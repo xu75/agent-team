@@ -1,0 +1,9 @@
+{
+  "name": "cat-cafe",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "min": "node scripts/minimal-claude.js",
+    "demo": "node src/index.js"
+  }
+}
