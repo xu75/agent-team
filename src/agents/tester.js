@@ -2,9 +2,18 @@
 
 const { executeProviderText } = require("../providers/execute-provider");
 
-function buildTesterPrompt({ taskPrompt, coderOutput }) {
+function buildTesterPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+  const meName = roleProfile.display_name || "Tester";
+  const meTitle = roleProfile.role_title || "Tester";
+  const coder = peerProfiles.coder || {};
+  const reviewer = peerProfiles.reviewer || {};
+  const coderNick = coder.nickname || coder.display_name || "Coder";
+  const reviewerNick = reviewer.nickname || reviewer.display_name || "Reviewer";
+
   return [
-    "You are the Tester agent in a multi-agent coding workflow.",
+    `You are ${meName}, the ${meTitle} agent in a multi-agent coding workflow.`,
+    `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), reviewer is ${reviewer.display_name || "Reviewer"} (${reviewer.role_title || "Reviewer"}).`,
+    `Nickname rules: call coder as "${coderNick}", reviewer as "${reviewerNick}".`,
     "Create a minimal, practical test plan for the coder output.",
     "Return STRICT JSON only, no markdown fences.",
     "",
@@ -78,12 +87,14 @@ function validateTesterSchema(obj) {
 async function runTester({
   provider,
   model,
+  roleProfile,
+  peerProfiles,
   taskPrompt,
   coderOutput,
   timeoutMs,
   eventMeta,
 }) {
-  const prompt = buildTesterPrompt({ taskPrompt, coderOutput });
+  const prompt = buildTesterPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
   const result = await executeProviderText({
     provider,
     model,

@@ -2,9 +2,18 @@
 
 const { executeProviderText } = require("../providers/execute-provider");
 
-function buildReviewerPrompt({ taskPrompt, coderOutput }) {
+function buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+  const meName = roleProfile.display_name || "Reviewer";
+  const meTitle = roleProfile.role_title || "Reviewer";
+  const coder = peerProfiles.coder || {};
+  const tester = peerProfiles.tester || {};
+  const coderNick = coder.nickname || coder.display_name || "Coder";
+  const testerNick = tester.nickname || tester.display_name || "Tester";
+
   return [
-    "You are the Reviewer agent in a multi-agent coding workflow.",
+    `You are ${meName}, the ${meTitle} agent in a multi-agent coding workflow.`,
+    `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), tester is ${tester.display_name || "Tester"} (${tester.role_title || "Tester"}).`,
+    `Nickname rules: call coder as "${coderNick}", tester as "${testerNick}".`,
     "Review the coder output against the task and return STRICT JSON only.",
     "Do not output markdown fences.",
     "",
@@ -100,12 +109,14 @@ function validateReviewSchema(obj) {
 async function runReviewer({
   provider,
   model,
+  roleProfile,
+  peerProfiles,
   taskPrompt,
   coderOutput,
   timeoutMs,
   eventMeta,
 }) {
-  const prompt = buildReviewerPrompt({ taskPrompt, coderOutput });
+  const prompt = buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
   const result = await executeProviderText({
     provider,
     model,

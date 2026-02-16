@@ -518,6 +518,38 @@ h3 {
   font-weight: 420;
 }
 
+.chat-msg .msg-text.collapsed {
+  max-height: 240px;
+  overflow: hidden;
+  position: relative;
+}
+
+.chat-msg .msg-text.collapsed::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 44px;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0), rgba(252, 251, 250, 1));
+}
+
+.chat-msg .toggle-expand {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: #6f665f;
+  border-radius: 8px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-msg .toggle-expand:hover {
+  border-color: #d6ccc3;
+  background: #fffcfa;
+}
+
 .evidence-row {
   margin-top: 8px;
   display: flex;
@@ -556,7 +588,22 @@ h3 {
 }
 
 .chat-msg.role-task {
-  background: #f8f6f4;
+  background: #ffe9df;
+  border-color: #efc8b7;
+  align-self: flex-end;
+  max-width: 76%;
+}
+
+.chat-msg.role-task header .lhs {
+  gap: 6px;
+}
+
+.chat-msg.role-task .dot {
+  display: none;
+}
+
+.chat-msg.role-task .meta {
+  display: none;
 }
 
 .stat-grid {
@@ -648,6 +695,56 @@ h3 {
 
 .live-stage {
   margin-top: 8px;
+}
+
+.role-config-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.role-profile-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 9px;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.role-profile-card .card-head {
+  font-size: 12px;
+  font-weight: 700;
+  color: #625950;
+}
+
+.role-profile-card label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: #6d635c;
+  gap: 8px;
+}
+
+.role-profile-card input,
+.role-profile-card select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfaf9;
+  color: #6a615a;
+  padding: 5px 7px;
+  min-width: 136px;
+}
+
+.role-profile-card input {
+  width: 150px;
+}
+
+.role-actions {
+  margin-top: 8px;
+  margin-bottom: 2px;
 }
 
 .stage-card {

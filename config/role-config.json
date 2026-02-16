@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "models": [
+    {
+      "id": "claude",
+      "name": "Claude",
+      "provider": "claude-cli"
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "provider": "codex-cli"
+    }
+  ],
+  "stage_assignment": {
+    "coder": "codex",
+    "reviewer": "claude",
+    "tester": "claude"
+  },
+  "role_profiles": {
+    "coder": {
+      "display_name": "银渐层(Codex)",
+      "role_title": "CoreDev",
+      "nickname": "小码"
+    },
+    "reviewer": {
+      "display_name": "阿比西尼亚(Claude)",
+      "role_title": "Reviewer",
+      "nickname": "评审官"
+    },
+    "tester": {
+      "display_name": "加菲猫（待定）",
+      "role_title": "Tester",
+      "nickname": "测试员"
+    }
+  }
+}

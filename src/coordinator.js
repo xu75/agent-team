@@ -98,6 +98,9 @@ async function runTask(taskPrompt, options = {}) {
 
   const provider = options.provider || "claude-cli";
   const model = options.model;
+  const roleProviders = options.roleProviders || {};
+  const roleProfiles = options.roleProfiles || {};
+  const roleConfig = options.roleConfig || null;
   const maxIterations = Number.isFinite(options.maxIterations)
     ? Math.max(1, Math.floor(options.maxIterations))
     : 3;
@@ -109,16 +112,29 @@ async function runTask(taskPrompt, options = {}) {
     ? options.allowedTestCommands
     : DEFAULT_ALLOWED_PREFIXES;
 
-  const { taskId, dir: taskDir } = createTaskLogDir("logs", options.taskId);
+  const appendToTask = !!options.appendToTask;
+  const existingTaskId = options.taskId ? String(options.taskId) : null;
+  const existingTaskDir = options.taskDir ? String(options.taskDir) : null;
+  const created = appendToTask
+    ? { taskId: existingTaskId, dir: existingTaskDir }
+    : createTaskLogDir("logs", options.taskId);
+  const { taskId, dir: taskDir } = created;
+  if (!taskId || !taskDir) {
+    throw new Error("appendToTask requires both taskId and taskDir");
+  }
+  fs.mkdirSync(path.join(taskDir, "rounds"), { recursive: true });
   const taskEventsFile = path.join(taskDir, "task-events.jsonl");
+  const priorSummary = appendToTask ? JSON.parse(JSON.stringify(safeSummary(taskDir))) : null;
 
-  writeText(path.join(taskDir, "task.md"), taskPrompt + "\n");
+  if (!appendToTask) {
+    writeText(path.join(taskDir, "task.md"), taskPrompt + "\n");
+  }
 
-  const rounds = [];
-  let mustFix = [];
-  let finalOutcome = "max_iterations_reached";
-  let currentState = null;
-  const stateEvents = [];
+  const rounds = priorSummary?.rounds ? [...priorSummary.rounds] : [];
+  let mustFix = Array.isArray(priorSummary?.unresolved_must_fix) ? [...priorSummary.unresolved_must_fix] : [];
+  let finalOutcome = priorSummary?.final_outcome || "max_iterations_reached";
+  let currentState = priorSummary?.final_status || null;
+  const stateEvents = Array.isArray(priorSummary?.state_events) ? [...priorSummary.state_events] : [];
 
   function transition(to, payload = {}) {
     const evt = {
@@ -134,18 +150,58 @@ async function runTask(taskPrompt, options = {}) {
     fs.appendFileSync(taskEventsFile, JSON.stringify(evt) + "\n", "utf8");
   }
 
-  transition(FSM_STATES.INTAKE, { reason: "task_received" });
+  function providerFor(role) {
+    const cfg = roleProviders[role];
+    return cfg?.provider || provider;
+  }
+
+  function modelFor(role) {
+    const cfg = roleProviders[role];
+    return cfg?.model || model;
+  }
+
+  function modelIdFor(role) {
+    const cfg = roleProviders[role];
+    return cfg?.model_id || null;
+  }
+
+  function profileFor(role) {
+    const p = roleProfiles[role] || {};
+    const displayName = p.display_name || role;
+    const roleTitle = p.role_title || role;
+    const nickname = p.nickname || p.alias || displayName;
+    return {
+      display_name: String(displayName),
+      role_title: String(roleTitle),
+      nickname: String(nickname),
+    };
+  }
+
+  function peersFor(role) {
+    const out = {};
+    for (const k of ["coder", "reviewer", "tester"]) {
+      if (k === role) continue;
+      out[k] = profileFor(k);
+    }
+    return out;
+  }
+
+  transition(FSM_STATES.INTAKE, { reason: appendToTask ? "task_followup_received" : "task_received" });
   transition(FSM_STATES.PLAN, { reason: "minimal_plan_bootstrap" });
 
-  for (let round = 1; round <= maxIterations; round += 1) {
+  const startRound = rounds.length + 1;
+  const endRoundExclusive = startRound + maxIterations;
+  for (let round = startRound; round < endRoundExclusive; round += 1) {
     transition(FSM_STATES.BUILD, { round, reason: "start_coder" });
 
     const roundPath = roundDir(taskDir, round);
     const attempt = round;
 
     const coder = await runCoder({
-      provider,
-      model,
+      provider: providerFor("coder"),
+      model: modelFor("coder"),
+      roleProfile: profileFor("coder"),
+      peerProfiles: peersFor("coder"),
       taskPrompt,
       mustFix,
       timeoutMs,
@@ -168,8 +224,10 @@ async function runTask(taskPrompt, options = {}) {
     transition(FSM_STATES.REVIEW, { round, reason: "start_reviewer" });
 
     const reviewer = await runReviewer({
-      provider,
-      model,
+      provider: providerFor("reviewer"),
+      model: modelFor("reviewer"),
+      roleProfile: profileFor("reviewer"),
+      peerProfiles: peersFor("reviewer"),
       taskPrompt,
       coderOutput: coder.text,
       timeoutMs,
@@ -221,8 +279,10 @@ async function runTask(taskPrompt, options = {}) {
       transition(FSM_STATES.TEST, { round, reason: "review_approved" });
 
       const tester = await runTester({
-        provider,
-        model,
+        provider: providerFor("tester"),
+        model: modelFor("tester"),
+        roleProfile: profileFor("tester"),
+        peerProfiles: peersFor("tester"),
         taskPrompt,
         coderOutput: coder.text,
         timeoutMs,
@@ -334,6 +394,29 @@ async function runTask(taskPrompt, options = {}) {
     timeline_file: path.join(taskDir, "task-timeline.json"),
     provider,
     model: model || null,
+    role_providers: {
+      coder: {
+        model_id: modelIdFor("coder"),
+        provider: providerFor("coder"),
+        model: modelFor("coder") || null,
+      },
+      reviewer: {
+        model_id: modelIdFor("reviewer"),
+        provider: providerFor("reviewer"),
+        model: modelFor("reviewer") || null,
+      },
+      tester: {
+        model_id: modelIdFor("tester"),
+        provider: providerFor("tester"),
+        model: modelFor("tester") || null,
+      },
+    },
+    role_profiles: {
+      coder: profileFor("coder"),
+      reviewer: profileFor("reviewer"),
+      tester: profileFor("tester"),
+    },
+    role_config: roleConfig,
     final_status: currentState,
     final_outcome: finalOutcome,
     max_iterations: maxIterations,
@@ -348,6 +431,15 @@ async function runTask(taskPrompt, options = {}) {
   writeJson(path.join(taskDir, "task-timeline.json"), timeline);
 
   return summary;
+}
+
+function safeSummary(taskDir) {
+  try {
+    const raw = fs.readFileSync(path.join(taskDir, "summary.json"), "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
 }
 
 async function runOnce(prompt, options = {}) {

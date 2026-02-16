@@ -55,13 +55,8 @@
           <div id="chatStream" class="chat-stream"></div>
 
           <div class="composer">
-            <input id="runPromptInput" placeholder="输入新任务描述，例如：实现某个功能并给出测试计划" />
-            <select id="runProviderSelect">
-              <option value="claude-cli">claude-cli</option>
-              <option value="codex-cli">codex-cli</option>
-            </select>
-            <input id="runIterationsInput" type="number" min="1" max="8" value="3" />
-            <button id="runTaskBtn" class="btn primary">运行任务</button>
+            <input id="chatCommandInput" placeholder='输入命令，如：/task 实现登录接口；/task --provider codex-cli --rounds 2 修复失败测试；/rerun 继续上个任务' />
+            <button id="sendCommandBtn" class="btn primary">发送</button>
           </div>
           <div id="runTaskStatus" class="run-status"></div>
         </section>
@@ -87,6 +82,12 @@
 
           <h3>未解决项</h3>
           <ul id="mustFixList" class="simple-list"></ul>
+
+          <h3>角色定义</h3>
+          <div id="roleConfigPanel" class="role-config-panel"></div>
+          <div class="role-actions">
+            <button id="saveRolesBtn" class="btn">保存角色配置</button>
+          </div>
         </aside>
       </main>
     </div>

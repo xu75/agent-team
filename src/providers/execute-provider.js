@@ -28,6 +28,7 @@ async function executeProviderText({
 }) {
   const { cmd, args, stdoutParseMode } = resolveProvider(provider, prompt, model);
   let text = "";
+  const stderrLines = [];
 
   const result = await runCommandStreaming({
     providerName: provider,
@@ -37,11 +38,32 @@ async function executeProviderText({
     timeoutMs,
     eventMeta,
     onEvent: (evt) => {
-      if (evt.type !== "assistant.text") return;
-      text += evt.data.text;
-      if (streamOutput) process.stdout.write(evt.data.text);
+      if (evt.type === "assistant.text") {
+        text += evt.data.text;
+        if (streamOutput) process.stdout.write(evt.data.text);
+        return;
+      }
+      if (evt.type === "run.stderr.line") {
+        const line = String(evt.data?.line || "").trim();
+        if (line) stderrLines.push(line);
+      }
     },
   });
+
+  if (!text.trim() && result.exit?.error) {
+    const errMsg = String(result.exit.error.message || "unknown provider error");
+    if (provider === "codex-cli" && /ENOENT/i.test(errMsg)) {
+      text =
+        "Runtime Error: codex command not found (ENOENT).\n" +
+        "Please install Codex CLI or set CODEX_BIN to the executable path.\n" +
+        "Example: export CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex\n";
+    } else {
+      text = `Runtime Error: ${errMsg}\n`;
+    }
+  } else if (!text.trim() && Number(result.exit?.code) !== 0 && stderrLines.length) {
+    const tail = stderrLines.slice(-6).join("\n");
+    text = `Runtime Error: provider exited with code ${result.exit.code}\n${tail}\n`;
+  }
 
   return {
     text,

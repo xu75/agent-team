@@ -9,8 +9,48 @@ const { runTask } = require("../src/coordinator");
 const ROOT = path.resolve(__dirname, "..");
 const UI_ROOT = path.join(ROOT, "ui");
 const LOGS_ROOT = path.join(ROOT, "logs");
+const CONFIG_ROOT = path.join(ROOT, "config");
+const ROLE_CONFIG_FILE = path.join(CONFIG_ROOT, "role-config.json");
 const PORT = Number(process.env.UI_PORT || 4173);
 const HOST = process.env.UI_HOST || "127.0.0.1";
+
+const STAGES = ["coder", "reviewer", "tester"];
+const DEFAULT_STAGE_DUTY = Object.freeze({
+  coder: "CoreDev",
+  reviewer: "Reviewer",
+  tester: "Tester",
+});
+const ROLE_DUTY_OPTIONS = Object.freeze(["CoreDev", "Reviewer", "Tester"]);
+
+const DEFAULT_ROLE_CONFIG = Object.freeze({
+  version: 2,
+  models: [
+    { id: "claude", name: "Claude", provider: "claude-cli" },
+    { id: "codex", name: "Codex", provider: "codex-cli" },
+  ],
+  stage_assignment: {
+    coder: "codex",
+    reviewer: "claude",
+    tester: "claude",
+  },
+  role_profiles: {
+    coder: {
+      display_name: "Codex",
+      role_title: "CoreDev",
+      nickname: "小码",
+    },
+    reviewer: {
+      display_name: "Claude",
+      role_title: "Reviewer",
+      nickname: "评审官",
+    },
+    tester: {
+      display_name: "Claude",
+      role_title: "Tester",
+      nickname: "测试员",
+    },
+  },
+});
 
 function sendJson(res, code, data) {
   res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
@@ -37,6 +77,172 @@ function safeReadJson(filePath) {
   } catch {
     return null;
   }
+}
+
+function cloneDefaultRoleConfig() {
+  return JSON.parse(JSON.stringify(DEFAULT_ROLE_CONFIG));
+}
+
+function clip(s, max = 64) {
+  return String(s || "").trim().slice(0, max);
+}
+
+function normalizeRoleConfig(input) {
+  const fallback = cloneDefaultRoleConfig();
+  if (!input || typeof input !== "object") return fallback;
+
+  const inModels = Array.isArray(input.models) ? input.models : [];
+  const mergedModels = fallback.models.map((base) => {
+    const found = inModels.find((m) => m && m.id === base.id) || {};
+    return {
+      id: base.id,
+      name: base.name,
+      provider: base.provider,
+    };
+  });
+
+  const validIds = new Set(mergedModels.map((m) => m.id));
+  const stageIn = input.stage_assignment && typeof input.stage_assignment === "object"
+    ? input.stage_assignment
+    : {};
+  const stage = {};
+  for (const key of ["coder", "reviewer", "tester"]) {
+    const candidate = String(stageIn[key] || "").trim();
+    stage[key] = validIds.has(candidate) ? candidate : fallback.stage_assignment[key];
+  }
+
+  const oldModelRoles = new Map(
+    inModels
+      .filter((x) => x && typeof x.id === "string" && typeof x.role === "string")
+      .map((x) => [x.id, clip(x.role)])
+  );
+
+  function fallbackProfile(stageKey) {
+    const fromDefault = fallback.role_profiles[stageKey] || {};
+    const modelId = stage[stageKey];
+    const model = mergedModels.find((m) => m.id === modelId);
+    const displayName = clip(fromDefault.display_name || model?.name || stageKey);
+    const roleTitleRaw = clip(oldModelRoles.get(modelId) || fromDefault.role_title || DEFAULT_STAGE_DUTY[stageKey]);
+    const roleTitle = ROLE_DUTY_OPTIONS.includes(roleTitleRaw) ? roleTitleRaw : DEFAULT_STAGE_DUTY[stageKey];
+    const nickname = clip(fromDefault.nickname || displayName);
+    return { display_name: displayName, role_title: roleTitle, nickname };
+  }
+
+  const profilesIn = input.role_profiles && typeof input.role_profiles === "object" ? input.role_profiles : {};
+
+  function legacyNickname(stageKey, fallbackNickname) {
+    for (const source of STAGES) {
+      if (source === stageKey) continue;
+      const sourceProfile = profilesIn[source];
+      if (!sourceProfile || typeof sourceProfile !== "object") continue;
+      const aliases = sourceProfile.aliases && typeof sourceProfile.aliases === "object" ? sourceProfile.aliases : {};
+      const old = aliases[stageKey];
+      if (String(old || "").trim()) return clip(old);
+    }
+    return clip(fallbackNickname);
+  }
+
+  const roleProfiles = {};
+  for (const stageKey of STAGES) {
+    const baseProfile = fallbackProfile(stageKey);
+    const inP = profilesIn[stageKey] && typeof profilesIn[stageKey] === "object" ? profilesIn[stageKey] : {};
+    const roleTitleRaw = clip(inP.role_title || inP.role || baseProfile.role_title || DEFAULT_STAGE_DUTY[stageKey]);
+    const roleTitle = ROLE_DUTY_OPTIONS.includes(roleTitleRaw) ? roleTitleRaw : DEFAULT_STAGE_DUTY[stageKey];
+    const displayName = clip(inP.display_name || inP.name || baseProfile.display_name);
+    const nickname = clip(inP.nickname || inP.alias || legacyNickname(stageKey, baseProfile.nickname || displayName));
+    roleProfiles[stageKey] = {
+      display_name: displayName,
+      role_title: roleTitle,
+      nickname: nickname || displayName,
+    };
+  }
+
+  return {
+    version: 2,
+    models: mergedModels,
+    stage_assignment: stage,
+    role_profiles: roleProfiles,
+  };
+}
+
+function validateNicknameUniqueness(roleConfig) {
+  const cfg = normalizeRoleConfig(roleConfig);
+  const seen = new Map();
+
+  for (const stage of STAGES) {
+    const nick = clip(cfg.role_profiles?.[stage]?.nickname);
+    if (!nick) {
+      return {
+        ok: false,
+        roleConfig: cfg,
+        error: `role_profiles.${stage}.nickname 不能为空`,
+      };
+    }
+    const key = nick.toLowerCase();
+    const prevStage = seen.get(key);
+    if (prevStage && prevStage !== stage) {
+      return {
+        ok: false,
+        roleConfig: cfg,
+        error: `昵称“${nick}”重复：${prevStage} 与 ${stage}`,
+      };
+    }
+    seen.set(key, stage);
+  }
+
+  return { ok: true, roleConfig: cfg, error: "" };
+}
+
+function readRoleConfig() {
+  const parsed = safeReadJson(ROLE_CONFIG_FILE);
+  return normalizeRoleConfig(parsed);
+}
+
+function writeRoleConfig(nextConfig) {
+  const checked = validateNicknameUniqueness(nextConfig);
+  if (!checked.ok) {
+    throw new Error(checked.error);
+  }
+  const normalized = checked.roleConfig;
+  fs.mkdirSync(CONFIG_ROOT, { recursive: true });
+  fs.writeFileSync(ROLE_CONFIG_FILE, JSON.stringify(normalized, null, 2) + "\n", "utf8");
+  return normalized;
+}
+
+function modelById(roleConfig) {
+  const m = new Map();
+  for (const x of roleConfig.models || []) m.set(x.id, x);
+  return m;
+}
+
+function stageAssignmentToRoleProviders(roleConfig) {
+  const map = modelById(roleConfig);
+  const out = {};
+  for (const stage of STAGES) {
+    const modelId = roleConfig?.stage_assignment?.[stage];
+    const model = map.get(modelId);
+    out[stage] = {
+      model_id: modelId || null,
+      provider: model?.provider || "claude-cli",
+      model: null,
+    };
+  }
+  return out;
+}
+
+function stageRoleProfiles(roleConfig) {
+  const cfg = normalizeRoleConfig(roleConfig);
+  const out = {};
+  for (const stage of STAGES) {
+    const p = cfg.role_profiles?.[stage] || {};
+    const roleTitle = clip(p.role_title || DEFAULT_STAGE_DUTY[stage]);
+    out[stage] = {
+      display_name: clip(p.display_name || stage),
+      role_title: ROLE_DUTY_OPTIONS.includes(roleTitle) ? roleTitle : DEFAULT_STAGE_DUTY[stage],
+      nickname: clip(p.nickname || p.display_name || stage),
+    };
+  }
+  return out;
 }
 
 function readRequestJson(req) {
@@ -366,6 +572,48 @@ function safeTextOrEmpty(filePath) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 }
 
+function followupsFile(taskDir) {
+  return path.join(taskDir, "task-followups.jsonl");
+}
+
+function appendFollowup(taskDir, text) {
+  const line = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    ts: Date.now(),
+    text: String(text || "").trim(),
+  };
+  if (!line.text) return null;
+  fs.appendFileSync(followupsFile(taskDir), JSON.stringify(line) + "\n", "utf8");
+  return line;
+}
+
+function readFollowups(taskDir) {
+  return readJsonLines(followupsFile(taskDir))
+    .filter((x) => x && typeof x.text === "string" && x.text.trim())
+    .map((x) => ({
+      id: String(x.id || `${x.ts || Date.now()}`),
+      ts: Number.isFinite(x.ts) ? x.ts : Date.now(),
+      text: String(x.text).trim(),
+    }));
+}
+
+function buildThreadPrompt(taskDir) {
+  const baseTask = safeTextOrEmpty(path.join(taskDir, "task.md")).trim();
+  const followups = readFollowups(taskDir);
+  if (!followups.length) return baseTask;
+
+  const lines = [];
+  lines.push(baseTask || "");
+  lines.push("");
+  lines.push("Follow-up messages from operator (chronological):");
+  followups.forEach((m, idx) => {
+    lines.push(`${idx + 1}. ${m.text}`);
+  });
+  lines.push("");
+  lines.push("Please respond to the latest follow-up while respecting prior context.");
+  return lines.join("\n").trim();
+}
+
 function roleMessageContent(roundDir, role) {
   if (role === "coder") {
     return safeTextOrEmpty(path.join(roundDir, "coder_output.md"));
@@ -385,18 +633,66 @@ function roleMessageContent(roundDir, role) {
   return "";
 }
 
+function firstRunFailedMessage(events) {
+  const failed = events.find((e) => e?.type === "run.failed");
+  const msg = failed?.data?.message;
+  return typeof msg === "string" && msg.trim() ? msg.trim() : "";
+}
+
+function stageRoleLabel(roleConfig, stage) {
+  const fallback = stage.charAt(0).toUpperCase() + stage.slice(1);
+  const profile = roleConfig?.role_profiles?.[stage] || {};
+  const displayName = clip(profile.display_name || fallback);
+  const roleTitle = clip(profile.role_title || fallback);
+  return {
+    display_name: displayName,
+    role_title: roleTitle,
+    role_label: `${displayName} · ${roleTitle}`,
+  };
+}
+
+function computeProgress(summary, timeline) {
+  const rounds = Array.isArray(summary?.rounds) ? summary.rounds : [];
+  const threadRounds = rounds.length;
+  const latestMax = Number.isFinite(summary?.max_iterations) ? Number(summary.max_iterations) : null;
+  const transitions = Array.isArray(timeline?.transitions) ? timeline.transitions : [];
+
+  let lastIntakeIdx = -1;
+  for (let i = transitions.length - 1; i >= 0; i -= 1) {
+    const t = transitions[i];
+    if (t?.to === "intake") {
+      lastIntakeIdx = i;
+      break;
+    }
+  }
+  const seg = lastIntakeIdx >= 0 ? transitions.slice(lastIntakeIdx) : transitions;
+  const latestRoundSet = new Set(
+    seg.map((x) => x?.round).filter((n) => Number.isFinite(n) && n > 0)
+  );
+
+  return {
+    rounds_total: threadRounds,
+    rounds_max: latestMax,
+    thread_rounds: threadRounds,
+    latest_run_rounds: latestRoundSet.size,
+    latest_run_max: latestMax,
+  };
+}
+
 function buildTaskMessages(taskId, taskDir) {
   const summary = safeReadJson(path.join(taskDir, "summary.json")) || {};
   const timeline = safeReadJson(path.join(taskDir, "task-timeline.json")) || {};
   const taskText = safeTextOrEmpty(path.join(taskDir, "task.md")).trim();
+  const followups = readFollowups(taskDir);
   const rounds = summary?.rounds || [];
+  const roleConfig = normalizeRoleConfig(summary.role_config || readRoleConfig());
   const messages = [];
 
   if (taskText) {
     messages.push({
       id: `${taskId}-task`,
       role: "task",
-      role_label: "Task",
+      role_label: "铲屎官",
       round: null,
       text: taskText,
       ts: timeline?.transitions?.[0]?.ts || Date.now(),
@@ -412,23 +708,48 @@ function buildTaskMessages(taskId, taskDir) {
     });
   }
 
+  followups.forEach((m, idx) => {
+    messages.push({
+      id: `${taskId}-followup-${m.id || idx}`,
+      role: "task",
+      role_label: "铲屎官",
+      round: null,
+      text: m.text,
+      ts: m.ts,
+      provider: null,
+      model: null,
+      cost_usd: null,
+      duration_ms: null,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_input_tokens: null,
+      exit_code: null,
+      ok: true,
+    });
+  });
+
   for (const r of rounds) {
     const round = r.round;
     const roundName = String(round).padStart(2, "0");
     const roundDir = path.join(taskDir, "rounds", roundName);
     if (!fs.existsSync(roundDir)) continue;
 
-    for (const role of ["coder", "reviewer", "tester"]) {
+    for (const role of STAGES) {
       const text = roleMessageContent(roundDir, role);
       const events = readJsonLines(path.join(roundDir, `${role}.events.jsonl`));
       const meta = summarizeRunFromEvents(events);
       if (!text.trim() && !events.length) continue;
+      const failedMsg = firstRunFailedMessage(events);
+      const textOut = text.trim() ? text : failedMsg ? `Runtime Error: ${failedMsg}` : text;
+      const roleName = stageRoleLabel(roleConfig, role);
       messages.push({
         id: `${taskId}-${round}-${role}`,
         role,
-        role_label: role.charAt(0).toUpperCase() + role.slice(1),
+        role_label: roleName.role_label,
+        role_display_name: roleName.display_name,
+        role_title: roleName.role_title,
         round,
-        text: text || "",
+        text: textOut || "",
         ts: meta.ts,
         provider: meta.provider,
         model: meta.model,
@@ -468,13 +789,11 @@ function buildTaskMessages(taskId, taskDir) {
     current_stage: timeline?.transitions?.length
       ? timeline.transitions[timeline.transitions.length - 1].to
       : null,
-    progress: {
-      rounds_total: rounds.length,
-      rounds_max: summary.max_iterations || null,
-    },
+    progress: computeProgress(summary, timeline),
     messages,
     latest_test_results: latestTestText,
     unresolved_must_fix: Array.isArray(summary.unresolved_must_fix) ? summary.unresolved_must_fix : [],
+    role_config: roleConfig,
   };
 }
 
@@ -574,6 +893,18 @@ const server = http.createServer(async (req, res) => {
   const p = u.pathname;
 
   try {
+    if (p === "/api/roles" && req.method === "GET") {
+      return sendJson(res, 200, { role_config: readRoleConfig() });
+    }
+
+    if (p === "/api/roles" && req.method === "PUT") {
+      const body = await readRequestJson(req);
+      const checked = validateNicknameUniqueness(body.role_config || body);
+      if (!checked.ok) return sendJson(res, 400, { error: checked.error });
+      const next = writeRoleConfig(checked.roleConfig);
+      return sendJson(res, 200, { ok: true, role_config: next });
+    }
+
     if (p === "/api/tasks" && req.method === "GET") {
       return sendJson(res, 200, { tasks: listTasks() });
     }
@@ -586,21 +917,71 @@ const server = http.createServer(async (req, res) => {
       const provider = String(body.provider || "claude-cli");
       const model = body.model ? String(body.model) : undefined;
       const maxIterations = Number.isFinite(body.maxIterations) ? Number(body.maxIterations) : 3;
+      const roleConfig = body.role_config ? normalizeRoleConfig(body.role_config) : readRoleConfig();
+      const checked = validateNicknameUniqueness(roleConfig);
+      if (!checked.ok) return sendJson(res, 400, { error: checked.error });
+      const effectiveRoleConfig = checked.roleConfig;
+      const roleProviders = stageAssignmentToRoleProviders(effectiveRoleConfig);
+      const roleProfiles = stageRoleProfiles(effectiveRoleConfig);
 
       const summary = await runTask(prompt, {
         provider,
         model,
         maxIterations,
+        roleProviders,
+        roleProfiles,
+        roleConfig: effectiveRoleConfig,
       });
       return sendJson(res, 200, {
         ok: true,
         task_id: summary.task_id,
         summary,
+        role_config: effectiveRoleConfig,
       });
     }
 
     if (p.startsWith("/api/tasks/") && req.method === "POST") {
       const seg = p.split("/").filter(Boolean);
+      if (seg.length === 4 && seg[3] === "followup") {
+        const taskId = seg[2];
+        const task = getTaskDetail(taskId);
+        if (!task) return sendJson(res, 404, { error: "task not found" });
+        const body = await readRequestJson(req);
+        const message = String(body.message || "").trim();
+        if (!message) return sendJson(res, 400, { error: "message is required" });
+        appendFollowup(task.task_dir, message);
+
+        const summary = task.summary || {};
+        const roleConfig = body.role_config ? normalizeRoleConfig(body.role_config) : readRoleConfig();
+        const checked = validateNicknameUniqueness(roleConfig);
+        if (!checked.ok) return sendJson(res, 400, { error: checked.error });
+        const effectiveRoleConfig = checked.roleConfig;
+        const roleProviders = stageAssignmentToRoleProviders(effectiveRoleConfig);
+        const roleProfiles = stageRoleProfiles(effectiveRoleConfig);
+        const maxIterations = Number.isFinite(body.maxIterations) ? Number(body.maxIterations) : 1;
+        const provider = String(body.provider || summary.provider || "claude-cli");
+        const prompt = buildThreadPrompt(task.task_dir);
+
+        const updated = await runTask(prompt, {
+          provider,
+          model: body.model ? String(body.model) : summary.model || undefined,
+          maxIterations: Math.max(1, maxIterations),
+          roleProviders,
+          roleProfiles,
+          roleConfig: effectiveRoleConfig,
+          appendToTask: true,
+          taskId,
+          taskDir: task.task_dir,
+        });
+
+        return sendJson(res, 200, {
+          ok: true,
+          task_id: taskId,
+          summary: updated,
+          role_config: effectiveRoleConfig,
+        });
+      }
+
       if (seg.length === 4 && seg[3] === "rerun") {
         const taskId = seg[2];
         const task = getTaskDetail(taskId);
@@ -610,6 +991,12 @@ const server = http.createServer(async (req, res) => {
         const summary = task.summary || {};
         const prompt = String(body.prompt || task.task_md || "").trim();
         if (!prompt) return sendJson(res, 400, { error: "task prompt is empty" });
+        const roleConfig = body.role_config ? normalizeRoleConfig(body.role_config) : readRoleConfig();
+        const checked = validateNicknameUniqueness(roleConfig);
+        if (!checked.ok) return sendJson(res, 400, { error: checked.error });
+        const effectiveRoleConfig = checked.roleConfig;
+        const roleProviders = stageAssignmentToRoleProviders(effectiveRoleConfig);
+        const roleProfiles = stageRoleProfiles(effectiveRoleConfig);
 
         const rerun = await runTask(prompt, {
           provider: String(body.provider || summary.provider || "claude-cli"),
@@ -617,12 +1004,16 @@ const server = http.createServer(async (req, res) => {
           maxIterations: Number.isFinite(body.maxIterations)
             ? Number(body.maxIterations)
             : Number(summary.max_iterations || 3),
+          roleProviders,
+          roleProfiles,
+          roleConfig: effectiveRoleConfig,
         });
 
         return sendJson(res, 200, {
           ok: true,
           task_id: rerun.task_id,
           summary: rerun,
+          role_config: effectiveRoleConfig,
         });
       }
     }
