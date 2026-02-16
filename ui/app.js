@@ -8,6 +8,9 @@ const state = {
   messagesData: null,
   roleConfig: null,
   busy: false,
+  optimisticMessages: [],
+  livePollTimer: null,
+  livePollBusy: false,
 };
 
 const el = {
@@ -154,6 +157,84 @@ function metaLine(m) {
   if (fmtCost(m.cost_usd)) parts.push(fmtCost(m.cost_usd));
   if (Number.isFinite(m.duration_ms)) parts.push(`${m.duration_ms}ms`);
   return parts.join(" · ");
+}
+
+function tryParseJsonLoose(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {}
+  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fence) {
+    try {
+      return JSON.parse(fence[1]);
+    } catch {}
+  }
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(raw.slice(start, end + 1));
+    } catch {}
+  }
+  return null;
+}
+
+function summarizeReviewerMessage(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  if (!("decision" in obj) || !Array.isArray(obj.must_fix)) return null;
+  const decision = obj.decision === "approve" ? "通过" : "需修改";
+  const mustFix = obj.must_fix || [];
+  const nice = Array.isArray(obj.nice_to_have) ? obj.nice_to_have : [];
+  const tests = Array.isArray(obj.tests) ? obj.tests : [];
+  const security = Array.isArray(obj.security) ? obj.security : [];
+  const lines = [];
+  lines.push(`评审结论：${decision}`);
+  lines.push(`必须修复：${mustFix.length} 项`);
+  if (mustFix.length) {
+    mustFix.slice(0, 3).forEach((x, i) => lines.push(`${i + 1}. ${x}`));
+    if (mustFix.length > 3) lines.push(`... 还有 ${mustFix.length - 3} 项`);
+  }
+  lines.push(`建议优化：${nice.length} 项`);
+  lines.push(`测试建议：${tests.length} 项`);
+  lines.push(`安全建议：${security.length} 项`);
+  lines.push("");
+  lines.push("查看完整 JSON：点击下方 Evidence -> json");
+  return lines.join("\n");
+}
+
+function summarizeTesterMessage(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  if (typeof obj.test_plan !== "string" || !Array.isArray(obj.commands)) return null;
+  const cmds = obj.commands || [];
+  const exp = Array.isArray(obj.expected_results) ? obj.expected_results : [];
+  const lines = [];
+  lines.push("测试方案摘要：");
+  lines.push(obj.test_plan.trim() || "(空)");
+  lines.push("");
+  lines.push(`命令数：${cmds.length}`);
+  cmds.slice(0, 3).forEach((x, i) => lines.push(`${i + 1}. ${x}`));
+  if (cmds.length > 3) lines.push(`... 还有 ${cmds.length - 3} 条`);
+  lines.push(`预期结果：${exp.length} 条`);
+  lines.push("");
+  lines.push("查看完整 JSON：点击下方 Evidence -> json");
+  return lines.join("\n");
+}
+
+function renderMessageText(m) {
+  const role = String(m?.role || "");
+  const text = String(m?.text || "");
+  if (!text.trim()) return "";
+  if (role === "reviewer") {
+    const parsed = tryParseJsonLoose(text);
+    return summarizeReviewerMessage(parsed) || text;
+  }
+  if (role === "tester") {
+    const parsed = tryParseJsonLoose(text);
+    return summarizeTesterMessage(parsed) || text;
+  }
+  return text;
 }
 
 function showToast(text, kind = "neutral") {
@@ -513,8 +594,61 @@ function renderTimeline() {
 
 function filteredMessages() {
   const all = state.messagesData?.messages || [];
-  if (!Number.isFinite(state.selectedRound)) return all;
-  return all.filter((m) => m.round === state.selectedRound || m.role === "task");
+  const existingIds = new Set(all.map((m) => String(m.id || "")));
+  const pending = state.optimisticMessages.filter(
+    (m) =>
+      String(m.task_id || "") === String(state.selectedTaskId || "") &&
+      !existingIds.has(String(m.id || ""))
+  );
+  const merged = [...all, ...pending].sort((a, b) => {
+    const ta = Number.isFinite(a.ts) ? a.ts : 0;
+    const tb = Number.isFinite(b.ts) ? b.ts : 0;
+    if (ta !== tb) return ta - tb;
+    const ra = Number.isFinite(a.round) ? a.round : -1;
+    const rb = Number.isFinite(b.round) ? b.round : -1;
+    if (ra !== rb) return ra - rb;
+    return String(a.role || "").localeCompare(String(b.role || ""));
+  });
+  if (!Number.isFinite(state.selectedRound)) return merged;
+  return merged.filter((m) => m.round === state.selectedRound || m.role === "task");
+}
+
+function removeOptimisticMessage(msgId) {
+  state.optimisticMessages = state.optimisticMessages.filter((m) => String(m.id || "") !== String(msgId || ""));
+}
+
+async function refreshTaskLive(taskId) {
+  if (!taskId || state.livePollBusy) return;
+  state.livePollBusy = true;
+  try {
+    const [detail, messages] = await Promise.all([
+      getJson(`/api/tasks/${taskId}`),
+      getJson(`/api/tasks/${taskId}/messages`),
+    ]);
+    if (state.selectedTaskId !== taskId) return;
+    state.detail = detail;
+    state.messagesData = messages;
+    renderTaskPage();
+  } catch {
+    // keep polling; transient errors are expected while background run is active
+  } finally {
+    state.livePollBusy = false;
+  }
+}
+
+function stopLivePolling() {
+  if (state.livePollTimer) {
+    clearInterval(state.livePollTimer);
+    state.livePollTimer = null;
+  }
+}
+
+function startLivePolling(taskId) {
+  stopLivePolling();
+  refreshTaskLive(taskId).catch(() => {});
+  state.livePollTimer = setInterval(() => {
+    refreshTaskLive(taskId).catch(() => {});
+  }, 1000);
 }
 
 function evidenceKindsForRole(role) {
@@ -554,7 +688,10 @@ async function openEvidence(round, role, kind) {
 function renderChat() {
   const messages = filteredMessages();
   const prev = el.chatStream;
-  const nearBottom = prev.scrollHeight - prev.scrollTop - prev.clientHeight < 48;
+  const prevScrollTop = prev.scrollTop;
+  const prevScrollHeight = prev.scrollHeight;
+  const prevClientHeight = prev.clientHeight;
+  const nearBottom = prevScrollHeight - prevScrollTop - prevClientHeight < 64;
   el.chatStream.innerHTML = "";
   if (!messages.length) {
     el.chatStream.innerHTML = '<div class="empty-block">当前筛选条件下没有消息。</div>';
@@ -575,7 +712,8 @@ function renderChat() {
         : "";
     const meta = metaLine(m);
     const metaHtml = meta ? `<div class="meta">${meta}</div>` : "";
-    const rawText = String(m.text || "");
+    const renderedText = renderMessageText(m);
+    const rawText = String(renderedText || "");
     const lineCount = rawText.split("\n").length;
     const collapsible = rawText.length > 700 || lineCount > 18;
     const textHtml = collapsible
@@ -618,8 +756,11 @@ function renderChat() {
     });
   });
 
-  if (nearBottom || !Number.isFinite(state.selectedRound)) {
+  if (nearBottom) {
     el.chatStream.scrollTop = el.chatStream.scrollHeight;
+  } else {
+    const maxTop = Math.max(0, el.chatStream.scrollHeight - el.chatStream.clientHeight);
+    el.chatStream.scrollTop = Math.min(prevScrollTop, maxTop);
   }
 }
 
@@ -938,24 +1079,53 @@ async function sendFollowupInThread({ message, provider, rounds }) {
     await runNewTaskFromCommand({ prompt: message, provider, rounds });
     return;
   }
+  const taskId = state.selectedTaskId;
+  const clientMessageId = `client-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const optimisticMessage = {
+    task_id: taskId,
+    id: `${taskId}-followup-${clientMessageId}`,
+    role: "task",
+    role_label: "铲屎官",
+    round: null,
+    text: String(message || "").trim(),
+    ts: Date.now(),
+    provider: null,
+    model: null,
+    cost_usd: null,
+    duration_ms: null,
+    input_tokens: null,
+    output_tokens: null,
+    cache_read_input_tokens: null,
+    exit_code: null,
+    ok: true,
+  };
+
   try {
+    el.chatCommandInput.value = "";
+    state.optimisticMessages.push(optimisticMessage);
+    renderChat();
     setBusy(true);
-    setRunStatus(`追问中：${state.selectedTaskId}`, true);
-    const res = await postJson(`/api/tasks/${state.selectedTaskId}/followup`, {
+    setRunStatus(`追问中：${taskId}`, true);
+    startLivePolling(taskId);
+    const res = await postJson(`/api/tasks/${taskId}/followup`, {
       message,
       provider: resolvedProvider(provider),
       maxIterations: resolvedRounds(rounds),
       role_config: state.roleConfig || DEFAULT_ROLE_CONFIG,
+      client_message_id: clientMessageId,
     });
     setRunStatus(`已更新：${res.task_id}`, false);
     showToast("追问已加入当前会话", "positive");
-    el.chatCommandInput.value = "";
+    removeOptimisticMessage(optimisticMessage.id);
     await loadTasks();
     if (res.task_id) await selectTask(res.task_id);
   } catch (err) {
+    removeOptimisticMessage(optimisticMessage.id);
+    renderChat();
     setRunStatus(`追问失败：${err.message}`, false);
     showToast(`追问失败：${err.message}`, "negative");
   } finally {
+    stopLivePolling();
     setBusy(false);
   }
 }

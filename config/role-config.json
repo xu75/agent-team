@@ -13,18 +13,18 @@
     }
   ],
   "stage_assignment": {
-    "coder": "codex",
-    "reviewer": "claude",
+    "coder": "claude",
+    "reviewer": "codex",
     "tester": "claude"
   },
   "role_profiles": {
     "coder": {
-      "display_name": "银渐层(Codex)",
+      "display_name": "银渐层",
       "role_title": "CoreDev",
       "nickname": "小码"
     },
     "reviewer": {
-      "display_name": "阿比西尼亚(Claude)",
+      "display_name": "阿比西尼亚",
       "role_title": "Reviewer",
       "nickname": "评审官"
     },

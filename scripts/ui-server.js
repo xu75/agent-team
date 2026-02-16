@@ -576,9 +576,10 @@ function followupsFile(taskDir) {
   return path.join(taskDir, "task-followups.jsonl");
 }
 
-function appendFollowup(taskDir, text) {
+function appendFollowup(taskDir, text, messageId = null) {
+  const trimmedId = String(messageId || "").trim();
   const line = {
-    id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    id: trimmedId || `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
     ts: Date.now(),
     text: String(text || "").trim(),
   };
@@ -651,6 +652,47 @@ function stageRoleLabel(roleConfig, stage) {
   };
 }
 
+function roundNumbersFromSummary(summary) {
+  const rounds = Array.isArray(summary?.rounds) ? summary.rounds : [];
+  return rounds
+    .map((r) => r?.round)
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function roundNumbersFromDir(taskDir) {
+  const root = path.join(taskDir, "rounds");
+  if (!fs.existsSync(root)) return [];
+  return fs
+    .readdirSync(root, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && /^\d+$/.test(d.name))
+    .map((d) => Number(d.name))
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function mergedRoundNumbers(taskDir, summary) {
+  const set = new Set([...roundNumbersFromSummary(summary), ...roundNumbersFromDir(taskDir)]);
+  return Array.from(set).sort((a, b) => a - b);
+}
+
+function readLiveTransitions(taskDir, timelineObj) {
+  if (Array.isArray(timelineObj?.transitions) && timelineObj.transitions.length) {
+    return timelineObj.transitions;
+  }
+  const taskEvents = readJsonLines(path.join(taskDir, "task-events.jsonl"));
+  return taskEvents
+    .filter((e) => e?.type === "fsm.transition")
+    .map((e, idx) => ({
+      index: idx,
+      ts: e.ts,
+      from: e.from ?? null,
+      to: e.to ?? null,
+      label: String(e.to || "-"),
+      reason: e.reason ?? null,
+      round: Number.isFinite(e.round) ? e.round : null,
+      duration_ms: null,
+    }));
+}
+
 function computeProgress(summary, timeline) {
   const rounds = Array.isArray(summary?.rounds) ? summary.rounds : [];
   const threadRounds = rounds.length;
@@ -682,9 +724,10 @@ function computeProgress(summary, timeline) {
 function buildTaskMessages(taskId, taskDir) {
   const summary = safeReadJson(path.join(taskDir, "summary.json")) || {};
   const timeline = safeReadJson(path.join(taskDir, "task-timeline.json")) || {};
+  const transitions = readLiveTransitions(taskDir, timeline);
   const taskText = safeTextOrEmpty(path.join(taskDir, "task.md")).trim();
   const followups = readFollowups(taskDir);
-  const rounds = summary?.rounds || [];
+  const roundNumbers = mergedRoundNumbers(taskDir, summary);
   const roleConfig = normalizeRoleConfig(summary.role_config || readRoleConfig());
   const messages = [];
 
@@ -695,7 +738,7 @@ function buildTaskMessages(taskId, taskDir) {
       role_label: "铲屎官",
       round: null,
       text: taskText,
-      ts: timeline?.transitions?.[0]?.ts || Date.now(),
+      ts: transitions[0]?.ts || Date.now(),
       provider: null,
       model: null,
       cost_usd: null,
@@ -728,8 +771,7 @@ function buildTaskMessages(taskId, taskDir) {
     });
   });
 
-  for (const r of rounds) {
-    const round = r.round;
+  for (const round of roundNumbers) {
     const roundName = String(round).padStart(2, "0");
     const roundDir = path.join(taskDir, "rounds", roundName);
     if (!fs.existsSync(roundDir)) continue;
@@ -775,8 +817,8 @@ function buildTaskMessages(taskId, taskDir) {
   });
 
   const latestTestText = (() => {
-    for (let i = rounds.length; i >= 1; i -= 1) {
-      const p = path.join(taskDir, "rounds", String(i).padStart(2, "0"), "test-results.txt");
+    for (let i = roundNumbers.length - 1; i >= 0; i -= 1) {
+      const p = path.join(taskDir, "rounds", String(roundNumbers[i]).padStart(2, "0"), "test-results.txt");
       if (fs.existsSync(p)) return fs.readFileSync(p, "utf8");
     }
     return "";
@@ -786,10 +828,13 @@ function buildTaskMessages(taskId, taskDir) {
     task_id: taskId,
     final_status: summary.final_status || null,
     final_outcome: summary.final_outcome || null,
-    current_stage: timeline?.transitions?.length
-      ? timeline.transitions[timeline.transitions.length - 1].to
+    current_stage: transitions.length
+      ? transitions[transitions.length - 1].to
       : null,
-    progress: computeProgress(summary, timeline),
+    progress: computeProgress(
+      { ...summary, rounds: roundNumbers.map((n) => ({ round: n })) },
+      { transitions }
+    ),
     messages,
     latest_test_results: latestTestText,
     unresolved_must_fix: Array.isArray(summary.unresolved_must_fix) ? summary.unresolved_must_fix : [],
@@ -949,7 +994,7 @@ const server = http.createServer(async (req, res) => {
         const body = await readRequestJson(req);
         const message = String(body.message || "").trim();
         if (!message) return sendJson(res, 400, { error: "message is required" });
-        appendFollowup(task.task_dir, message);
+        appendFollowup(task.task_dir, message, body.client_message_id || body.clientMessageId || null);
 
         const summary = task.summary || {};
         const roleConfig = body.role_config ? normalizeRoleConfig(body.role_config) : readRoleConfig();
