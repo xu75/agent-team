@@ -1,11 +1,19 @@
 "use strict";
 
-const { runOnce } = require("./coordinator");
+const { runTask } = require("./coordinator");
 
 const prompt = process.argv.slice(2).join(" ").trim() || "用一句话介绍你自己";
-runOnce(prompt)
-  .then(({ review }) => {
-    console.error("\n--- reviewer ---\n" + review);
+const provider = process.env.PROVIDER || "claude-cli";
+const model = process.env.CODEX_MODEL || undefined;
+const maxIterations = Number(process.env.MAX_ITERATIONS || 3);
+const testCommandTimeoutMs = Number(process.env.TEST_COMMAND_TIMEOUT_MS || 120000);
+const allowedTestCommands = process.env.ALLOWED_TEST_COMMANDS
+  ? process.env.ALLOWED_TEST_COMMANDS.split(",").map((s) => s.trim()).filter(Boolean)
+  : undefined;
+
+runTask(prompt, { provider, model, maxIterations, testCommandTimeoutMs, allowedTestCommands })
+  .then((summary) => {
+    console.error("\n--- task summary ---\n" + JSON.stringify(summary, null, 2));
     process.exit(0);
   })
   .catch((err) => {

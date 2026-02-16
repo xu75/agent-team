@@ -1,17 +1,359 @@
 "use strict";
 
-const { runClaude } = require("./engine/claude");
-const { reviewText } = require("./agents/reviewer");
+const fs = require("node:fs");
+const path = require("node:path");
 
-/**
- * Minimal coordinator example:
- * 1) Ask Claude something
- * 2) Run reviewer on the returned text
- */
-async function runOnce(prompt) {
-  const answer = await runClaude(prompt, { output: "inherit" });
-  const review = await reviewText(answer);
-  return { answer, review };
+const { runCoder } = require("./agents/coder");
+const { runReviewer } = require("./agents/reviewer");
+const { runTester } = require("./agents/tester");
+const { runTestCommands, DEFAULT_ALLOWED_PREFIXES } = require("./engine/test-runner");
+const { createTaskLogDir, roundDir, writeText, writeJson } = require("./engine/task-logger");
+
+const FSM_STATES = Object.freeze({
+  INTAKE: "intake",
+  PLAN: "plan",
+  BUILD: "build",
+  REVIEW: "review",
+  TEST: "test",
+  ITERATE: "iterate",
+  FINALIZE: "finalize",
+});
+
+const STATE_LABELS = Object.freeze({
+  [FSM_STATES.INTAKE]: "Intake",
+  [FSM_STATES.PLAN]: "Plan",
+  [FSM_STATES.BUILD]: "Build",
+  [FSM_STATES.REVIEW]: "Review",
+  [FSM_STATES.TEST]: "Test",
+  [FSM_STATES.ITERATE]: "Iterate",
+  [FSM_STATES.FINALIZE]: "Finalize",
+});
+
+function copyRunArtifacts(runDir, roundPath, prefix) {
+  if (!runDir) return;
+
+  const eventsSrc = path.join(runDir, "events.jsonl");
+  const rawSrc = path.join(runDir, "raw.ndjson");
+  const eventsDst = path.join(roundPath, `${prefix}.events.jsonl`);
+  const rawDst = path.join(roundPath, `${prefix}.raw.ndjson`);
+
+  if (fs.existsSync(eventsSrc)) fs.copyFileSync(eventsSrc, eventsDst);
+  if (fs.existsSync(rawSrc)) fs.copyFileSync(rawSrc, rawDst);
 }
 
-module.exports = { runOnce };
+function buildTimeline(taskId, stateEvents) {
+  const transitions = stateEvents.map((evt, idx) => {
+    const next = stateEvents[idx + 1] || null;
+    return {
+      index: idx,
+      ts: evt.ts,
+      from: evt.from,
+      to: evt.to,
+      label: STATE_LABELS[evt.to] || evt.to,
+      reason: evt.reason || null,
+      round: Number.isFinite(evt.round) ? evt.round : null,
+      duration_ms: next ? Math.max(0, next.ts - evt.ts) : null,
+    };
+  });
+
+  const roundMap = new Map();
+  for (const t of transitions) {
+    if (!Number.isFinite(t.round)) continue;
+    const current = roundMap.get(t.round) || {
+      round: t.round,
+      first_ts: t.ts,
+      last_ts: t.ts,
+      duration_ms: 0,
+      states: [],
+    };
+    current.first_ts = Math.min(current.first_ts, t.ts);
+    current.last_ts = Math.max(current.last_ts, t.ts);
+    if (Number.isFinite(t.duration_ms)) {
+      current.duration_ms += t.duration_ms;
+    }
+    current.states.push(t.to);
+    roundMap.set(t.round, current);
+  }
+
+  const rounds = Array.from(roundMap.values()).sort((a, b) => a.round - b.round);
+  const totalDurationMs =
+    transitions.length > 1
+      ? Math.max(0, transitions[transitions.length - 1].ts - transitions[0].ts)
+      : 0;
+
+  return {
+    task_id: taskId,
+    generated_at: Date.now(),
+    total_transitions: transitions.length,
+    total_duration_ms: totalDurationMs,
+    transitions,
+    rounds,
+  };
+}
+
+async function runTask(taskPrompt, options = {}) {
+  if (typeof taskPrompt !== "string" || !taskPrompt.trim()) {
+    throw new Error("taskPrompt must be a non-empty string");
+  }
+
+  const provider = options.provider || "claude-cli";
+  const model = options.model;
+  const maxIterations = Number.isFinite(options.maxIterations)
+    ? Math.max(1, Math.floor(options.maxIterations))
+    : 3;
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 10 * 60 * 1000;
+  const testCommandTimeoutMs = Number.isFinite(options.testCommandTimeoutMs)
+    ? options.testCommandTimeoutMs
+    : 2 * 60 * 1000;
+  const allowedTestCommands = Array.isArray(options.allowedTestCommands)
+    ? options.allowedTestCommands
+    : DEFAULT_ALLOWED_PREFIXES;
+
+  const { taskId, dir: taskDir } = createTaskLogDir("logs", options.taskId);
+  const taskEventsFile = path.join(taskDir, "task-events.jsonl");
+
+  writeText(path.join(taskDir, "task.md"), taskPrompt + "\n");
+
+  const rounds = [];
+  let mustFix = [];
+  let finalOutcome = "max_iterations_reached";
+  let currentState = null;
+  const stateEvents = [];
+
+  function transition(to, payload = {}) {
+    const evt = {
+      type: "fsm.transition",
+      ts: Date.now(),
+      task_id: taskId,
+      from: currentState,
+      to,
+      ...payload,
+    };
+    currentState = to;
+    stateEvents.push(evt);
+    fs.appendFileSync(taskEventsFile, JSON.stringify(evt) + "\n", "utf8");
+  }
+
+  transition(FSM_STATES.INTAKE, { reason: "task_received" });
+  transition(FSM_STATES.PLAN, { reason: "minimal_plan_bootstrap" });
+
+  for (let round = 1; round <= maxIterations; round += 1) {
+    transition(FSM_STATES.BUILD, { round, reason: "start_coder" });
+
+    const roundPath = roundDir(taskDir, round);
+    const attempt = round;
+
+    const coder = await runCoder({
+      provider,
+      model,
+      taskPrompt,
+      mustFix,
+      timeoutMs,
+      eventMeta: {
+        task_id: taskId,
+        round_id: round,
+        agent_role: "coder",
+        attempt,
+      },
+    });
+
+    writeText(path.join(roundPath, "coder_output.md"), coder.text);
+    writeJson(path.join(roundPath, "coder_run.json"), {
+      run_id: coder.runId,
+      run_dir: coder.runDir,
+      exit: coder.exit,
+    });
+    copyRunArtifacts(coder.runDir, roundPath, "coder");
+
+    transition(FSM_STATES.REVIEW, { round, reason: "start_reviewer" });
+
+    const reviewer = await runReviewer({
+      provider,
+      model,
+      taskPrompt,
+      coderOutput: coder.text,
+      timeoutMs,
+      eventMeta: {
+        task_id: taskId,
+        round_id: round,
+        agent_role: "reviewer",
+        attempt,
+      },
+    });
+
+    writeText(path.join(roundPath, "reviewer_raw.md"), reviewer.text);
+    writeJson(path.join(roundPath, "reviewer.json"), reviewer.review);
+    writeJson(path.join(roundPath, "reviewer_meta.json"), {
+      ok: reviewer.ok,
+      parse_error: reviewer.parse_error,
+      run_id: reviewer.runId,
+      run_dir: reviewer.runDir,
+      exit: reviewer.exit,
+    });
+    copyRunArtifacts(reviewer.runDir, roundPath, "reviewer");
+
+    rounds.push({
+      round,
+      coder: {
+        run_id: coder.runId,
+        exit_code: coder.exit.code,
+      },
+      reviewer: {
+        run_id: reviewer.runId,
+        ok: reviewer.ok,
+        parse_error: reviewer.parse_error,
+        decision: reviewer.review.decision,
+        must_fix_count: reviewer.review.must_fix.length,
+      },
+    });
+
+    if (!reviewer.ok) {
+      finalOutcome = "review_schema_invalid";
+      mustFix = reviewer.review.must_fix;
+      transition(FSM_STATES.FINALIZE, {
+        round,
+        reason: "review_schema_invalid",
+      });
+      break;
+    }
+
+    if (reviewer.review.decision === "approve") {
+      transition(FSM_STATES.TEST, { round, reason: "review_approved" });
+
+      const tester = await runTester({
+        provider,
+        model,
+        taskPrompt,
+        coderOutput: coder.text,
+        timeoutMs,
+        eventMeta: {
+          task_id: taskId,
+          round_id: round,
+          agent_role: "tester",
+          attempt,
+        },
+      });
+
+      writeText(path.join(roundPath, "tester_raw.md"), tester.text);
+      writeJson(path.join(roundPath, "tester.json"), tester.test_spec);
+      writeJson(path.join(roundPath, "tester_meta.json"), {
+        ok: tester.ok,
+        parse_error: tester.parse_error,
+        run_id: tester.runId,
+        run_dir: tester.runDir,
+        exit: tester.exit,
+      });
+      copyRunArtifacts(tester.runDir, roundPath, "tester");
+
+      const commands = tester.test_spec.commands || [];
+      const testRun = await runTestCommands(commands, {
+        timeoutMs: testCommandTimeoutMs,
+        cwd: process.cwd(),
+        env: process.env,
+        allowedPrefixes: allowedTestCommands,
+        stopOnFailure: true,
+      });
+
+      writeJson(path.join(roundPath, "test-results.json"), testRun);
+      writeText(
+        path.join(roundPath, "test-results.txt"),
+        testRun.results
+          .map((r, idx) => {
+            return [
+              `# Command ${idx + 1}`,
+              `cmd: ${r.command}`,
+              `ok: ${r.ok}`,
+              `code: ${r.code}`,
+              r.stdout ? `stdout:\n${r.stdout}` : "stdout:",
+              r.stderr ? `stderr:\n${r.stderr}` : "stderr:",
+              "",
+            ].join("\n");
+          })
+          .join("\n")
+      );
+
+      const roundRef = rounds[rounds.length - 1];
+      if (roundRef) {
+        roundRef.tester = {
+          run_id: tester.runId,
+          ok: tester.ok,
+          parse_error: tester.parse_error,
+          command_count: commands.length,
+          tests_passed: testRun.allPassed,
+        };
+      }
+
+      if (!tester.ok) {
+        mustFix = ["Tester output schema invalid"];
+        finalOutcome = "tester_schema_invalid";
+        transition(FSM_STATES.ITERATE, {
+          round,
+          reason: "tester_schema_invalid",
+        });
+        continue;
+      }
+
+      if (!testRun.allPassed) {
+        const failed = testRun.results.find((r) => !r.ok);
+        mustFix = [
+          "Tests failed in tester stage",
+          failed ? `Failed command: ${failed.command}` : "Unknown test failure",
+        ];
+        finalOutcome = "test_failed";
+        transition(FSM_STATES.ITERATE, {
+          round,
+          reason: "tests_failed",
+          failed_command: failed ? failed.command : null,
+        });
+        continue;
+      }
+
+      finalOutcome = "approved";
+      mustFix = [];
+      transition(FSM_STATES.FINALIZE, { round, reason: "tests_passed" });
+      break;
+    }
+
+    mustFix = reviewer.review.must_fix;
+    transition(FSM_STATES.ITERATE, {
+      round,
+      reason: "review_changes_requested",
+      must_fix_count: mustFix.length,
+    });
+  }
+
+  if (currentState !== FSM_STATES.FINALIZE) {
+    transition(FSM_STATES.FINALIZE, {
+      reason: finalOutcome === "max_iterations_reached" ? "max_iterations_reached" : "finalized",
+    });
+  }
+
+  const summary = {
+    task_id: taskId,
+    task_dir: taskDir,
+    timeline_file: path.join(taskDir, "task-timeline.json"),
+    provider,
+    model: model || null,
+    final_status: currentState,
+    final_outcome: finalOutcome,
+    max_iterations: maxIterations,
+    fsm_states: Object.values(FSM_STATES),
+    state_events: stateEvents,
+    rounds,
+    unresolved_must_fix: mustFix,
+  };
+  const timeline = buildTimeline(taskId, stateEvents);
+
+  writeJson(path.join(taskDir, "summary.json"), summary);
+  writeJson(path.join(taskDir, "task-timeline.json"), timeline);
+
+  return summary;
+}
+
+async function runOnce(prompt, options = {}) {
+  const summary = await runTask(prompt, options);
+  const lastRound = summary.rounds[summary.rounds.length - 1] || null;
+  return { summary, review: lastRound ? lastRound.reviewer : null };
+}
+
+module.exports = { FSM_STATES, runTask, runOnce };

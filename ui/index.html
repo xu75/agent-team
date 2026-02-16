@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cat Cafe Timeline</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="paw">●</span>
+          <h1>Cat Cafe</h1>
+        </div>
+        <div class="subtitle">Apple Flat Light UI</div>
+      </header>
+
+      <main class="layout">
+        <aside class="panel left-panel">
+          <div class="panel-title-row">
+            <h2>任务</h2>
+            <button id="refreshBtn" class="btn">刷新</button>
+          </div>
+          <input id="taskSearch" class="search" placeholder="搜索 task_id / provider" />
+          <div class="filter-row" id="statusFilters">
+            <button class="chip active" data-filter="all">全部</button>
+            <button class="chip" data-filter="positive">通过</button>
+            <button class="chip" data-filter="warning">进行中</button>
+            <button class="chip" data-filter="negative">失败</button>
+          </div>
+          <div id="taskList" class="task-list"></div>
+        </aside>
+
+        <section class="panel center-panel">
+          <div class="panel-title-row">
+            <h2 id="taskTitle">协作对话</h2>
+            <span id="taskMeta" class="meta-pill">未选择任务</span>
+          </div>
+
+          <div class="action-bar">
+            <button id="copyTaskBtn" class="btn">复制任务ID</button>
+            <button id="exportReportBtn" class="btn">导出报告</button>
+            <button id="rerunTaskBtn" class="btn">重跑任务</button>
+            <button id="clearRoundBtn" class="btn">清除回合筛选</button>
+          </div>
+
+          <div id="timeline" class="timeline-strip"></div>
+
+          <div class="chat-toolbar">
+            <h3>消息流</h3>
+            <span id="roundTag" class="meta-pill">All Rounds</span>
+          </div>
+
+          <div id="chatStream" class="chat-stream"></div>
+
+          <div class="composer">
+            <input id="runPromptInput" placeholder="输入新任务描述，例如：实现某个功能并给出测试计划" />
+            <select id="runProviderSelect">
+              <option value="claude-cli">claude-cli</option>
+              <option value="codex-cli">codex-cli</option>
+            </select>
+            <input id="runIterationsInput" type="number" min="1" max="8" value="3" />
+            <button id="runTaskBtn" class="btn primary">运行任务</button>
+          </div>
+          <div id="runTaskStatus" class="run-status"></div>
+        </section>
+
+        <aside class="panel right-panel">
+          <h2>状态栏</h2>
+          <div id="liveStage" class="live-stage"></div>
+          <h3>Agent 状态</h3>
+          <div id="agentStatus" class="agent-status"></div>
+
+          <h3>任务统计</h3>
+          <div class="stat-grid" id="stats"></div>
+
+          <h3>最近失败</h3>
+          <pre id="latestFailure" class="plain-block"></pre>
+
+          <h3>测试结果</h3>
+          <pre id="testResults" class="plain-block"></pre>
+
+          <h3>证据查看</h3>
+          <div id="evidenceMeta" class="evidence-meta">点击消息卡里的 Evidence 按钮查看。</div>
+          <pre id="evidenceViewer" class="plain-block"></pre>
+
+          <h3>未解决项</h3>
+          <ul id="mustFixList" class="simple-list"></ul>
+        </aside>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

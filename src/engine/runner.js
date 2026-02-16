@@ -23,6 +23,8 @@ async function runCommandStreaming({
   cmd,
   args,
   env = process.env,
+  stdoutParseMode = "ndjson",
+  eventMeta = {},
   timeoutMs = 10 * 60 * 1000,
   killGraceMs = 5000,
   logsRoot = "logs",
@@ -33,7 +35,7 @@ async function runCommandStreaming({
   const eventsWriter = createLineWriter(path.join(dir, "events.jsonl"));
   const rawWriter = createLineWriter(path.join(dir, "raw.ndjson"));
 
-  const baseMeta = { run_id: runId, provider: providerName };
+  const baseMeta = { run_id: runId, provider: providerName, ...eventMeta };
 
   let lastActivity = Date.now();
   let finished = false;
@@ -95,6 +97,11 @@ async function runCommandStreaming({
 
     rawWriter.writeLine(line);
     emit("run.stdout.line", { line });
+
+    if (stdoutParseMode === "text") {
+      emit("assistant.text", { text: line + "\n" });
+      return;
+    }
 
     try {
       const obj = JSON.parse(line);

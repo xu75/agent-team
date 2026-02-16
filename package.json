@@ -4,6 +4,9 @@
   "type": "commonjs",
   "scripts": {
     "min": "node scripts/minimal-claude.js",
-    "demo": "node src/index.js"
+    "demo": "node src/index.js",
+    "run:claude": "node scripts/run-claude.js",
+    "run:codex": "node scripts/run-codex.js",
+    "ui": "node scripts/ui-server.js"
   }
 }
