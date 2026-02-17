@@ -14,6 +14,13 @@ const ROLE_CONFIG_FILE = path.join(CONFIG_ROOT, "role-config.json");
 const PORT = Number(process.env.UI_PORT || 4173);
 const HOST = process.env.UI_HOST || "127.0.0.1";
 const ACTIVE_TASK_RUNS = new Map();
+const DEFAULT_PROJECT_ID = path.basename(ROOT).toLowerCase();
+const DEFAULT_PROJECT_NAME = path
+  .basename(ROOT)
+  .split(/[-_]/g)
+  .filter(Boolean)
+  .map((x) => x.slice(0, 1).toUpperCase() + x.slice(1))
+  .join(" ");
 
 const STAGES = ["coder", "reviewer", "tester"];
 const DEFAULT_STAGE_DUTY = Object.freeze({
@@ -384,12 +391,16 @@ function listTasks() {
       const tone = toneFromOutcome(summary.final_outcome);
       const preview = taskLastPreview(t.dir, summary);
       const updatedTs = taskUpdatedTs(summary, t.dir);
+      const projectId = clip(summary.project_id || summary.project || DEFAULT_PROJECT_ID, 64) || DEFAULT_PROJECT_ID;
+      const projectName = clip(summary.project_name || summary.workspace_name || DEFAULT_PROJECT_NAME, 96) || DEFAULT_PROJECT_NAME;
       const alertCount =
         unresolved.length +
         (tone === "negative" ? 1 : 0) +
         ((summary.final_outcome || "") === "max_iterations_reached" ? 1 : 0);
       return {
         task_id: summary.task_id || t.taskId,
+        project_id: projectId,
+        project_name: projectName,
         date: t.date,
         provider: summary.provider || "unknown",
         final_status: summary.final_status || null,

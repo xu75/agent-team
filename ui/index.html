@@ -8,21 +8,17 @@
   </head>
   <body>
     <div class="app-shell">
-      <header class="topbar">
-        <div class="brand">
-          <span class="paw">●</span>
-          <h1>Cat Cafe</h1>
-        </div>
-        <div class="subtitle">Apple Flat Light UI</div>
-      </header>
-
-      <main class="layout">
+      <main id="appLayout" class="layout">
         <aside class="panel left-panel">
-          <div class="panel-title-row">
-            <h2>任务</h2>
-            <button id="refreshBtn" class="btn">刷新</button>
+          <div class="column-top brand-top">
+            <span class="paw">●</span>
+            <h1>Cat Café</h1>
           </div>
-          <input id="taskSearch" class="search" placeholder="搜索 task_id / provider" />
+          <div class="panel-title-row">
+            <h2>对话</h2>
+            <button id="newChatBtn" class="btn primary">新对话</button>
+          </div>
+          <input id="taskSearch" class="search" placeholder="搜索项目 / task / provider" />
           <div class="filter-row" id="statusFilters">
             <button class="chip active" data-filter="all">全部</button>
             <button class="chip" data-filter="positive">通过</button>
@@ -33,30 +29,62 @@
         </aside>
 
         <section class="panel center-panel">
-          <div class="panel-title-row">
-            <h2 id="taskTitle">协作对话</h2>
-            <span id="taskMeta" class="meta-pill">未选择任务</span>
+          <div class="column-top center-top">
+            <h2 id="taskTitle">对话</h2>
+            <div class="top-icon-actions">
+              <button id="exportReportBtn" class="icon-btn" title="导出报告" aria-label="导出报告">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M8 3h6l5 5v13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" />
+                  <path d="M14 3v5h5" />
+                  <path d="M10 12h7M10 16h7M10 8h3" />
+                </svg>
+              </button>
+              <button id="exportChatImageBtn" class="icon-btn" title="导出长图" aria-label="导出长图">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="3" y="5" width="18" height="14" rx="2" />
+                  <path d="M7 14l3-3 3 3 3-4 2 3" />
+                  <circle cx="9" cy="9" r="1.2" />
+                </svg>
+              </button>
+              <button id="cancelRunBtn" class="icon-btn danger" title="终止运行" aria-label="终止运行">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                </svg>
+              </button>
+              <button
+                id="toggleRightPanelBtn"
+                class="icon-btn"
+                title="隐藏状态栏"
+                aria-label="隐藏状态栏"
+                aria-pressed="false"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="3" y="4" width="18" height="16" rx="2" />
+                  <path d="M15 4v16" />
+                  <path d="M11 12h2" />
+                </svg>
+              </button>
+              <button id="moreActionsBtn" class="icon-btn" title="更多操作" aria-label="更多操作">⋯</button>
+            </div>
+            <div id="moreActionsMenu" class="more-actions-menu" aria-hidden="true">
+              <button data-action="copy-task-id">复制任务ID</button>
+              <button data-action="export-page-image">导出整页长图</button>
+              <button data-action="rerun-task">重跑任务</button>
+              <button data-action="clear-round-filter">清除回合筛选</button>
+            </div>
           </div>
-
-          <div class="action-bar">
-            <button id="copyTaskBtn" class="btn">复制任务ID</button>
-            <button id="exportReportBtn" class="btn">导出报告</button>
-            <button id="rerunTaskBtn" class="btn">重跑任务</button>
-            <button id="cancelRunBtn" class="btn danger">终止运行</button>
-            <button id="clearRoundBtn" class="btn">清除回合筛选</button>
-          </div>
-
-          <div id="timeline" class="timeline-strip"></div>
-
-          <div class="chat-toolbar">
-            <h3>消息流</h3>
-            <span id="roundTag" class="meta-pill">All Rounds</span>
-          </div>
-
           <div id="chatStream" class="chat-stream"></div>
           <button id="jumpBottomBtn" class="jump-bottom-btn" title="回到最新消息" aria-label="回到最新消息">
-            ↓ 最新
+            ↓ 回到最新
           </button>
+          <aside id="evidenceDrawer" class="evidence-drawer" aria-hidden="true">
+            <div class="drawer-head">
+              <strong id="evidenceDrawerTitle">证据</strong>
+              <button id="evidenceDrawerClose" class="btn">关闭</button>
+            </div>
+            <div id="evidenceDrawerKinds" class="drawer-kinds"></div>
+            <pre id="evidenceDrawerBody" class="drawer-body">点击消息中的“证据”按钮查看。</pre>
+          </aside>
 
           <div class="composer">
             <input id="chatCommandInput" placeholder='输入命令，如：/task 实现登录接口；/task --provider codex-cli --rounds 2 修复失败测试；/rerun 继续上个任务' />
@@ -66,8 +94,19 @@
         </section>
 
         <aside class="panel right-panel">
-          <h2>状态栏</h2>
+          <div class="column-top right-top">
+            <h2>状态栏</h2>
+            <span id="rightRuntimeHint" class="runtime-hint">空闲</span>
+          </div>
+          <section id="flowCard">
+          <h3>流程状态</h3>
+          <div class="status-flow-head">
+            <span id="taskMeta" class="meta-pill">未选择任务</span>
+          </div>
+          <div id="timeline" class="timeline-strip"></div>
           <div id="liveStage" class="live-stage"></div>
+          </section>
+
           <h3>Agent 状态</h3>
           <div id="agentStatus" class="agent-status"></div>
 
@@ -97,5 +136,6 @@
     </div>
 
     <script src="/app.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   </body>
 </html>

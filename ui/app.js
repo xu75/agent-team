@@ -13,24 +13,39 @@ const state = {
   livePollBusy: false,
   liveDigest: "",
   runningTaskId: null,
+  evidenceDrawer: {
+    open: false,
+    round: null,
+    role: null,
+    kind: null,
+  },
+  collapsedProjects: new Set(),
 };
 
 const el = {
+  appLayout: document.getElementById("appLayout"),
   taskList: document.getElementById("taskList"),
   taskSearch: document.getElementById("taskSearch"),
-  refreshBtn: document.getElementById("refreshBtn"),
+  newChatBtn: document.getElementById("newChatBtn"),
   statusFilters: document.getElementById("statusFilters"),
   taskTitle: document.getElementById("taskTitle"),
   taskMeta: document.getElementById("taskMeta"),
   timeline: document.getElementById("timeline"),
   roundTag: document.getElementById("roundTag"),
-  copyTaskBtn: document.getElementById("copyTaskBtn"),
+  moreActionsBtn: document.getElementById("moreActionsBtn"),
+  moreActionsMenu: document.getElementById("moreActionsMenu"),
   exportReportBtn: document.getElementById("exportReportBtn"),
-  rerunTaskBtn: document.getElementById("rerunTaskBtn"),
+  exportChatImageBtn: document.getElementById("exportChatImageBtn"),
   cancelRunBtn: document.getElementById("cancelRunBtn"),
-  clearRoundBtn: document.getElementById("clearRoundBtn"),
+  toggleRightPanelBtn: document.getElementById("toggleRightPanelBtn"),
   chatStream: document.getElementById("chatStream"),
   jumpBottomBtn: document.getElementById("jumpBottomBtn"),
+  evidenceDrawer: document.getElementById("evidenceDrawer"),
+  evidenceDrawerTitle: document.getElementById("evidenceDrawerTitle"),
+  evidenceDrawerKinds: document.getElementById("evidenceDrawerKinds"),
+  evidenceDrawerBody: document.getElementById("evidenceDrawerBody"),
+  evidenceDrawerClose: document.getElementById("evidenceDrawerClose"),
+  rightRuntimeHint: document.getElementById("rightRuntimeHint"),
   chatCommandInput: document.getElementById("chatCommandInput"),
   sendCommandBtn: document.getElementById("sendCommandBtn"),
   runTaskStatus: document.getElementById("runTaskStatus"),
@@ -45,6 +60,8 @@ const el = {
   evidenceViewer: document.getElementById("evidenceViewer"),
   mustFixList: document.getElementById("mustFixList"),
 };
+
+let rightPanelCollapsed = false;
 
 const DEFAULT_ROLE_CONFIG = {
   version: 2,
@@ -189,6 +206,23 @@ function roundsLabel(rounds) {
   const n = Math.max(0, Number(rounds || 0));
   if (!n) return "";
   return `${n}轮`;
+}
+
+function normalizeProjectId(v) {
+  return String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9\-_]/g, "") || "default";
+}
+
+function taskProjectInfo(t) {
+  const rawName = String(t?.project_name || t?.project_id || "默认项目").trim();
+  const rawId = String(t?.project_id || rawName).trim();
+  return {
+    id: normalizeProjectId(rawId),
+    name: rawName || "默认项目",
+  };
 }
 
 function roleAvatar(role) {
@@ -538,15 +572,17 @@ function updateActionAvailability() {
   const hasTask = !!state.selectedTaskId;
   const busy = !!state.busy;
   const canCancel = !!state.selectedTaskId && state.runningTaskId === state.selectedTaskId;
+  const setDisabled = (node, value) => {
+    if (node) node.disabled = value;
+  };
   el.sendCommandBtn.disabled = busy;
-  el.refreshBtn.disabled = busy;
+  if (el.newChatBtn) el.newChatBtn.disabled = busy;
   el.chatCommandInput.disabled = busy;
-  el.copyTaskBtn.disabled = busy || !hasTask;
-  el.exportReportBtn.disabled = busy || !hasTask;
-  el.rerunTaskBtn.disabled = busy || !hasTask;
-  el.cancelRunBtn.disabled = !canCancel;
-  el.clearRoundBtn.disabled = busy || !hasTask;
-  el.saveRolesBtn.disabled = busy;
+  setDisabled(el.exportReportBtn, busy || !hasTask);
+  setDisabled(el.exportChatImageBtn, busy || !hasTask);
+  setDisabled(el.cancelRunBtn, !canCancel);
+  setDisabled(el.moreActionsBtn, busy || !hasTask);
+  setDisabled(el.saveRolesBtn, busy);
 }
 
 function setBusy(v) {
@@ -595,6 +631,21 @@ function taskGroups(tasks) {
   return Array.from(map.entries());
 }
 
+function projectTaskGroups(tasks) {
+  const map = new Map();
+  for (const t of tasks) {
+    const p = taskProjectInfo(t);
+    if (!map.has(p.id)) map.set(p.id, { id: p.id, name: p.name, tasks: [] });
+    map.get(p.id).tasks.push(t);
+  }
+  return Array.from(map.values())
+    .map((p) => {
+      p.tasks.sort((a, b) => (b.updated_ts || 0) - (a.updated_ts || 0));
+      return p;
+    })
+    .sort((a, b) => (b.tasks[0]?.updated_ts || 0) - (a.tasks[0]?.updated_ts || 0));
+}
+
 function renderTasks() {
   el.taskList.innerHTML = "";
   if (!state.filtered.length) {
@@ -603,39 +654,70 @@ function renderTasks() {
     return;
   }
 
-  const groups = taskGroups(state.filtered);
-  groups.forEach(([date, list]) => {
-    const section = document.createElement("section");
-    section.className = "task-section";
-    section.innerHTML = `<div class="task-section-title">${date}</div>`;
-    const box = document.createElement("div");
-    box.className = "task-section-list";
+  const projects = projectTaskGroups(state.filtered);
+  projects.forEach((project) => {
+    const projectSection = document.createElement("section");
+    const collapsed = state.collapsedProjects.has(project.id);
+    projectSection.className = `project-section${collapsed ? " collapsed" : ""}`;
 
-    list.forEach((t) => {
-      const row = document.createElement("div");
-      row.className =
-        `task-item tone-${t.status_tone || toneFromOutcome(t.final_outcome)}` +
-        (t.task_id === state.selectedTaskId ? " active" : "");
-      row.innerHTML = `
-        <div class="task-head">
-          <div class="task-title" title="${escapeHtml(t.task_id)}">${escapeHtml(taskTitleLine(t))}</div>
-          <div class="task-right">
-            <span class="mini-time">${fmtRelativeTime(t.updated_ts)}</span>
-            ${Number(t.alert_count) > 0 ? `<span class="alert-badge">${t.alert_count}</span>` : ""}
+    const warningCount = project.tasks.reduce((sum, t) => sum + Number(t.alert_count || 0), 0);
+    const latest = project.tasks[0];
+    projectSection.innerHTML = `
+      <button class="project-head" data-project-toggle="${escapeHtml(project.id)}">
+        <span class="caret">${collapsed ? "▸" : "▾"}</span>
+        <span class="project-name">${escapeHtml(project.name)}</span>
+        <span class="project-meta">${project.tasks.length} 个任务 · ${fmtRelativeTime(latest?.updated_ts)}</span>
+        ${warningCount > 0 ? `<span class="alert-badge">${warningCount}</span>` : ""}
+      </button>
+      <div class="project-body"></div>
+    `;
+    const body = projectSection.querySelector(".project-body");
+    const groups = taskGroups(project.tasks);
+    groups.forEach(([date, list]) => {
+      const section = document.createElement("section");
+      section.className = "task-section";
+      section.innerHTML = `<div class="task-section-title">${date}</div>`;
+      const box = document.createElement("div");
+      box.className = "task-section-list";
+
+      list.forEach((t) => {
+        const row = document.createElement("div");
+        row.className =
+          `task-item tone-${t.status_tone || toneFromOutcome(t.final_outcome)}` +
+          (t.task_id === state.selectedTaskId ? " active" : "");
+        row.innerHTML = `
+          <div class="task-head">
+            <div class="task-title" title="${escapeHtml(t.task_id)}">${escapeHtml(taskTitleLine(t))}</div>
+            <div class="task-right">
+              <span class="mini-time">${fmtRelativeTime(t.updated_ts)}</span>
+              ${Number(t.alert_count) > 0 ? `<span class="alert-badge">${t.alert_count}</span>` : ""}
+            </div>
           </div>
-        </div>
-        <div class="main">${escapeHtml(taskStatusLine(t))}</div>
-        <div class="preview">${escapeHtml(previewLine(t))}</div>
-        <div class="task-foot">
-          <span class="round-dots" title="对话轮次">${roundsLabel(t.rounds)}</span>
-        </div>
-      `;
-      row.addEventListener("click", () => selectTask(t.task_id));
-      box.appendChild(row);
+          <div class="main">${escapeHtml(taskStatusLine(t))}</div>
+          <div class="preview">${escapeHtml(previewLine(t))}</div>
+          <div class="task-foot">
+            <span class="round-dots" title="对话轮次">${roundsLabel(t.rounds)}</span>
+          </div>
+        `;
+        row.addEventListener("click", () => selectTask(t.task_id));
+        box.appendChild(row);
+      });
+
+      section.appendChild(box);
+      body.appendChild(section);
     });
 
-    section.appendChild(box);
-    el.taskList.appendChild(section);
+    const toggle = projectSection.querySelector("[data-project-toggle]");
+    toggle.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      if (state.collapsedProjects.has(project.id)) {
+        state.collapsedProjects.delete(project.id);
+      } else {
+        state.collapsedProjects.add(project.id);
+      }
+      renderTasks();
+    });
+    el.taskList.appendChild(projectSection);
   });
 }
 
@@ -646,6 +728,8 @@ function applyFilter() {
     if (state.statusFilter !== "all" && tone !== state.statusFilter) return false;
     if (!q) return true;
     return (
+      String(t.project_name || "").toLowerCase().includes(q) ||
+      String(t.project_id || "").toLowerCase().includes(q) ||
       t.task_id.toLowerCase().includes(q) ||
       String(t.task_title || "").toLowerCase().includes(q) ||
       String(t.provider).toLowerCase().includes(q) ||
@@ -769,6 +853,52 @@ function renderEvidencePlaceholder() {
   el.evidenceViewer.textContent = "暂无证据内容。";
 }
 
+function setEvidenceDrawerOpen(open) {
+  state.evidenceDrawer.open = !!open;
+  el.evidenceDrawer.classList.toggle("show", !!open);
+  el.evidenceDrawer.setAttribute("aria-hidden", open ? "false" : "true");
+}
+
+function renderEvidenceDrawerKinds(kinds, activeKind, round, role) {
+  el.evidenceDrawerKinds.innerHTML = (kinds || [])
+    .map(
+      (kind) =>
+        `<button class="chip ${kind === activeKind ? "active" : ""}" data-drawer-kind="${kind}" data-drawer-round="${round}" data-drawer-role="${role}">${kind}</button>`
+    )
+    .join("");
+}
+
+async function openEvidenceDrawer(round, role, preferredKind = null) {
+  const kinds = evidenceKindsForRole(role);
+  if (!kinds.length) return;
+  const kind = preferredKind && kinds.includes(preferredKind) ? preferredKind : kinds[0];
+  state.evidenceDrawer.round = round;
+  state.evidenceDrawer.role = role;
+  state.evidenceDrawer.kind = kind;
+  setEvidenceDrawerOpen(true);
+  el.evidenceDrawerTitle.textContent = `${role} · R${round}`;
+  renderEvidenceDrawerKinds(kinds, kind, round, role);
+  el.evidenceDrawerBody.className = "drawer-body";
+  el.evidenceDrawerBody.textContent = "加载中...";
+
+  try {
+    const ev = await getJson(
+      `/api/tasks/${state.selectedTaskId}/evidence?round=${round}&role=${encodeURIComponent(
+        role
+      )}&kind=${encodeURIComponent(kind)}`
+    );
+    el.evidenceDrawerBody.className = "drawer-body";
+    if (kind === "events" || kind === "raw") el.evidenceDrawerBody.classList.add("warning");
+    if (kind === "tests" || kind === "tests_json") el.evidenceDrawerBody.classList.add("positive");
+    if (kind === "meta" || kind === "json") el.evidenceDrawerBody.classList.add("neutral");
+    el.evidenceDrawerBody.textContent = ev.content || "";
+    openEvidence(round, role, kind).catch(() => {});
+  } catch (err) {
+    el.evidenceDrawerBody.className = "drawer-body negative";
+    el.evidenceDrawerBody.textContent = `加载证据失败: ${err.message}`;
+  }
+}
+
 async function openEvidence(round, role, kind) {
   if (!state.selectedTaskId) return;
   try {
@@ -802,61 +932,111 @@ function renderChat() {
     updateJumpBottomVisibility();
     return;
   }
-  messages.forEach((m) => {
-    const msgId = String(m.id || `${m.role}-${m.round ?? "na"}-${m.ts ?? Date.now()}`);
-    messageMap.set(msgId, m);
-    const item = document.createElement("article");
-    item.className = `chat-msg role-${m.role}`;
-    const statusDot = m.ok === false ? "status-bad" : m.ok === true ? "status-ok" : "status-idle";
-    const evidenceButtons =
-      Number.isFinite(m.round) && m.role !== "task"
-        ? evidenceKindsForRole(m.role)
-            .map(
-              (kind) =>
-                `<button class="ev-btn" data-round="${m.round}" data-role="${m.role}" data-kind="${kind}">${kind}</button>`
-            )
-            .join("")
-        : "";
-    const meta = metaLine(m);
-    const metaHtml = meta ? `<div class="meta">${meta}</div>` : "";
-    const renderedText = renderMessageText(m);
-    const rawText = String(renderedText || "");
-    const lineCount = rawText.split("\n").length;
-    const collapsible = rawText.length > 700 || lineCount > 18;
-    const textHtml = collapsible
-      ? `<pre class="msg-text collapsed" data-collapsible="1">${rawText}</pre>
-         <button class="toggle-expand" data-expand-btn="1">展开全文</button>`
-      : `<pre class="msg-text">${rawText}</pre>`;
-    item.innerHTML = `
-      <header>
+  const groups = [];
+  for (const m of messages) {
+    const g = groups[groups.length - 1];
+    const sameRole = g && g.role === m.role;
+    const sameRound =
+      g &&
+      ((Number.isFinite(g.round) && Number.isFinite(m.round) && g.round === m.round) ||
+        (!Number.isFinite(g.round) && !Number.isFinite(m.round)));
+    const nearTs = g && Math.abs((m.ts || 0) - (g.lastTs || 0)) <= 5 * 60 * 1000;
+    if (sameRole && sameRound && nearTs) {
+      g.messages.push(m);
+      g.lastTs = m.ts || g.lastTs;
+    } else {
+      groups.push({
+        role: m.role,
+        round: Number.isFinite(m.round) ? m.round : null,
+        roleLabel: displayRoleLabel(m.role, m.role_label),
+        firstTs: m.ts || Date.now(),
+        lastTs: m.ts || Date.now(),
+        messages: [m],
+      });
+    }
+  }
+
+  groups.forEach((g) => {
+    const block = document.createElement("article");
+    block.className = `chat-group role-${g.role}`;
+    block.innerHTML = `
+      <header class="group-head">
         <div class="lhs">
-          <span class="avatar">${roleAvatar(m.role)}</span>
-          <span class="role">${displayRoleLabel(m.role, m.role_label)}</span>
-          ${Number.isFinite(m.round) ? `<span class="round">R${m.round}</span>` : ""}
-          <span class="dot ${statusDot}"></span>
+          <span class="avatar">${roleAvatar(g.role)}</span>
+          <span class="role">${escapeHtml(g.roleLabel)}</span>
+          ${Number.isFinite(g.round) ? `<span class="round">R${g.round}</span>` : ""}
+          <time class="group-time">${fmtTime(g.firstTs)}</time>
         </div>
-        <time>${fmtTime(m.ts)}</time>
       </header>
-      ${metaHtml}
-      ${textHtml}
-      <div class="msg-footer">
-        ${evidenceButtons ? `<div class="evidence-row"><span>Evidence:</span>${evidenceButtons}</div>` : `<div></div>`}
+      <div class="group-body"></div>
+    `;
+    const body = block.querySelector(".group-body");
+
+    g.messages.forEach((m, idx) => {
+      const msgId = String(m.id || `${m.role}-${m.round ?? "na"}-${m.ts ?? Date.now()}-${idx}`);
+      messageMap.set(msgId, m);
+      const statusDot = m.ok === false ? "status-bad" : m.ok === true ? "status-ok" : "status-idle";
+      const evidenceButtons =
+        Number.isFinite(m.round) && m.role !== "task"
+          ? `<button class="btn evidence-open-btn" data-round="${m.round}" data-role="${m.role}">证据</button>`
+          : "";
+      const meta = metaLine(m);
+      const detailLine =
+        m.role !== "task" && (meta || evidenceButtons)
+          ? `
+            <div class="msg-detailline">
+              ${meta ? `<span class="detail-meta">${escapeHtml(meta)}</span>` : ""}
+              ${evidenceButtons ? `<span class="detail-actions">${evidenceButtons}</span>` : ""}
+            </div>
+          `
+          : "";
+      const renderedText = renderMessageText(m);
+      const rawText = String(renderedText || "");
+      const lineCount = rawText.split("\n").length;
+      const collapsible = rawText.length > 700 || lineCount > 18;
+      const textHtml = collapsible
+        ? `<pre class="msg-text collapsed" data-collapsible="1">${escapeHtml(rawText)}</pre>
+           <button class="toggle-expand" data-expand-btn="1">展开全文</button>`
+        : `<pre class="msg-text">${escapeHtml(rawText)}</pre>`;
+      const bubble = document.createElement("div");
+      bubble.className = "msg-bubble";
+      bubble.innerHTML = `
+        <div class="bubble-top"><span class="dot ${statusDot}"></span></div>
         <button class="copy-msg-btn" data-copy-msg="${escapeHtml(msgId)}" title="复制消息" aria-label="复制消息">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M9 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Zm-4 6H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
           </svg>
         </button>
-      </div>
-    `;
-    el.chatStream.appendChild(item);
+        ${textHtml}
+      `;
+      body.appendChild(bubble);
+      if (detailLine) {
+        const detail = document.createElement("div");
+        detail.innerHTML = detailLine;
+        body.appendChild(detail.firstElementChild);
+      }
+    });
+    el.chatStream.appendChild(block);
   });
 
   Array.from(el.chatStream.querySelectorAll(".ev-btn")).forEach((btn) => {
+    btn.remove();
+  });
+
+  Array.from(el.chatStream.querySelectorAll(".evidence-open-btn")).forEach((btn) => {
     btn.addEventListener("click", () => {
       const round = Number(btn.dataset.round);
-      const role = btn.dataset.role;
-      const kind = btn.dataset.kind;
-      openEvidence(round, role, kind);
+      const role = String(btn.dataset.role || "");
+      if (!Number.isFinite(round) || !role) return;
+      if (state.evidenceDrawer.open) {
+        const sameTarget =
+          state.evidenceDrawer.round === round && state.evidenceDrawer.role === role;
+        if (sameTarget) {
+          setEvidenceDrawerOpen(false);
+          return;
+        }
+      }
+      openEvidenceDrawer(round, role).catch(() => {});
     });
   });
 
@@ -898,6 +1078,7 @@ function renderChat() {
 }
 
 function renderRoundTag() {
+  if (!el.roundTag) return;
   if (Number.isFinite(state.selectedRound)) {
     el.roundTag.textContent = `Round ${state.selectedRound}`;
   } else {
@@ -1037,9 +1218,14 @@ function syncComposerWithCurrentTask() {
 function renderTaskPage(opts = {}) {
   const preserveEvidence = !!opts.preserveEvidence;
   const summary = state.detail?.summary || {};
-  el.taskTitle.textContent = `协作对话 · ${state.selectedTaskId}`;
+  const selected = state.tasks.find((t) => t.task_id === state.selectedTaskId);
+  el.taskTitle.textContent = String(selected?.task_title || selected?.task_id || "对话");
   el.taskMeta.textContent = `${summary.provider || "-"} · ${summary.final_outcome || "-"}`;
   el.taskMeta.className = `meta-pill ${toneFromOutcome(summary.final_outcome)}`.trim();
+  if (el.rightRuntimeHint) {
+    const current = state.messagesData?.current_stage || summary.final_status || "-";
+    el.rightRuntimeHint.textContent = `${summary.provider || "-"} · ${current}`;
+  }
   renderRoundTag();
   renderTimeline();
   renderChat();
@@ -1049,7 +1235,9 @@ function renderTaskPage(opts = {}) {
   renderLatestFailure();
   renderMustFix();
   renderRoundTestResults().catch(() => {});
+  setMoreActionsMenu(false);
   if (!preserveEvidence) renderEvidencePlaceholder();
+  if (!preserveEvidence) setEvidenceDrawerOpen(false);
   syncComposerWithCurrentTask();
   updateActionAvailability();
   updateJumpBottomVisibility();
@@ -1072,11 +1260,11 @@ async function selectTask(taskId) {
 }
 
 function renderEmptyScreen() {
-  el.taskTitle.textContent = "协作对话";
+  el.taskTitle.textContent = "对话";
   el.taskMeta.className = "meta-pill";
   el.taskMeta.textContent = "暂无任务";
   el.timeline.innerHTML = '<div class="timeline-empty">还没有任务数据。</div>';
-  el.roundTag.textContent = "All Rounds";
+  if (el.roundTag) el.roundTag.textContent = "All Rounds";
   el.chatStream.innerHTML = '<div class="empty-block">先运行一个任务，然后在这里查看多 Agent 对话回放。</div>';
   el.liveStage.innerHTML = '<div class="stage-card"><div class="k">Current Stage</div><div class="v">-</div></div>';
   el.agentStatus.innerHTML = "";
@@ -1086,7 +1274,10 @@ function renderEmptyScreen() {
   el.testResults.className = "plain-block warning";
   el.testResults.textContent = "暂无测试结果。";
   el.mustFixList.innerHTML = "<li>无</li>";
+  setMoreActionsMenu(false);
+  if (el.rightRuntimeHint) el.rightRuntimeHint.textContent = "空闲";
   renderEvidencePlaceholder();
+  setEvidenceDrawerOpen(false);
   updateJumpBottomVisibility();
   updateActionAvailability();
 }
@@ -1404,6 +1595,344 @@ async function exportCurrentReport() {
   }
 }
 
+function collectPageCssText() {
+  const chunks = [];
+  for (const sheet of Array.from(document.styleSheets || [])) {
+    try {
+      const rules = Array.from(sheet.cssRules || []);
+      chunks.push(rules.map((r) => r.cssText).join("\n"));
+    } catch {}
+  }
+  return chunks.join("\n");
+}
+
+async function getHtml2Canvas() {
+  if (typeof window.html2canvas === "function") return window.html2canvas;
+  const script = document.createElement("script");
+  script.src = "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js";
+  script.async = true;
+  await new Promise((resolve, reject) => {
+    script.onload = resolve;
+    script.onerror = () => reject(new Error("无法加载 html2canvas"));
+    document.head.appendChild(script);
+  });
+  if (typeof window.html2canvas !== "function") {
+    throw new Error("html2canvas 未就绪");
+  }
+  return window.html2canvas;
+}
+
+async function exportCurrentImage() {
+  if (!state.selectedTaskId) return;
+  const prevRound = state.selectedRound;
+  const hadRoundFilter = Number.isFinite(prevRound);
+  let host = null;
+  let svgUrl = null;
+  let svgBlob = null;
+  try {
+    setBusy(true);
+
+    if (hadRoundFilter) {
+      state.selectedRound = null;
+      renderRoundTag();
+      renderTimeline();
+      renderChat();
+      await renderRoundTestResults().catch(() => {});
+    }
+
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    const shell = document.querySelector(".app-shell");
+    if (!shell) throw new Error("页面节点不存在");
+
+    host = document.createElement("div");
+    host.style.position = "fixed";
+    host.style.left = "-100000px";
+    host.style.top = "0";
+    host.style.zIndex = "-1";
+    host.style.pointerEvents = "none";
+    document.body.appendChild(host);
+
+    const clone = shell.cloneNode(true);
+    clone.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+    clone.style.width = `${shell.clientWidth}px`;
+    clone.style.height = "auto";
+    clone.style.maxHeight = "none";
+
+    // Stabilize layout for export: keep timeline viewport, expand only chat stream.
+    const freezeStyle = document.createElement("style");
+    freezeStyle.textContent = `
+      * { animation: none !important; transition: none !important; }
+      .timeline-strip { overflow: hidden !important; }
+      .jump-bottom-btn, .copy-msg-btn, .toggle-expand, .evidence-open-btn, .evidence-drawer { display: none !important; }
+    `;
+    clone.appendChild(freezeStyle);
+
+    const cloneLayout = clone.querySelector(".layout");
+    if (cloneLayout) cloneLayout.style.height = "auto";
+    const cloneCenter = clone.querySelector(".center-panel");
+    if (cloneCenter) {
+      cloneCenter.style.overflow = "hidden";
+      cloneCenter.style.height = "auto";
+      cloneCenter.style.maxHeight = "none";
+    }
+    const cloneChat = clone.querySelector("#chatStream");
+    if (cloneChat) {
+      cloneChat.style.overflow = "visible";
+      cloneChat.style.height = "auto";
+      cloneChat.style.maxHeight = "none";
+      cloneChat.style.flex = "none";
+      Array.from(cloneChat.querySelectorAll(".msg-text.collapsed")).forEach((node) => {
+        node.classList.remove("collapsed");
+        node.classList.add("expanded");
+      });
+      Array.from(cloneChat.querySelectorAll("[data-expand-btn='1']")).forEach((btn) => btn.remove());
+    }
+    const cloneJump = clone.querySelector("#jumpBottomBtn");
+    if (cloneJump) cloneJump.remove();
+    host.appendChild(clone);
+
+    const width = Math.max(1, Math.ceil(clone.scrollWidth));
+    const height = Math.max(1, Math.ceil(clone.scrollHeight));
+    const maxDim = 16000;
+    const fitScale = height > maxDim ? maxDim / height : 1;
+    const outWidth = Math.max(1, Math.floor(width * fitScale));
+    const outHeight = Math.max(1, Math.floor(height * fitScale));
+
+    const cssText = collectPageCssText();
+    const serialized = new XMLSerializer().serializeToString(clone);
+    const xhtml = `
+      <div xmlns="http://www.w3.org/1999/xhtml">
+        <style>${cssText}</style>
+        ${serialized}
+      </div>
+    `;
+    const svg = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}" viewBox="0 0 ${width} ${height}">
+        <foreignObject x="0" y="0" width="${width}" height="${height}">${xhtml}</foreignObject>
+      </svg>
+    `;
+    svgBlob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+    svgUrl = URL.createObjectURL(svgBlob);
+
+    try {
+      const html2canvas = await getHtml2Canvas();
+      const rendered = await html2canvas(clone, {
+        backgroundColor: "#f4f3f1",
+        useCORS: true,
+        allowTaint: false,
+        scale: Math.max(1, Math.min(2, window.devicePixelRatio || 1)),
+        width,
+        height,
+        windowWidth: width,
+        windowHeight: height,
+      });
+      let canvas = rendered;
+      if (fitScale < 1) {
+        const scaled = document.createElement("canvas");
+        scaled.width = outWidth;
+        scaled.height = outHeight;
+        const sctx = scaled.getContext("2d");
+        if (!sctx) throw new Error("无法创建画布");
+        sctx.drawImage(rendered, 0, 0, outWidth, outHeight);
+        canvas = scaled;
+      }
+
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png", 1));
+      if (!blob) throw new Error("图片生成失败");
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `task-${state.selectedTaskId}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(blobUrl);
+    } catch (canvasErr) {
+      const msg = String(canvasErr?.message || canvasErr || "");
+      const isCanvasSecurityError =
+        /insecure|security|tainted|origin-clean|cross-origin|toBlob|html2canvas/i.test(msg) ||
+        canvasErr?.name === "SecurityError";
+      if (!isCanvasSecurityError || !svgBlob) throw canvasErr;
+      const rawUrl = URL.createObjectURL(svgBlob);
+      const a = document.createElement("a");
+      a.href = rawUrl;
+      a.download = `task-${state.selectedTaskId}.svg`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(rawUrl);
+      showToast("浏览器安全限制导致 PNG 失败，已导出 SVG 长图", "warning");
+      setRunStatus(`已导出 SVG：${state.selectedTaskId}`, false);
+      return;
+    }
+    if (fitScale < 1) {
+      showToast("内容过长，已按比例缩放导出", "warning");
+    } else {
+      showToast("图片已导出", "positive");
+    }
+    setRunStatus(`图片导出完成：${state.selectedTaskId}`, false);
+  } catch (err) {
+    showToast(`导出图片失败：${err.message}`, "negative");
+    setRunStatus(`导出图片失败：${err.message}`, false);
+  } finally {
+    if (svgUrl) URL.revokeObjectURL(svgUrl);
+    if (host) host.remove();
+    if (hadRoundFilter) {
+      state.selectedRound = prevRound;
+      renderRoundTag();
+      renderTimeline();
+      renderChat();
+      renderRoundTestResults().catch(() => {});
+    }
+    setBusy(false);
+  }
+}
+
+async function exportCurrentChatImage() {
+  if (!state.selectedTaskId) return;
+  let host = null;
+  let svgUrl = null;
+  let svgBlob = null;
+  try {
+    setBusy(true);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    host = document.createElement("div");
+    host.style.position = "fixed";
+    host.style.left = "-100000px";
+    host.style.top = "0";
+    host.style.zIndex = "-1";
+    host.style.pointerEvents = "none";
+    document.body.appendChild(host);
+
+    const shell = document.createElement("section");
+    shell.style.width = `${Math.max(680, el.chatStream.clientWidth)}px`;
+    shell.style.background = "#fcfbfa";
+    shell.style.border = "1px solid #e7e1dc";
+    shell.style.borderRadius = "14px";
+    shell.style.padding = "12px";
+    shell.style.boxSizing = "border-box";
+
+    const title = document.createElement("div");
+    title.style.display = "flex";
+    title.style.alignItems = "center";
+    title.style.justifyContent = "space-between";
+    title.style.marginBottom = "8px";
+    title.innerHTML = `<strong style="font-size:14px;color:#2f2c29;">消息流</strong><span style="font-size:12px;color:#847b74;">${escapeHtml(
+      String(state.selectedTaskId)
+    )}</span>`;
+    shell.appendChild(title);
+
+    const toolbar = document.querySelector(".chat-toolbar");
+    if (toolbar) {
+      const toolbarClone = toolbar.cloneNode(true);
+      shell.appendChild(toolbarClone);
+    }
+
+    const chatClone = el.chatStream.cloneNode(true);
+    chatClone.style.marginTop = "10px";
+    chatClone.style.overflow = "visible";
+    chatClone.style.height = "auto";
+    chatClone.style.maxHeight = "none";
+    chatClone.style.flex = "none";
+    Array.from(chatClone.querySelectorAll(".msg-text.collapsed")).forEach((node) => {
+      node.classList.remove("collapsed");
+      node.classList.add("expanded");
+    });
+    Array.from(chatClone.querySelectorAll(".toggle-expand,.copy-msg-btn,.ev-btn,.evidence-open-btn")).forEach((node) =>
+      node.remove()
+    );
+    shell.appendChild(chatClone);
+    host.appendChild(shell);
+
+    const width = Math.max(1, Math.ceil(shell.scrollWidth));
+    const height = Math.max(1, Math.ceil(shell.scrollHeight));
+    const maxDim = 16000;
+    const fitScale = height > maxDim ? maxDim / height : 1;
+    const outWidth = Math.max(1, Math.floor(width * fitScale));
+    const outHeight = Math.max(1, Math.floor(height * fitScale));
+
+    const html2canvas = await getHtml2Canvas();
+    const rendered = await html2canvas(shell, {
+      backgroundColor: "#fcfbfa",
+      useCORS: true,
+      allowTaint: false,
+      scale: Math.max(1, Math.min(2, window.devicePixelRatio || 1)),
+      width,
+      height,
+      windowWidth: width,
+      windowHeight: height,
+    });
+    let canvas = rendered;
+    if (fitScale < 1) {
+      const scaled = document.createElement("canvas");
+      scaled.width = outWidth;
+      scaled.height = outHeight;
+      const sctx = scaled.getContext("2d");
+      if (!sctx) throw new Error("无法创建画布");
+      sctx.drawImage(rendered, 0, 0, outWidth, outHeight);
+      canvas = scaled;
+    }
+
+    try {
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png", 1));
+      if (!blob) throw new Error("图片生成失败");
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `task-${state.selectedTaskId}-chat.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(blobUrl);
+      showToast(fitScale < 1 ? "消息流过长，已按比例缩放导出" : "消息流图片已导出", fitScale < 1 ? "warning" : "positive");
+      setRunStatus(`消息流图片导出完成：${state.selectedTaskId}`, false);
+      return;
+    } catch (canvasErr) {
+      const cssText = collectPageCssText();
+      const serialized = new XMLSerializer().serializeToString(shell);
+      const xhtml = `
+        <div xmlns="http://www.w3.org/1999/xhtml">
+          <style>${cssText}</style>
+          ${serialized}
+        </div>
+      `;
+      const svg = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="${outWidth}" height="${outHeight}" viewBox="0 0 ${width} ${height}">
+          <foreignObject x="0" y="0" width="${width}" height="${height}">${xhtml}</foreignObject>
+        </svg>
+      `;
+      svgBlob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+      svgUrl = URL.createObjectURL(svgBlob);
+
+      const msg = String(canvasErr?.message || canvasErr || "");
+      const isCanvasSecurityError =
+        /insecure|security|tainted|origin-clean|cross-origin|toBlob|html2canvas/i.test(msg) ||
+        canvasErr?.name === "SecurityError";
+      if (!isCanvasSecurityError || !svgBlob) throw canvasErr;
+
+      const rawUrl = URL.createObjectURL(svgBlob);
+      const a = document.createElement("a");
+      a.href = rawUrl;
+      a.download = `task-${state.selectedTaskId}-chat.svg`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(rawUrl);
+      showToast("浏览器安全限制导致 PNG 失败，已导出 SVG", "warning");
+      setRunStatus(`消息流已导出 SVG：${state.selectedTaskId}`, false);
+    }
+  } catch (err) {
+    showToast(`导出消息流失败：${err.message}`, "negative");
+    setRunStatus(`导出消息流失败：${err.message}`, false);
+  } finally {
+    if (svgUrl) URL.revokeObjectURL(svgUrl);
+    if (host) host.remove();
+    setBusy(false);
+  }
+}
+
 function copyCurrentTaskId() {
   if (!state.selectedTaskId) return;
   navigator.clipboard
@@ -1420,24 +1949,101 @@ function clearRoundFilter() {
   renderRoundTestResults().catch(() => {});
 }
 
+function setMoreActionsMenu(open) {
+  if (!el.moreActionsMenu) return;
+  el.moreActionsMenu.classList.toggle("show", !!open);
+  el.moreActionsMenu.setAttribute("aria-hidden", open ? "false" : "true");
+}
+
+function setRightPanelCollapsed(collapsed) {
+  rightPanelCollapsed = !!collapsed;
+  if (el.appLayout) el.appLayout.classList.toggle("right-collapsed", rightPanelCollapsed);
+  if (el.toggleRightPanelBtn) {
+    const label = rightPanelCollapsed ? "展开状态栏" : "隐藏状态栏";
+    el.toggleRightPanelBtn.title = label;
+    el.toggleRightPanelBtn.setAttribute("aria-label", label);
+    el.toggleRightPanelBtn.setAttribute("aria-pressed", rightPanelCollapsed ? "true" : "false");
+  }
+  try {
+    localStorage.setItem("catcafe_right_panel_collapsed", rightPanelCollapsed ? "1" : "0");
+  } catch {}
+}
+
+async function startNewTaskDialog() {
+  if (state.busy) return;
+  const input = window.prompt("输入新对话任务：");
+  if (input == null) return;
+  const prompt = String(input || "").trim();
+  if (!prompt) {
+    showToast("任务内容不能为空", "warning");
+    return;
+  }
+  await runNewTaskFromCommand({ prompt, provider: null, rounds: null });
+}
+
 el.taskSearch.addEventListener("input", applyFilter);
-el.refreshBtn.addEventListener("click", () => {
-  loadTasks().catch((err) => {
-    el.taskList.innerHTML = `<div class="empty-block">刷新失败: ${err.message}</div>`;
-  });
-});
+if (el.newChatBtn) el.newChatBtn.addEventListener("click", () => startNewTaskDialog().catch(() => {}));
 Array.from(el.statusFilters.querySelectorAll(".chip")).forEach((btn) => {
   btn.addEventListener("click", () => setStatusFilter(btn.dataset.filter || "all"));
 });
 
-el.clearRoundBtn.addEventListener("click", clearRoundFilter);
-el.copyTaskBtn.addEventListener("click", copyCurrentTaskId);
-el.exportReportBtn.addEventListener("click", exportCurrentReport);
-el.rerunTaskBtn.addEventListener("click", rerunCurrentTask);
-el.cancelRunBtn.addEventListener("click", cancelCurrentRun);
+if (el.exportReportBtn) el.exportReportBtn.addEventListener("click", exportCurrentReport);
+if (el.exportChatImageBtn) el.exportChatImageBtn.addEventListener("click", exportCurrentChatImage);
+if (el.cancelRunBtn) el.cancelRunBtn.addEventListener("click", cancelCurrentRun);
+if (el.toggleRightPanelBtn) {
+  el.toggleRightPanelBtn.addEventListener("click", () => setRightPanelCollapsed(!rightPanelCollapsed));
+}
+if (el.moreActionsBtn)
+  el.moreActionsBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opened = !!el.moreActionsMenu?.classList.contains("show");
+    setMoreActionsMenu(!opened);
+  });
+if (el.moreActionsMenu)
+  el.moreActionsMenu.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const action = String(target.dataset.action || "");
+    if (!action) return;
+    setMoreActionsMenu(false);
+    if (action === "copy-task-id") copyCurrentTaskId();
+    if (action === "export-page-image") exportCurrentImage();
+    if (action === "rerun-task") rerunCurrentTask();
+    if (action === "clear-round-filter") clearRoundFilter();
+  });
 el.sendCommandBtn.addEventListener("click", handleComposerSubmit);
 el.jumpBottomBtn.addEventListener("click", jumpToBottom);
 el.chatStream.addEventListener("scroll", updateJumpBottomVisibility);
+if (el.evidenceDrawerClose) el.evidenceDrawerClose.addEventListener("click", () => setEvidenceDrawerOpen(false));
+if (el.evidenceDrawer)
+  el.evidenceDrawer.addEventListener("click", (e) => {
+    e.stopPropagation();
+  });
+if (el.evidenceDrawerKinds)
+  el.evidenceDrawerKinds.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const kind = String(target.dataset.drawerKind || "");
+    const round = Number(target.dataset.drawerRound);
+    const role = String(target.dataset.drawerRole || "");
+    if (!kind || !Number.isFinite(round) || !role) return;
+    openEvidenceDrawer(round, role, kind).catch(() => {});
+  });
+document.addEventListener("click", (e) => {
+  if (el.moreActionsMenu?.classList.contains("show")) {
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+    if (!path.includes(el.moreActionsMenu) && !path.includes(el.moreActionsBtn)) {
+      setMoreActionsMenu(false);
+    }
+  }
+  if (!state.evidenceDrawer.open) return;
+  const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+  if (el.evidenceDrawer && path.includes(el.evidenceDrawer)) return;
+  if (path.some((n) => n instanceof Element && n.closest?.(".evidence-open-btn"))) return;
+  setEvidenceDrawerOpen(false);
+});
 el.chatCommandInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -1448,6 +2054,11 @@ el.saveRolesBtn.addEventListener("click", saveRoleConfig);
 
 setRunStatus(commandHelpText(), false);
 updateActionAvailability();
+try {
+  setRightPanelCollapsed(localStorage.getItem("catcafe_right_panel_collapsed") === "1");
+} catch {
+  setRightPanelCollapsed(false);
+}
 Promise.all([loadRoleConfig(), loadTasks()])
   .catch((err) => {
     el.taskList.innerHTML = `<div class="empty-block">加载失败: ${err.message}</div>`;
