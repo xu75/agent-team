@@ -238,7 +238,7 @@ async function runTask(taskPrompt, options = {}) {
     });
     copyRunArtifacts(proposal.runDir, roundPath, "coder");
 
-    transition(FSM_STATES.REVIEW, { round, reason: "review_proposal" });
+    transition(FSM_STATES.REVIEW, { round, reason: "roundtable_reviewer" });
       throwIfAborted();
       const reviewer = await runReviewer({
       provider: providerFor("reviewer"),
@@ -247,6 +247,7 @@ async function runTask(taskPrompt, options = {}) {
       peerProfiles: peersFor("reviewer"),
       taskPrompt,
       coderOutput: proposal.text,
+      mode: "discussion",
       timeoutMs,
       abortSignal,
       eventMeta: {
@@ -265,9 +266,41 @@ async function runTask(taskPrompt, options = {}) {
       run_id: reviewer.runId,
       run_dir: reviewer.runDir,
       exit: reviewer.exit,
-      mode: "proposal",
+      mode: "discussion",
     });
     copyRunArtifacts(reviewer.runDir, roundPath, "reviewer");
+
+    transition(FSM_STATES.TEST, { round, reason: "roundtable_tester" });
+      throwIfAborted();
+      const tester = await runTester({
+      provider: providerFor("tester"),
+      model: modelFor("tester"),
+      roleProfile: profileFor("tester"),
+      peerProfiles: peersFor("tester"),
+      taskPrompt,
+      coderOutput: proposal.text,
+      mode: "discussion",
+      timeoutMs,
+      abortSignal,
+      eventMeta: {
+        task_id: taskId,
+        round_id: round,
+        agent_role: "tester",
+        attempt: round,
+      },
+    });
+
+    writeText(path.join(roundPath, "tester_raw.md"), tester.text);
+    writeJson(path.join(roundPath, "tester.json"), tester.test_spec);
+    writeJson(path.join(roundPath, "tester_meta.json"), {
+      ok: tester.ok,
+      parse_error: tester.parse_error,
+      run_id: tester.runId,
+      run_dir: tester.runDir,
+      exit: tester.exit,
+      mode: "discussion",
+    });
+    copyRunArtifacts(tester.runDir, roundPath, "tester");
 
     rounds.push({
       round,
@@ -280,33 +313,24 @@ async function runTask(taskPrompt, options = {}) {
         run_id: reviewer.runId,
         ok: reviewer.ok,
         parse_error: reviewer.parse_error,
-        decision: reviewer.review.decision,
-        must_fix_count: reviewer.review.must_fix.length,
+        decision: "discussion",
+        must_fix_count: 0,
+      },
+      tester: {
+        run_id: tester.runId,
+        ok: tester.ok,
+        parse_error: tester.parse_error,
+        command_count: 0,
+        tests_passed: null,
       },
     });
 
-    if (!reviewer.ok) {
-      finalOutcome = "review_schema_invalid";
-      mustFix = reviewer.review.must_fix;
-      transition(FSM_STATES.FINALIZE, {
-        round,
-        reason: "review_schema_invalid",
-      });
-    } else if (reviewer.review.decision === "approve") {
-      finalOutcome = "awaiting_operator_confirm";
-      mustFix = [];
-      transition(FSM_STATES.FINALIZE, {
-        round,
-        reason: "await_operator_confirm",
-      });
-    } else {
-      finalOutcome = "proposal_changes_requested";
-      mustFix = reviewer.review.must_fix;
-      transition(FSM_STATES.FINALIZE, {
-        round,
-        reason: "proposal_changes_requested",
-      });
-    }
+    finalOutcome = "awaiting_operator_confirm";
+    mustFix = [];
+    transition(FSM_STATES.FINALIZE, {
+      round,
+      reason: "await_operator_confirm",
+    });
     } else {
     transition(FSM_STATES.PLAN, { reason: "implementation_confirmed" });
 

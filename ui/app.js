@@ -3,7 +3,6 @@ const state = {
   filtered: [],
   selectedTaskId: null,
   selectedRound: null,
-  statusFilter: "all",
   detail: null,
   messagesData: null,
   roleConfig: null,
@@ -27,7 +26,6 @@ const el = {
   taskList: document.getElementById("taskList"),
   taskSearch: document.getElementById("taskSearch"),
   newChatBtn: document.getElementById("newChatBtn"),
-  statusFilters: document.getElementById("statusFilters"),
   taskTitle: document.getElementById("taskTitle"),
   taskMeta: document.getElementById("taskMeta"),
   timeline: document.getElementById("timeline"),
@@ -660,14 +658,12 @@ function renderTasks() {
     const collapsed = state.collapsedProjects.has(project.id);
     projectSection.className = `project-section${collapsed ? " collapsed" : ""}`;
 
-    const warningCount = project.tasks.reduce((sum, t) => sum + Number(t.alert_count || 0), 0);
     const latest = project.tasks[0];
     projectSection.innerHTML = `
       <button class="project-head" data-project-toggle="${escapeHtml(project.id)}">
         <span class="caret">${collapsed ? "▸" : "▾"}</span>
         <span class="project-name">${escapeHtml(project.name)}</span>
-        <span class="project-meta">${project.tasks.length} 个任务 · ${fmtRelativeTime(latest?.updated_ts)}</span>
-        ${warningCount > 0 ? `<span class="alert-badge">${warningCount}</span>` : ""}
+        <span class="project-meta">${project.tasks.length} 个对话 · ${fmtRelativeTime(latest?.updated_ts)}</span>
       </button>
       <div class="project-body"></div>
     `;
@@ -683,21 +679,14 @@ function renderTasks() {
       list.forEach((t) => {
         const row = document.createElement("div");
         row.className =
-          `task-item tone-${t.status_tone || toneFromOutcome(t.final_outcome)}` +
+          `task-item` +
           (t.task_id === state.selectedTaskId ? " active" : "");
         row.innerHTML = `
           <div class="task-head">
             <div class="task-title" title="${escapeHtml(t.task_id)}">${escapeHtml(taskTitleLine(t))}</div>
-            <div class="task-right">
-              <span class="mini-time">${fmtRelativeTime(t.updated_ts)}</span>
-              ${Number(t.alert_count) > 0 ? `<span class="alert-badge">${t.alert_count}</span>` : ""}
-            </div>
+            <span class="mini-time">${fmtRelativeTime(t.updated_ts)}</span>
           </div>
-          <div class="main">${escapeHtml(taskStatusLine(t))}</div>
           <div class="preview">${escapeHtml(previewLine(t))}</div>
-          <div class="task-foot">
-            <span class="round-dots" title="对话轮次">${roundsLabel(t.rounds)}</span>
-          </div>
         `;
         row.addEventListener("click", () => selectTask(t.task_id));
         box.appendChild(row);
@@ -724,8 +713,6 @@ function renderTasks() {
 function applyFilter() {
   const q = el.taskSearch.value.trim().toLowerCase();
   state.filtered = state.tasks.filter((t) => {
-    const tone = t.status_tone || toneFromOutcome(t.final_outcome);
-    if (state.statusFilter !== "all" && tone !== state.statusFilter) return false;
     if (!q) return true;
     return (
       String(t.project_name || "").toLowerCase().includes(q) ||
@@ -738,14 +725,6 @@ function applyFilter() {
     );
   });
   renderTasks();
-}
-
-function setStatusFilter(v) {
-  state.statusFilter = v;
-  Array.from(el.statusFilters.querySelectorAll(".chip")).forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.filter === v);
-  });
-  applyFilter();
 }
 
 function renderTimeline() {
@@ -1983,9 +1962,6 @@ async function startNewTaskDialog() {
 
 el.taskSearch.addEventListener("input", applyFilter);
 if (el.newChatBtn) el.newChatBtn.addEventListener("click", () => startNewTaskDialog().catch(() => {}));
-Array.from(el.statusFilters.querySelectorAll(".chip")).forEach((btn) => {
-  btn.addEventListener("click", () => setStatusFilter(btn.dataset.filter || "all"));
-});
 
 if (el.exportReportBtn) el.exportReportBtn.addEventListener("click", exportCurrentReport);
 if (el.exportChatImageBtn) el.exportChatImageBtn.addEventListener("click", exportCurrentChatImage);

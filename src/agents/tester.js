@@ -37,6 +37,34 @@ function buildTesterPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProf
   ].join("\n");
 }
 
+function buildTesterDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+  const meName = roleProfile.display_name || "Tester";
+  const meTitle = roleProfile.role_title || "Tester";
+  const coder = peerProfiles.coder || {};
+  const reviewer = peerProfiles.reviewer || {};
+  const coderNick = coder.nickname || coder.display_name || "Coder";
+  const reviewerNick = reviewer.nickname || reviewer.display_name || "Reviewer";
+
+  return [
+    `You are ${meName}, the ${meTitle} agent in a multi-agent coding roundtable.`,
+    `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), reviewer is ${reviewer.display_name || "Reviewer"} (${reviewer.role_title || "Reviewer"}).`,
+    `Nickname rules: call coder as "${coderNick}", reviewer as "${reviewerNick}".`,
+    "This is an open discussion stage before implementation is confirmed by operator.",
+    "Return concise plain text only (no JSON required).",
+    "",
+    "Focus:",
+    "- Evaluate testability and observability.",
+    "- Suggest minimal verification strategy and edge cases.",
+    "- Flag risky rollout points.",
+    "",
+    "Task:",
+    taskPrompt,
+    "",
+    "Coder proposal / latest implementation notes:",
+    coderOutput,
+  ].join("\n");
+}
+
 function extractJsonObject(text) {
   const trimmed = text.trim();
   if (!trimmed) return null;
@@ -91,11 +119,15 @@ async function runTester({
   peerProfiles,
   taskPrompt,
   coderOutput,
+  mode = "strict_json",
   timeoutMs,
   eventMeta,
   abortSignal,
 }) {
-  const prompt = buildTesterPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
+  const prompt =
+    mode === "discussion"
+      ? buildTesterDiscussionPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles })
+      : buildTesterPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
   const result = await executeProviderText({
     provider,
     model,
@@ -105,6 +137,20 @@ async function runTester({
     eventMeta,
     abortSignal,
   });
+
+  if (mode === "discussion") {
+    const exitCode = Number(result?.exit?.code);
+    return {
+      ...result,
+      ok: !Number.isFinite(exitCode) || exitCode === 0,
+      parse_error: null,
+      test_spec: {
+        test_plan: "discussion",
+        commands: [],
+        expected_results: [],
+      },
+    };
+  }
 
   const parsed = extractJsonObject(result.text);
   const schema = validateTesterSchema(parsed);

@@ -38,6 +38,34 @@ function buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerPr
   ].join("\n");
 }
 
+function buildReviewerDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+  const meName = roleProfile.display_name || "Reviewer";
+  const meTitle = roleProfile.role_title || "Reviewer";
+  const coder = peerProfiles.coder || {};
+  const tester = peerProfiles.tester || {};
+  const coderNick = coder.nickname || coder.display_name || "Coder";
+  const testerNick = tester.nickname || tester.display_name || "Tester";
+
+  return [
+    `You are ${meName}, the ${meTitle} agent in a multi-agent coding roundtable.`,
+    `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), tester is ${tester.display_name || "Tester"} (${tester.role_title || "Tester"}).`,
+    `Nickname rules: call coder as "${coderNick}", tester as "${testerNick}".`,
+    "This is an open discussion stage before implementation is confirmed by operator.",
+    "Return concise plain text only (no JSON required).",
+    "",
+    "Focus:",
+    "- Critique the plan feasibility and tradeoffs.",
+    "- Point out top risks and assumptions.",
+    "- Suggest concrete refinements and acceptance criteria.",
+    "",
+    "Task:",
+    taskPrompt,
+    "",
+    "Coder proposal / latest implementation notes:",
+    coderOutput,
+  ].join("\n");
+}
+
 function extractJsonObject(text) {
   const trimmed = text.trim();
   if (!trimmed) return null;
@@ -113,11 +141,15 @@ async function runReviewer({
   peerProfiles,
   taskPrompt,
   coderOutput,
+  mode = "strict_json",
   timeoutMs,
   eventMeta,
   abortSignal,
 }) {
-  const prompt = buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
+  const prompt =
+    mode === "discussion"
+      ? buildReviewerDiscussionPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles })
+      : buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
   const result = await executeProviderText({
     provider,
     model,
@@ -127,6 +159,22 @@ async function runReviewer({
     eventMeta,
     abortSignal,
   });
+
+  if (mode === "discussion") {
+    const exitCode = Number(result?.exit?.code);
+    return {
+      ...result,
+      ok: !Number.isFinite(exitCode) || exitCode === 0,
+      parse_error: null,
+      review: {
+        decision: "approve",
+        must_fix: [],
+        nice_to_have: [],
+        tests: [],
+        security: [],
+      },
+    };
+  }
 
   const parsed = extractJsonObject(result.text);
   const schema = validateReviewSchema(parsed);
