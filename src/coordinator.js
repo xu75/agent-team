@@ -140,6 +140,10 @@ async function runTask(taskPrompt, options = {}) {
   const rounds = priorSummary?.rounds ? [...priorSummary.rounds] : [];
   let mustFix = Array.isArray(priorSummary?.unresolved_must_fix) ? [...priorSummary.unresolved_must_fix] : [];
   let finalOutcome = priorSummary?.final_outcome || "max_iterations_reached";
+  if (executionMode === "implementation") {
+    // Never inherit proposal outcomes into implementation runs.
+    finalOutcome = "max_iterations_reached";
+  }
   let currentState = priorSummary?.final_status || null;
   const stateEvents = Array.isArray(priorSummary?.state_events) ? [...priorSummary.state_events] : [];
 
@@ -263,6 +267,7 @@ async function runTask(taskPrompt, options = {}) {
     writeJson(path.join(roundPath, "reviewer_meta.json"), {
       ok: reviewer.ok,
       parse_error: reviewer.parse_error,
+      error_class: reviewer.error_class || null,
       run_id: reviewer.runId,
       run_dir: reviewer.runDir,
       exit: reviewer.exit,
@@ -295,6 +300,7 @@ async function runTask(taskPrompt, options = {}) {
     writeJson(path.join(roundPath, "tester_meta.json"), {
       ok: tester.ok,
       parse_error: tester.parse_error,
+      error_class: tester.error_class || null,
       run_id: tester.runId,
       run_dir: tester.runDir,
       exit: tester.exit,
@@ -394,6 +400,7 @@ async function runTask(taskPrompt, options = {}) {
     writeJson(path.join(roundPath, "reviewer_meta.json"), {
       ok: reviewer.ok,
       parse_error: reviewer.parse_error,
+      error_class: reviewer.error_class || null,
       run_id: reviewer.runId,
       run_dir: reviewer.runDir,
       exit: reviewer.exit,
@@ -417,11 +424,11 @@ async function runTask(taskPrompt, options = {}) {
     });
 
     if (!reviewer.ok) {
-      finalOutcome = "review_schema_invalid";
+      finalOutcome = reviewer.error_class || "review_schema_invalid";
       mustFix = reviewer.review.must_fix;
       transition(FSM_STATES.FINALIZE, {
         round,
-        reason: "review_schema_invalid",
+        reason: finalOutcome,
       });
       break;
     }
@@ -452,6 +459,7 @@ async function runTask(taskPrompt, options = {}) {
       writeJson(path.join(roundPath, "tester_meta.json"), {
         ok: tester.ok,
         parse_error: tester.parse_error,
+        error_class: tester.error_class || null,
         run_id: tester.runId,
         run_dir: tester.runDir,
         exit: tester.exit,
@@ -499,6 +507,15 @@ async function runTask(taskPrompt, options = {}) {
       }
 
       if (!tester.ok) {
+        if (tester.error_class) {
+          mustFix = [`Tester provider error: ${tester.error_class}`];
+          finalOutcome = tester.error_class;
+          transition(FSM_STATES.FINALIZE, {
+            round,
+            reason: finalOutcome,
+          });
+          break;
+        }
         mustFix = ["Tester output schema invalid"];
         finalOutcome = "tester_schema_invalid";
         transition(FSM_STATES.ITERATE, {
@@ -530,6 +547,7 @@ async function runTask(taskPrompt, options = {}) {
     }
 
     mustFix = reviewer.review.must_fix;
+    finalOutcome = "review_changes_requested";
     transition(FSM_STATES.ITERATE, {
       round,
       reason: "review_changes_requested",
@@ -550,6 +568,9 @@ async function runTask(taskPrompt, options = {}) {
   }
 
   if (currentState !== FSM_STATES.FINALIZE) {
+    if (executionMode === "implementation" && finalOutcome === "awaiting_operator_confirm") {
+      finalOutcome = mustFix.length ? "review_changes_requested" : "max_iterations_reached";
+    }
     transition(FSM_STATES.FINALIZE, {
       reason: finalOutcome === "max_iterations_reached" ? "max_iterations_reached" : "finalized",
     });

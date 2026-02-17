@@ -358,6 +358,24 @@ h3 {
   margin-bottom: 8px;
 }
 
+.flow-title-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.flow-title-row h3 {
+  margin-bottom: 0;
+}
+
+.flow-task-id {
+  font-size: 11px;
+  color: #aaa19a;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .btn {
   border: 1px solid var(--line);
   background: #fff;
@@ -434,83 +452,42 @@ h3 {
 .task-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 4px;
 }
 
-.project-section {
-  border: 1px solid #e9e2dc;
-  border-radius: 12px;
-  background: #fffcfa;
-  overflow: hidden;
-}
-
-.project-section.collapsed .project-body {
-  display: none;
-}
-
-.project-head {
-  width: 100%;
-  border: 0;
-  border-bottom: 1px solid #f0e8e1;
-  background: #fcf8f4;
-  color: #544c46;
+.project-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  text-align: left;
-  cursor: pointer;
+  justify-content: space-between;
+  padding: 8px 6px 4px;
+  margin-top: 8px;
 }
 
-.project-head:hover {
-  background: #faf3ed;
+.project-header:first-child {
+  margin-top: 0;
 }
 
-.project-head .caret {
-  color: #9b8f85;
+.project-header .project-name {
   font-size: 11px;
-}
-
-.project-head .project-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: #3d352f;
-  flex: 1;
-}
-
-.project-head .project-meta {
-  font-size: 11px;
-  color: #998f88;
-}
-
-.project-body {
-  padding: 6px;
-}
-
-.task-section {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.task-section-title {
-  font-size: 11px;
-  color: #998f88;
   font-weight: 650;
-  padding: 2px 4px;
+  color: #998f88;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
 }
 
-.task-section-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.project-header .project-count {
+  font-size: 10px;
+  color: #b5aca5;
+  background: #f5f0eb;
+  border-radius: 99px;
+  padding: 1px 6px;
 }
 
 .task-item {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 10px 12px;
-  background: #fff;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: transparent;
   cursor: pointer;
   transition:
     border-color 120ms ease,
@@ -518,8 +495,8 @@ h3 {
 }
 
 .task-item:hover {
-  border-color: #d6ccc3;
-  background: #fffdfa;
+  border-color: #e9e2dc;
+  background: #fdfbf9;
 }
 
 .task-item.active {
@@ -559,6 +536,44 @@ h3 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.task-delete-btn {
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #a09890;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.task-item:hover .task-delete-btn {
+  opacity: 1;
+  visibility: visible;
+}
+
+.task-delete-btn:hover {
+  background: #fee8e8;
+  color: #c45050;
+}
+
+.task-delete-btn svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .meta-pill {

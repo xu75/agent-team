@@ -1044,19 +1044,9 @@ const server = http.createServer(async (req, res) => {
         const maxIterations = Number.isFinite(body.maxIterations) ? Number(body.maxIterations) : 1;
         const provider = String(body.provider || summary.provider || "claude-cli");
         const prompt = buildThreadPrompt(task.task_dir);
-        const awaitingConfirm = summary.awaiting_operator_confirm === true || summary.final_outcome === "awaiting_operator_confirm";
         const confirmRequested = body.confirm === true || looksLikeConfirmMessage(message);
-
-        if (awaitingConfirm && !confirmRequested) {
-          return sendJson(res, 200, {
-            ok: true,
-            task_id: taskId,
-            summary,
-            role_config: effectiveRoleConfig,
-            pending_confirmation: true,
-            message: "提案已评审通过，等待铲屎官确认。请发送 /confirm 开始编码实施。",
-          });
-        }
+        // Even when awaiting operator confirm, allow further /ask discussion rounds.
+        // Only /confirm switches execution into implementation mode.
 
         if (ACTIVE_TASK_RUNS.has(taskId)) {
           return sendJson(res, 409, { error: "该任务已有运行进行中，请先终止或等待完成。" });
@@ -1141,6 +1131,46 @@ const server = http.createServer(async (req, res) => {
           summary: rerun,
           role_config: effectiveRoleConfig,
         });
+      }
+    }
+
+    if (p.startsWith("/api/tasks/") && req.method === "DELETE") {
+      const seg = p.split("/").filter(Boolean);
+      if (seg.length === 3) {
+        const taskId = seg[2];
+
+        // 路径安全校验：仅允许合法任务ID格式，禁止路径穿越字符
+        if (!taskId || typeof taskId !== "string") {
+          return sendJson(res, 400, { error: "无效的任务ID" });
+        }
+        // 禁止包含路径分隔符和父目录引用
+        if (/[\/\\]|\.\./.test(taskId)) {
+          return sendJson(res, 400, { error: "任务ID包含非法字符" });
+        }
+        // 仅允许合法的任务ID格式（时间戳格式）
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(taskId)) {
+          return sendJson(res, 400, { error: "任务ID格式不合法" });
+        }
+
+        const taskDir = getTaskDirById(taskId);
+        if (!taskDir) {
+          return sendJson(res, 404, { error: "task not found" });
+        }
+
+        // 二次校验：确保目标目录在任务根目录内
+        const resolvedTaskDir = path.resolve(taskDir);
+        if (!resolvedTaskDir.startsWith(LOGS_ROOT + path.sep)) {
+          return sendJson(res, 403, { error: "禁止删除任务根目录外的文件" });
+        }
+
+        // 检查是否有正在运行的任务
+        if (ACTIVE_TASK_RUNS.has(taskId)) {
+          return sendJson(res, 409, { error: "该任务正在运行中，请先终止后再删除。" });
+        }
+
+        // 递归删除任务目录
+        fs.rmSync(taskDir, { recursive: true, force: true });
+        return sendJson(res, 200, { ok: true, task_id: taskId, message: "会话已删除" });
       }
     }
 

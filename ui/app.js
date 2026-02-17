@@ -19,6 +19,10 @@ const state = {
     kind: null,
   },
   collapsedProjects: new Set(),
+  // 草稿防丢失：key = taskId (或 "__new__" 表示新对话), value = 草稿文本
+  drafts: new Map(),
+  // 新对话草稿模式
+  isNewConversationDraft: false,
 };
 
 const el = {
@@ -28,6 +32,7 @@ const el = {
   newChatBtn: document.getElementById("newChatBtn"),
   taskTitle: document.getElementById("taskTitle"),
   taskMeta: document.getElementById("taskMeta"),
+  flowTaskIdHint: document.getElementById("flowTaskIdHint"),
   timeline: document.getElementById("timeline"),
   roundTag: document.getElementById("roundTag"),
   moreActionsBtn: document.getElementById("moreActionsBtn"),
@@ -168,8 +173,25 @@ function fmtCost(v) {
 }
 
 function previewLine(t) {
-  const raw = String(t?.last_preview || "").trim();
+  let raw = String(t?.last_preview || "").trim();
   if (!raw) return "暂无预览";
+  // 如果是 JSON 格式，尝试提取有意义的文本
+  if (raw.startsWith("{") || raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      // 尝试提取常见字段
+      if (parsed.text) raw = String(parsed.text).trim();
+      else if (parsed.message) raw = String(parsed.message).trim();
+      else if (parsed.content) raw = String(parsed.content).trim();
+      else if (parsed.summary) raw = String(parsed.summary).trim();
+      else if (parsed.decision) raw = `评审: ${parsed.decision}`;
+      else if (parsed.test_plan) raw = String(parsed.test_plan).trim();
+      else raw = "暂无预览";
+    } catch {
+      // 不是有效 JSON，显示为暂无预览
+      raw = "暂无预览";
+    }
+  }
   return raw.length > 56 ? `${raw.slice(0, 56)}...` : raw;
 }
 
@@ -646,67 +668,70 @@ function projectTaskGroups(tasks) {
 
 function renderTasks() {
   el.taskList.innerHTML = "";
-  if (!state.filtered.length) {
+
+  // 如果处于新对话草稿模式，在顶部显示"新对话"条目
+  if (state.isNewConversationDraft) {
+    const newRow = document.createElement("div");
+    newRow.className = "task-item active";
+    newRow.innerHTML = `
+      <div class="task-head">
+        <div class="task-title">✨ 新对话</div>
+        <span class="mini-time">草稿</span>
+      </div>
+      <div class="preview">输入内容后发送创建...</div>
+    `;
+    el.taskList.appendChild(newRow);
+  }
+
+  if (!state.filtered.length && !state.isNewConversationDraft) {
     el.taskList.innerHTML =
       '<div class="empty-block">暂无任务。先运行一次 <code>node src/index.js "你的任务"</code> 生成日志。</div>';
     return;
   }
 
+  // 扁平化列表：按项目分组，项目名作为分隔标题，对话直接列出
   const projects = projectTaskGroups(state.filtered);
   projects.forEach((project) => {
-    const projectSection = document.createElement("section");
-    const collapsed = state.collapsedProjects.has(project.id);
-    projectSection.className = `project-section${collapsed ? " collapsed" : ""}`;
-
-    const latest = project.tasks[0];
-    projectSection.innerHTML = `
-      <button class="project-head" data-project-toggle="${escapeHtml(project.id)}">
-        <span class="caret">${collapsed ? "▸" : "▾"}</span>
-        <span class="project-name">${escapeHtml(project.name)}</span>
-        <span class="project-meta">${project.tasks.length} 个对话 · ${fmtRelativeTime(latest?.updated_ts)}</span>
-      </button>
-      <div class="project-body"></div>
+    // 项目标题行
+    const projectHeader = document.createElement("div");
+    projectHeader.className = "project-header";
+    projectHeader.innerHTML = `
+      <span class="project-name">${escapeHtml(project.name)}</span>
+      <span class="project-count">${project.tasks.length}</span>
     `;
-    const body = projectSection.querySelector(".project-body");
-    const groups = taskGroups(project.tasks);
-    groups.forEach(([date, list]) => {
-      const section = document.createElement("section");
-      section.className = "task-section";
-      section.innerHTML = `<div class="task-section-title">${date}</div>`;
-      const box = document.createElement("div");
-      box.className = "task-section-list";
+    el.taskList.appendChild(projectHeader);
 
-      list.forEach((t) => {
-        const row = document.createElement("div");
-        row.className =
-          `task-item` +
-          (t.task_id === state.selectedTaskId ? " active" : "");
-        row.innerHTML = `
-          <div class="task-head">
-            <div class="task-title" title="${escapeHtml(t.task_id)}">${escapeHtml(taskTitleLine(t))}</div>
-            <span class="mini-time">${fmtRelativeTime(t.updated_ts)}</span>
-          </div>
-          <div class="preview">${escapeHtml(previewLine(t))}</div>
-        `;
-        row.addEventListener("click", () => selectTask(t.task_id));
-        box.appendChild(row);
+    // 直接列出该项目下的所有对话
+    project.tasks.forEach((t) => {
+      const row = document.createElement("div");
+      const isActive = !state.isNewConversationDraft && t.task_id === state.selectedTaskId;
+      row.className = `task-item${isActive ? " active" : ""}`;
+      row.innerHTML = `
+        <div class="task-head">
+          <div class="task-title" title="${escapeHtml(t.task_id)}">${escapeHtml(taskTitleLine(t))}</div>
+          <button class="task-delete-btn" data-task-id="${escapeHtml(t.task_id)}" title="删除会话" aria-label="删除会话">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14Z"/>
+            </svg>
+          </button>
+          <span class="mini-time">${fmtRelativeTime(t.updated_ts)}</span>
+        </div>
+        <div class="preview">${escapeHtml(previewLine(t))}</div>
+      `;
+      row.addEventListener("click", (e) => {
+        // 如果点击的是删除按钮，不触发选中
+        if (e.target.closest(".task-delete-btn")) return;
+        selectTask(t.task_id);
       });
-
-      section.appendChild(box);
-      body.appendChild(section);
-    });
-
-    const toggle = projectSection.querySelector("[data-project-toggle]");
-    toggle.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      if (state.collapsedProjects.has(project.id)) {
-        state.collapsedProjects.delete(project.id);
-      } else {
-        state.collapsedProjects.add(project.id);
+      const deleteBtn = row.querySelector(".task-delete-btn");
+      if (deleteBtn) {
+        deleteBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          deleteConversation(t.task_id);
+        });
       }
-      renderTasks();
+      el.taskList.appendChild(row);
     });
-    el.taskList.appendChild(projectSection);
   });
 }
 
@@ -1201,6 +1226,7 @@ function renderTaskPage(opts = {}) {
   el.taskTitle.textContent = String(selected?.task_title || selected?.task_id || "对话");
   el.taskMeta.textContent = `${summary.provider || "-"} · ${summary.final_outcome || "-"}`;
   el.taskMeta.className = `meta-pill ${toneFromOutcome(summary.final_outcome)}`.trim();
+  if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = `Task: ${state.selectedTaskId || "-"}`;
   if (el.rightRuntimeHint) {
     const current = state.messagesData?.current_stage || summary.final_status || "-";
     el.rightRuntimeHint.textContent = `${summary.provider || "-"} · ${current}`;
@@ -1223,6 +1249,16 @@ function renderTaskPage(opts = {}) {
 }
 
 async function selectTask(taskId) {
+  // 保存当前对话的草稿
+  const currentInput = el.chatCommandInput.value.trim();
+  if (currentInput) {
+    const currentKey = state.isNewConversationDraft ? "__new__" : (state.selectedTaskId || "__new__");
+    state.drafts.set(currentKey, currentInput);
+  }
+
+  // 退出新对话草稿模式
+  exitNewConversationDraftMode();
+
   state.selectedTaskId = taskId;
   state.selectedRound = null;
   renderTasks();
@@ -1236,12 +1272,17 @@ async function selectTask(taskId) {
   state.messagesData = messages;
   state.liveDigest = buildLiveDigest(detail, messages);
   renderTaskPage();
+
+  // 恢复该对话的草稿
+  const draft = state.drafts.get(taskId) || "";
+  el.chatCommandInput.value = draft;
 }
 
 function renderEmptyScreen() {
   el.taskTitle.textContent = "对话";
   el.taskMeta.className = "meta-pill";
   el.taskMeta.textContent = "暂无任务";
+  if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = "Task: -";
   el.timeline.innerHTML = '<div class="timeline-empty">还没有任务数据。</div>';
   if (el.roundTag) el.roundTag.textContent = "All Rounds";
   el.chatStream.innerHTML = '<div class="empty-block">先运行一个任务，然后在这里查看多 Agent 对话回放。</div>';
@@ -1529,15 +1570,36 @@ async function handleComposerSubmit() {
     setRunStatus(parsed.error, false);
     return;
   }
+
+  // 新对话草稿模式下，任何非命令输入都作为新任务
+  if (state.isNewConversationDraft) {
+    clearDraft(); // 清除新对话草稿
+    exitNewConversationDraftMode();
+    if (parsed.kind === "task") {
+      await runNewTaskFromCommand(parsed);
+    } else if (parsed.kind === "followup") {
+      // 在新对话模式下，followup 也作为新任务
+      await runNewTaskFromCommand({ prompt: parsed.message, provider: parsed.provider, rounds: parsed.rounds });
+    } else if (parsed.kind === "confirm" || parsed.kind === "rerun") {
+      showToast("新对话模式下请先输入任务内容", "warning");
+      enterNewConversationDraftMode();
+    }
+    return;
+  }
+
+  // 发送成功后清除草稿
   if (parsed.kind === "task") {
+    clearDraft();
     await runNewTaskFromCommand(parsed);
     return;
   }
   if (parsed.kind === "followup") {
+    clearDraft();
     await sendFollowupInThread(parsed);
     return;
   }
   if (parsed.kind === "confirm") {
+    clearDraft();
     await sendFollowupInThread(parsed);
     return;
   }
@@ -1546,6 +1608,7 @@ async function handleComposerSubmit() {
       showToast("当前没有可重跑任务，请先 /task 新建任务。", "warning");
       return;
     }
+    clearDraft();
     await rerunCurrentTask({
       prompt: parsed.prompt || undefined,
       provider: parsed.provider || resolvedProvider(null),
@@ -1948,20 +2011,144 @@ function setRightPanelCollapsed(collapsed) {
   } catch {}
 }
 
-async function startNewTaskDialog() {
-  if (state.busy) return;
-  const input = window.prompt("输入新对话任务：");
-  if (input == null) return;
-  const prompt = String(input || "").trim();
-  if (!prompt) {
-    showToast("任务内容不能为空", "warning");
-    return;
+// ========== 草稿防丢失机制 ==========
+function getDraftKey() {
+  return state.isNewConversationDraft ? "__new__" : (state.selectedTaskId || "__new__");
+}
+
+function saveDraft(text) {
+  const key = getDraftKey();
+  const trimmed = String(text || "").trim();
+  if (trimmed) {
+    state.drafts.set(key, trimmed);
+  } else {
+    state.drafts.delete(key);
   }
-  await runNewTaskFromCommand({ prompt, provider: null, rounds: null });
+}
+
+function loadDraft() {
+  const key = getDraftKey();
+  return state.drafts.get(key) || "";
+}
+
+function clearDraft() {
+  const key = getDraftKey();
+  state.drafts.delete(key);
+}
+
+// ========== 新对话草稿模式 ==========
+function enterNewConversationDraftMode() {
+  if (state.busy) return;
+
+  // 保存当前对话的草稿
+  const currentInput = el.chatCommandInput.value.trim();
+  if (currentInput && state.selectedTaskId) {
+    state.drafts.set(state.selectedTaskId, currentInput);
+  }
+
+  // 进入新对话草稿模式
+  state.isNewConversationDraft = true;
+  state.selectedTaskId = null;
+  state.selectedRound = null;
+  state.detail = null;
+  state.messagesData = null;
+  state.liveDigest = "";
+
+  // 更新左侧列表选中状态
+  renderTasks();
+
+  // 更新中间面板显示
+  renderNewConversationDraftScreen();
+
+  // 恢复新对话的草稿（如果有）
+  const newDraft = state.drafts.get("__new__") || "";
+  el.chatCommandInput.value = newDraft;
+  el.chatCommandInput.placeholder = "输入新对话内容，发送后自动创建对话...";
+  el.chatCommandInput.focus();
+
+  updateActionAvailability();
+}
+
+function exitNewConversationDraftMode() {
+  state.isNewConversationDraft = false;
+}
+
+function renderNewConversationDraftScreen() {
+  el.taskTitle.textContent = "新对话";
+  el.taskMeta.className = "meta-pill";
+  el.taskMeta.textContent = "草稿";
+  if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = "Task: draft";
+  el.timeline.innerHTML = '<div class="timeline-empty">输入内容后发送，将自动创建新对话。</div>';
+  if (el.roundTag) el.roundTag.textContent = "";
+  el.chatStream.innerHTML = `
+    <div class="empty-block" style="text-align:center;padding:32px 16px;">
+      <div style="font-size:32px;margin-bottom:12px;">✨</div>
+      <div style="font-size:14px;color:#6d635c;margin-bottom:8px;">新对话</div>
+      <div style="font-size:12px;color:#9a9088;">在下方输入框输入内容，发送后自动创建对话</div>
+    </div>
+  `;
+  el.liveStage.innerHTML = '<div class="stage-card"><div class="k">状态</div><div class="v">等待输入</div></div>';
+  el.agentStatus.innerHTML = "";
+  el.stats.innerHTML = "";
+  el.latestFailure.className = "plain-block warning";
+  el.latestFailure.textContent = "暂无";
+  el.testResults.className = "plain-block warning";
+  el.testResults.textContent = "暂无";
+  el.mustFixList.innerHTML = "<li>无</li>";
+  setMoreActionsMenu(false);
+  if (el.rightRuntimeHint) el.rightRuntimeHint.textContent = "新对话草稿";
+  renderEvidencePlaceholder();
+  setEvidenceDrawerOpen(false);
+  updateJumpBottomVisibility();
+}
+
+async function startNewConversation() {
+  enterNewConversationDraftMode();
+}
+
+async function deleteConversation(taskId) {
+  if (!taskId) return;
+
+  const confirmed = confirm(`确定要删除这个会话吗？\n\n此操作不可撤销。`);
+  if (!confirmed) return;
+
+  try {
+    setBusy(true);
+    const res = await fetch(`/api/tasks/${taskId}`, { method: "DELETE" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+
+    showToast("会话已删除", "positive");
+
+    // 如果删除的是当前选中的会话，清空选中状态
+    if (state.selectedTaskId === taskId) {
+      state.selectedTaskId = null;
+      state.detail = null;
+      state.messagesData = null;
+      state.liveDigest = "";
+    }
+
+    // 从草稿中移除
+    state.drafts.delete(taskId);
+
+    // 重新加载任务列表
+    await loadTasks();
+  } catch (err) {
+    showToast(`删除失败：${err.message}`, "negative");
+  } finally {
+    setBusy(false);
+  }
 }
 
 el.taskSearch.addEventListener("input", applyFilter);
-if (el.newChatBtn) el.newChatBtn.addEventListener("click", () => startNewTaskDialog().catch(() => {}));
+if (el.newChatBtn) el.newChatBtn.addEventListener("click", () => startNewConversation());
+
+// 草稿自动保存：输入时保存
+el.chatCommandInput.addEventListener("input", () => {
+  saveDraft(el.chatCommandInput.value);
+});
 
 if (el.exportReportBtn) el.exportReportBtn.addEventListener("click", exportCurrentReport);
 if (el.exportChatImageBtn) el.exportChatImageBtn.addEventListener("click", exportCurrentChatImage);

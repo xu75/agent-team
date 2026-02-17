@@ -152,6 +152,19 @@ async function runTester({
     };
   }
 
+  if (result.error_class) {
+    return {
+      ...result,
+      ok: false,
+      parse_error: `provider_error:${result.error_class}`,
+      test_spec: {
+        test_plan: `Tester provider error: ${result.error_class}`,
+        commands: [],
+        expected_results: [],
+      },
+    };
+  }
+
   const parsed = extractJsonObject(result.text);
   const schema = validateTesterSchema(parsed);
 

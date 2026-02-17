@@ -18,6 +18,31 @@ function resolveProvider(provider, prompt, model) {
   throw new Error(`Unsupported provider: ${provider}`);
 }
 
+function classifyProviderError({ provider, exit, stderrLines = [], text = "", permissionDeniedCount = 0 }) {
+  const code = Number(exit?.code);
+  const hasFailure = !!exit?.error || (Number.isFinite(code) && code !== 0);
+  if (!hasFailure) return null;
+
+  if (permissionDeniedCount >= 3) return "provider_permission_denied";
+
+  const errMsg = String(exit?.error?.message || "");
+  const haystack = [errMsg, String(text || ""), ...stderrLines].join("\n").toLowerCase();
+
+  if (provider === "codex-cli" && /enoent/.test(errMsg.toLowerCase())) {
+    return "provider_not_found";
+  }
+  if (/(unauthorized|forbidden|invalid api key|auth|token expired|status 401|status 403)/i.test(haystack)) {
+    return "provider_auth_error";
+  }
+  if (/(timed out|timeout|etimedout)/i.test(haystack)) {
+    return "provider_timeout";
+  }
+  if (/(stream disconnected before completion|error sending request|econn|enotfound|socket hang up|network)/i.test(haystack)) {
+    return "provider_network_error";
+  }
+  return "provider_runtime_error";
+}
+
 async function executeProviderText({
   provider = "claude-cli",
   prompt,
@@ -102,11 +127,20 @@ async function executeProviderText({
     throw err;
   }
 
+  const errorClass = classifyProviderError({
+    provider,
+    exit: result.exit,
+    stderrLines,
+    text,
+    permissionDeniedCount,
+  });
+
   return {
     text,
     runId: result.runId,
     runDir: result.dir,
     exit: result.exit,
+    error_class: errorClass,
   };
 }
 

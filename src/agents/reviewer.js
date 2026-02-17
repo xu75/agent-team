@@ -176,6 +176,21 @@ async function runReviewer({
     };
   }
 
+  if (result.error_class) {
+    return {
+      ...result,
+      ok: false,
+      parse_error: `provider_error:${result.error_class}`,
+      review: {
+        decision: "changes_requested",
+        must_fix: [`Reviewer provider error: ${result.error_class}`],
+        nice_to_have: [],
+        tests: [],
+        security: [],
+      },
+    };
+  }
+
   const parsed = extractJsonObject(result.text);
   const schema = validateReviewSchema(parsed);
 
