@@ -115,6 +115,7 @@ async function runReviewer({
   coderOutput,
   timeoutMs,
   eventMeta,
+  abortSignal,
 }) {
   const prompt = buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
   const result = await executeProviderText({
@@ -124,6 +125,7 @@ async function runReviewer({
     timeoutMs,
     streamOutput: false,
     eventMeta,
+    abortSignal,
   });
 
   const parsed = extractJsonObject(result.text);

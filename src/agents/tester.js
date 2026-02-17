@@ -93,6 +93,7 @@ async function runTester({
   coderOutput,
   timeoutMs,
   eventMeta,
+  abortSignal,
 }) {
   const prompt = buildTesterPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
   const result = await executeProviderText({
@@ -102,6 +103,7 @@ async function runTester({
     timeoutMs,
     streamOutput: false,
     eventMeta,
+    abortSignal,
   });
 
   const parsed = extractJsonObject(result.text);

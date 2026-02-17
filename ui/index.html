@@ -42,6 +42,7 @@
             <button id="copyTaskBtn" class="btn">复制任务ID</button>
             <button id="exportReportBtn" class="btn">导出报告</button>
             <button id="rerunTaskBtn" class="btn">重跑任务</button>
+            <button id="cancelRunBtn" class="btn danger">终止运行</button>
             <button id="clearRoundBtn" class="btn">清除回合筛选</button>
           </div>
 
@@ -53,6 +54,9 @@
           </div>
 
           <div id="chatStream" class="chat-stream"></div>
+          <button id="jumpBottomBtn" class="jump-bottom-btn" title="回到最新消息" aria-label="回到最新消息">
+            ↓ 最新
+          </button>
 
           <div class="composer">
             <input id="chatCommandInput" placeholder='输入命令，如：/task 实现登录接口；/task --provider codex-cli --rounds 2 修复失败测试；/rerun 继续上个任务' />

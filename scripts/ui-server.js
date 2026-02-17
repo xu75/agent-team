@@ -13,6 +13,7 @@ const CONFIG_ROOT = path.join(ROOT, "config");
 const ROLE_CONFIG_FILE = path.join(CONFIG_ROOT, "role-config.json");
 const PORT = Number(process.env.UI_PORT || 4173);
 const HOST = process.env.UI_HOST || "127.0.0.1";
+const ACTIVE_TASK_RUNS = new Map();
 
 const STAGES = ["coder", "reviewer", "tester"];
 const DEFAULT_STAGE_DUTY = Object.freeze({
@@ -354,6 +355,14 @@ function taskLastPreview(taskDir, summary) {
   return "";
 }
 
+function taskPromptPreview(taskDir, maxLen = 28) {
+  const p = path.join(taskDir, "task.md");
+  if (!fs.existsSync(p)) return "";
+  const first = firstNonEmptyLine(fs.readFileSync(p, "utf8"));
+  if (!first) return "";
+  return first.length > maxLen ? `${first.slice(0, maxLen)}...` : first;
+}
+
 function toneFromOutcome(outcome) {
   const s = String(outcome || "").toLowerCase();
   if (!s) return "neutral";
@@ -385,6 +394,7 @@ function listTasks() {
         provider: summary.provider || "unknown",
         final_status: summary.final_status || null,
         final_outcome: summary.final_outcome || null,
+        task_title: taskPromptPreview(t.dir),
         rounds: Array.isArray(summary.rounds) ? summary.rounds.length : 0,
         unresolved_must_fix: unresolved.length,
         status_tone: tone,
@@ -613,6 +623,12 @@ function buildThreadPrompt(taskDir) {
   lines.push("");
   lines.push("Please respond to the latest follow-up while respecting prior context.");
   return lines.join("\n").trim();
+}
+
+function looksLikeConfirmMessage(text) {
+  const s = String(text || "").trim().toLowerCase();
+  if (!s) return false;
+  return /(^|\s)(confirm|approve|go|ship|实施|开始|执行|确认|按方案|同意|继续)/i.test(s);
 }
 
 function roleMessageContent(roundDir, role) {
@@ -976,6 +992,7 @@ const server = http.createServer(async (req, res) => {
         roleProviders,
         roleProfiles,
         roleConfig: effectiveRoleConfig,
+        executionMode: "proposal",
       });
       return sendJson(res, 200, {
         ok: true,
@@ -987,6 +1004,16 @@ const server = http.createServer(async (req, res) => {
 
     if (p.startsWith("/api/tasks/") && req.method === "POST") {
       const seg = p.split("/").filter(Boolean);
+      if (seg.length === 4 && seg[3] === "cancel") {
+        const taskId = seg[2];
+        const running = ACTIVE_TASK_RUNS.get(taskId);
+        if (!running) {
+          return sendJson(res, 200, { ok: true, task_id: taskId, canceled: false, message: "没有可取消的运行。" });
+        }
+        running.controller.abort();
+        return sendJson(res, 200, { ok: true, task_id: taskId, canceled: true, message: "已发送终止信号。" });
+      }
+
       if (seg.length === 4 && seg[3] === "followup") {
         const taskId = seg[2];
         const task = getTaskDetail(taskId);
@@ -1006,8 +1033,28 @@ const server = http.createServer(async (req, res) => {
         const maxIterations = Number.isFinite(body.maxIterations) ? Number(body.maxIterations) : 1;
         const provider = String(body.provider || summary.provider || "claude-cli");
         const prompt = buildThreadPrompt(task.task_dir);
+        const awaitingConfirm = summary.awaiting_operator_confirm === true || summary.final_outcome === "awaiting_operator_confirm";
+        const confirmRequested = body.confirm === true || looksLikeConfirmMessage(message);
 
-        const updated = await runTask(prompt, {
+        if (awaitingConfirm && !confirmRequested) {
+          return sendJson(res, 200, {
+            ok: true,
+            task_id: taskId,
+            summary,
+            role_config: effectiveRoleConfig,
+            pending_confirmation: true,
+            message: "提案已评审通过，等待铲屎官确认。请发送 /confirm 开始编码实施。",
+          });
+        }
+
+        if (ACTIVE_TASK_RUNS.has(taskId)) {
+          return sendJson(res, 409, { error: "该任务已有运行进行中，请先终止或等待完成。" });
+        }
+        const controller = new AbortController();
+        ACTIVE_TASK_RUNS.set(taskId, { controller, started_at: Date.now(), kind: "followup" });
+        let updated;
+        try {
+          updated = await runTask(prompt, {
           provider,
           model: body.model ? String(body.model) : summary.model || undefined,
           maxIterations: Math.max(1, maxIterations),
@@ -1017,7 +1064,16 @@ const server = http.createServer(async (req, res) => {
           appendToTask: true,
           taskId,
           taskDir: task.task_dir,
+          executionMode: confirmRequested ? "implementation" : "proposal",
+          operatorConfirmed: confirmRequested,
+          abortSignal: controller.signal,
         });
+        } finally {
+          const current = ACTIVE_TASK_RUNS.get(taskId);
+          if (current && current.controller === controller) {
+            ACTIVE_TASK_RUNS.delete(taskId);
+          }
+        }
 
         return sendJson(res, 200, {
           ok: true,
@@ -1031,6 +1087,9 @@ const server = http.createServer(async (req, res) => {
         const taskId = seg[2];
         const task = getTaskDetail(taskId);
         if (!task) return sendJson(res, 404, { error: "task not found" });
+        if (ACTIVE_TASK_RUNS.has(taskId)) {
+          return sendJson(res, 409, { error: "该任务已有运行进行中，请先终止或等待完成。" });
+        }
 
         const body = await readRequestJson(req);
         const summary = task.summary || {};
@@ -1043,7 +1102,11 @@ const server = http.createServer(async (req, res) => {
         const roleProviders = stageAssignmentToRoleProviders(effectiveRoleConfig);
         const roleProfiles = stageRoleProfiles(effectiveRoleConfig);
 
-        const rerun = await runTask(prompt, {
+        const controller = new AbortController();
+        ACTIVE_TASK_RUNS.set(taskId, { controller, started_at: Date.now(), kind: "rerun" });
+        let rerun;
+        try {
+          rerun = await runTask(prompt, {
           provider: String(body.provider || summary.provider || "claude-cli"),
           model: body.model ? String(body.model) : summary.model || undefined,
           maxIterations: Number.isFinite(body.maxIterations)
@@ -1052,7 +1115,14 @@ const server = http.createServer(async (req, res) => {
           roleProviders,
           roleProfiles,
           roleConfig: effectiveRoleConfig,
+          abortSignal: controller.signal,
         });
+        } finally {
+          const current = ACTIVE_TASK_RUNS.get(taskId);
+          if (current && current.controller === controller) {
+            ACTIVE_TASK_RUNS.delete(taskId);
+          }
+        }
 
         return sendJson(res, 200, {
           ok: true,

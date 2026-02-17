@@ -111,8 +111,10 @@ async function runTask(taskPrompt, options = {}) {
   const allowedTestCommands = Array.isArray(options.allowedTestCommands)
     ? options.allowedTestCommands
     : DEFAULT_ALLOWED_PREFIXES;
+  const abortSignal = options.abortSignal || null;
 
   const appendToTask = !!options.appendToTask;
+  const requestedMode = options.executionMode === "implementation" ? "implementation" : "proposal";
   const existingTaskId = options.taskId ? String(options.taskId) : null;
   const existingTaskDir = options.taskDir ? String(options.taskDir) : null;
   const created = appendToTask
@@ -125,6 +127,11 @@ async function runTask(taskPrompt, options = {}) {
   fs.mkdirSync(path.join(taskDir, "rounds"), { recursive: true });
   const taskEventsFile = path.join(taskDir, "task-events.jsonl");
   const priorSummary = appendToTask ? JSON.parse(JSON.stringify(safeSummary(taskDir))) : null;
+  const awaitingOperatorConfirm = priorSummary?.awaiting_operator_confirm === true;
+  const executionMode =
+    options.operatorConfirmed || (awaitingOperatorConfirm && requestedMode === "implementation")
+      ? "implementation"
+      : requestedMode;
 
   if (!appendToTask) {
     writeText(path.join(taskDir, "task.md"), taskPrompt + "\n");
@@ -186,25 +193,142 @@ async function runTask(taskPrompt, options = {}) {
     return out;
   }
 
-  transition(FSM_STATES.INTAKE, { reason: appendToTask ? "task_followup_received" : "task_received" });
-  transition(FSM_STATES.PLAN, { reason: "minimal_plan_bootstrap" });
+  function throwIfAborted() {
+    if (abortSignal?.aborted) {
+      const err = new Error("run aborted by operator");
+      err.code = "ABORTED";
+      throw err;
+    }
+  }
 
-  const startRound = rounds.length + 1;
-  const endRoundExclusive = startRound + maxIterations;
-  for (let round = startRound; round < endRoundExclusive; round += 1) {
-    transition(FSM_STATES.BUILD, { round, reason: "start_coder" });
+  try {
+    throwIfAborted();
+    transition(FSM_STATES.INTAKE, { reason: appendToTask ? "task_followup_received" : "task_received" });
 
+    if (executionMode === "proposal") {
+    const round = rounds.length + 1;
     const roundPath = roundDir(taskDir, round);
-    const attempt = round;
 
-    const coder = await runCoder({
+    transition(FSM_STATES.PLAN, { round, reason: "draft_proposal" });
+      throwIfAborted();
+      const proposal = await runCoder({
       provider: providerFor("coder"),
       model: modelFor("coder"),
       roleProfile: profileFor("coder"),
       peerProfiles: peersFor("coder"),
       taskPrompt,
       mustFix,
+      mode: "proposal",
       timeoutMs,
+      abortSignal,
+      eventMeta: {
+        task_id: taskId,
+        round_id: round,
+        agent_role: "coder",
+        attempt: round,
+      },
+    });
+
+    writeText(path.join(roundPath, "coder_output.md"), proposal.text);
+    writeJson(path.join(roundPath, "coder_run.json"), {
+      run_id: proposal.runId,
+      run_dir: proposal.runDir,
+      exit: proposal.exit,
+      mode: "proposal",
+    });
+    copyRunArtifacts(proposal.runDir, roundPath, "coder");
+
+    transition(FSM_STATES.REVIEW, { round, reason: "review_proposal" });
+      throwIfAborted();
+      const reviewer = await runReviewer({
+      provider: providerFor("reviewer"),
+      model: modelFor("reviewer"),
+      roleProfile: profileFor("reviewer"),
+      peerProfiles: peersFor("reviewer"),
+      taskPrompt,
+      coderOutput: proposal.text,
+      timeoutMs,
+      abortSignal,
+      eventMeta: {
+        task_id: taskId,
+        round_id: round,
+        agent_role: "reviewer",
+        attempt: round,
+      },
+    });
+
+    writeText(path.join(roundPath, "reviewer_raw.md"), reviewer.text);
+    writeJson(path.join(roundPath, "reviewer.json"), reviewer.review);
+    writeJson(path.join(roundPath, "reviewer_meta.json"), {
+      ok: reviewer.ok,
+      parse_error: reviewer.parse_error,
+      run_id: reviewer.runId,
+      run_dir: reviewer.runDir,
+      exit: reviewer.exit,
+      mode: "proposal",
+    });
+    copyRunArtifacts(reviewer.runDir, roundPath, "reviewer");
+
+    rounds.push({
+      round,
+      phase: "proposal",
+      coder: {
+        run_id: proposal.runId,
+        exit_code: proposal.exit.code,
+      },
+      reviewer: {
+        run_id: reviewer.runId,
+        ok: reviewer.ok,
+        parse_error: reviewer.parse_error,
+        decision: reviewer.review.decision,
+        must_fix_count: reviewer.review.must_fix.length,
+      },
+    });
+
+    if (!reviewer.ok) {
+      finalOutcome = "review_schema_invalid";
+      mustFix = reviewer.review.must_fix;
+      transition(FSM_STATES.FINALIZE, {
+        round,
+        reason: "review_schema_invalid",
+      });
+    } else if (reviewer.review.decision === "approve") {
+      finalOutcome = "awaiting_operator_confirm";
+      mustFix = [];
+      transition(FSM_STATES.FINALIZE, {
+        round,
+        reason: "await_operator_confirm",
+      });
+    } else {
+      finalOutcome = "proposal_changes_requested";
+      mustFix = reviewer.review.must_fix;
+      transition(FSM_STATES.FINALIZE, {
+        round,
+        reason: "proposal_changes_requested",
+      });
+    }
+    } else {
+    transition(FSM_STATES.PLAN, { reason: "implementation_confirmed" });
+
+    const startRound = rounds.length + 1;
+    const endRoundExclusive = startRound + maxIterations;
+      for (let round = startRound; round < endRoundExclusive; round += 1) {
+      throwIfAborted();
+      transition(FSM_STATES.BUILD, { round, reason: "start_coder" });
+
+    const roundPath = roundDir(taskDir, round);
+    const attempt = round;
+
+      const coder = await runCoder({
+      provider: providerFor("coder"),
+      model: modelFor("coder"),
+      roleProfile: profileFor("coder"),
+      peerProfiles: peersFor("coder"),
+      taskPrompt,
+      mustFix,
+      mode: "implementation",
+      timeoutMs,
+      abortSignal,
       eventMeta: {
         task_id: taskId,
         round_id: round,
@@ -223,7 +347,8 @@ async function runTask(taskPrompt, options = {}) {
 
     transition(FSM_STATES.REVIEW, { round, reason: "start_reviewer" });
 
-    const reviewer = await runReviewer({
+      throwIfAborted();
+      const reviewer = await runReviewer({
       provider: providerFor("reviewer"),
       model: modelFor("reviewer"),
       roleProfile: profileFor("reviewer"),
@@ -231,6 +356,7 @@ async function runTask(taskPrompt, options = {}) {
       taskPrompt,
       coderOutput: coder.text,
       timeoutMs,
+      abortSignal,
       eventMeta: {
         task_id: taskId,
         round_id: round,
@@ -252,6 +378,7 @@ async function runTask(taskPrompt, options = {}) {
 
     rounds.push({
       round,
+      phase: "implementation",
       coder: {
         run_id: coder.runId,
         exit_code: coder.exit.code,
@@ -278,6 +405,7 @@ async function runTask(taskPrompt, options = {}) {
     if (reviewer.review.decision === "approve") {
       transition(FSM_STATES.TEST, { round, reason: "review_approved" });
 
+      throwIfAborted();
       const tester = await runTester({
         provider: providerFor("tester"),
         model: modelFor("tester"),
@@ -286,6 +414,7 @@ async function runTask(taskPrompt, options = {}) {
         taskPrompt,
         coderOutput: coder.text,
         timeoutMs,
+        abortSignal,
         eventMeta: {
           task_id: taskId,
           round_id: round,
@@ -306,12 +435,14 @@ async function runTask(taskPrompt, options = {}) {
       copyRunArtifacts(tester.runDir, roundPath, "tester");
 
       const commands = tester.test_spec.commands || [];
+      throwIfAborted();
       const testRun = await runTestCommands(commands, {
         timeoutMs: testCommandTimeoutMs,
         cwd: process.cwd(),
         env: process.env,
         allowedPrefixes: allowedTestCommands,
         stopOnFailure: true,
+        abortSignal,
       });
 
       writeJson(path.join(roundPath, "test-results.json"), testRun);
@@ -381,6 +512,18 @@ async function runTask(taskPrompt, options = {}) {
       must_fix_count: mustFix.length,
     });
   }
+    }
+  } catch (err) {
+    if (err?.code === "ABORTED") {
+      finalOutcome = "canceled";
+      mustFix = [];
+      if (currentState !== FSM_STATES.FINALIZE) {
+        transition(FSM_STATES.FINALIZE, { reason: "aborted_by_operator" });
+      }
+    } else {
+      throw err;
+    }
+  }
 
   if (currentState !== FSM_STATES.FINALIZE) {
     transition(FSM_STATES.FINALIZE, {
@@ -419,6 +562,8 @@ async function runTask(taskPrompt, options = {}) {
     role_config: roleConfig,
     final_status: currentState,
     final_outcome: finalOutcome,
+    awaiting_operator_confirm: finalOutcome === "awaiting_operator_confirm",
+    workflow_phase: executionMode,
     max_iterations: maxIterations,
     fsm_states: Object.values(FSM_STATES),
     state_events: stateEvents,

@@ -2,7 +2,13 @@
 
 const { executeProviderText } = require("../providers/execute-provider");
 
-function buildCoderPrompt({ taskPrompt, mustFix = [], roleProfile = {}, peerProfiles = {} }) {
+function buildCoderPrompt({
+  taskPrompt,
+  mustFix = [],
+  roleProfile = {},
+  peerProfiles = {},
+  mode = "implementation",
+}) {
   const meName = roleProfile.display_name || "Coder";
   const meTitle = roleProfile.role_title || "CoreDev";
   const reviewer = peerProfiles.reviewer || {};
@@ -18,8 +24,14 @@ function buildCoderPrompt({ taskPrompt, mustFix = [], roleProfile = {}, peerProf
   lines.push(
     `Nickname rules: call reviewer as "${reviewerNick}", tester as "${testerNick}".`
   );
-  lines.push("Produce a concise implementation answer for the task.");
-  lines.push("If reviewer must-fix items exist, fix them first.");
+  if (mode === "proposal") {
+    lines.push("Produce a concise implementation proposal only.");
+    lines.push("Do not claim files are edited. This step is planning before operator confirmation.");
+    lines.push("Include: approach, touched files (planned), key risks, and rollout notes.");
+  } else {
+    lines.push("Produce a concise implementation answer for the task.");
+    lines.push("If reviewer must-fix items exist, fix them first.");
+  }
   lines.push("");
   lines.push("Task:");
   lines.push(taskPrompt);
@@ -42,10 +54,12 @@ async function runCoder({
   peerProfiles,
   taskPrompt,
   mustFix,
+  mode,
   timeoutMs,
   eventMeta,
+  abortSignal,
 }) {
-  const prompt = buildCoderPrompt({ taskPrompt, mustFix, roleProfile, peerProfiles });
+  const prompt = buildCoderPrompt({ taskPrompt, mustFix, roleProfile, peerProfiles, mode });
   return executeProviderText({
     provider,
     model,
@@ -53,6 +67,7 @@ async function runCoder({
     timeoutMs,
     streamOutput: true,
     eventMeta,
+    abortSignal,
   });
 }
 

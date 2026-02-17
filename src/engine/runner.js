@@ -29,6 +29,8 @@ async function runCommandStreaming({
   killGraceMs = 5000,
   logsRoot = "logs",
   onEvent = () => {},
+  shouldTerminate = null,
+  abortSignal = null,
 }) {
   const { runId, dir } = createRunLogDir(logsRoot);
 
@@ -39,11 +41,25 @@ async function runCommandStreaming({
 
   let lastActivity = Date.now();
   let finished = false;
+  let child = null;
+  let abortedBySignal = false;
 
   function emit(type, data = {}, meta = {}) {
     const evt = makeEvent(type, data, { ...baseMeta, ...meta });
     onEvent(evt);
     eventsWriter.writeLine(JSON.stringify(evt));
+    if (typeof shouldTerminate === "function" && !finished) {
+      try {
+        const decision = shouldTerminate(evt);
+        if (decision) {
+          const reason =
+            typeof decision === "string"
+              ? decision
+              : "provider requested early termination";
+          gracefulKill(reason);
+        }
+      } catch {}
+    }
   }
 
   function markActivity() {
@@ -55,21 +71,30 @@ async function runCommandStreaming({
     finished = true;
 
     emit("run.terminating", { reason });
+    if (reason === "aborted by operator") {
+      abortedBySignal = true;
+    }
 
-    try {
-      child.kill("SIGTERM");
-    } catch {}
+    if (child) {
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+    }
 
     setTimeout(() => {
       try {
-        if (!child.killed) child.kill("SIGKILL");
+        if (child && !child.killed) child.kill("SIGKILL");
       } catch {}
     }, killGraceMs);
   }
 
   emit("run.started", { cmd, args, log_dir: dir });
 
-  const child = spawn(cmd, args, {
+  if (abortSignal?.aborted) {
+    gracefulKill("aborted by operator");
+  }
+
+  child = spawn(cmd, args, {
     stdio: ["ignore", "pipe", "pipe"],
     env,
   });
@@ -81,6 +106,11 @@ async function runCommandStreaming({
   const onSigterm = () => gracefulKill("parent SIGTERM");
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
+
+  const onAbort = () => gracefulKill("aborted by operator");
+  if (abortSignal && typeof abortSignal.addEventListener === "function") {
+    abortSignal.addEventListener("abort", onAbort, { once: true });
+  }
 
   const rlOut = readline.createInterface({
     input: child.stdout,
@@ -169,6 +199,9 @@ async function runCommandStreaming({
 
   process.off("SIGINT", onSigint);
   process.off("SIGTERM", onSigterm);
+  if (abortSignal && typeof abortSignal.removeEventListener === "function") {
+    abortSignal.removeEventListener("abort", onAbort);
+  }
 
   finished = true;
 
@@ -183,7 +216,7 @@ async function runCommandStreaming({
   await rawWriter.close();
   await eventsWriter.close();
 
-  return { runId, dir, exit };
+  return { runId, dir, exit, aborted: abortedBySignal };
 }
 
 module.exports = { runCommandStreaming };

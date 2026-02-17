@@ -11,6 +11,8 @@ const state = {
   optimisticMessages: [],
   livePollTimer: null,
   livePollBusy: false,
+  liveDigest: "",
+  runningTaskId: null,
 };
 
 const el = {
@@ -25,8 +27,10 @@ const el = {
   copyTaskBtn: document.getElementById("copyTaskBtn"),
   exportReportBtn: document.getElementById("exportReportBtn"),
   rerunTaskBtn: document.getElementById("rerunTaskBtn"),
+  cancelRunBtn: document.getElementById("cancelRunBtn"),
   clearRoundBtn: document.getElementById("clearRoundBtn"),
   chatStream: document.getElementById("chatStream"),
+  jumpBottomBtn: document.getElementById("jumpBottomBtn"),
   chatCommandInput: document.getElementById("chatCommandInput"),
   sendCommandBtn: document.getElementById("sendCommandBtn"),
   runTaskStatus: document.getElementById("runTaskStatus"),
@@ -115,7 +119,7 @@ function toneFromOutcome(v) {
   const s = String(v || "").toLowerCase();
   if (!s) return "neutral";
   if (s.includes("approved") || s.includes("pass") || s.includes("success")) return "positive";
-  if (s.includes("max_iterations") || s.includes("changes_requested")) return "warning";
+  if (s.includes("max_iterations") || s.includes("changes_requested") || s.includes("awaiting_operator_confirm")) return "warning";
   if (s.includes("failed") || s.includes("invalid") || s.includes("error") || s.includes("schema")) {
     return "negative";
   }
@@ -128,6 +132,21 @@ function fmtTime(ts) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+function fmtRelativeTime(ts) {
+  if (!Number.isFinite(ts)) return "刚刚";
+  const now = Date.now();
+  const diff = Math.max(0, now - ts);
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (diff < minute) return "刚刚";
+  if (diff < hour) return `${Math.floor(diff / minute)}分钟前`;
+  if (diff < day) return `今天 ${fmtTime(ts)}`;
+  if (diff < day * 2) return `昨天 ${fmtTime(ts)}`;
+  const d = new Date(ts);
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${fmtTime(ts)}`;
+}
+
 function fmtCost(v) {
   if (!Number.isFinite(v)) return null;
   return `$${v.toFixed(4)}`;
@@ -137,6 +156,39 @@ function previewLine(t) {
   const raw = String(t?.last_preview || "").trim();
   if (!raw) return "暂无预览";
   return raw.length > 56 ? `${raw.slice(0, 56)}...` : raw;
+}
+
+function taskTitleLine(t) {
+  const title = String(t?.task_title || "").trim();
+  if (title) return title;
+  const fallback = String(t?.last_preview || "").trim();
+  if (fallback) return fallback.length > 24 ? `${fallback.slice(0, 24)}...` : fallback;
+  return String(t?.task_id || "未命名任务");
+}
+
+function outcomeNaturalText(outcome) {
+  const s = String(outcome || "").toLowerCase();
+  if (!s) return "处理中";
+  if (s.includes("approved") || s.includes("pass")) return "评审通过";
+  if (s.includes("changes_requested")) return "待修改";
+  if (s.includes("max_iterations")) return "达到最大轮次";
+  if (s.includes("failed") || s.includes("error") || s.includes("invalid")) return "执行失败";
+  return "处理中";
+}
+
+function taskStatusLine(t) {
+  const cfg = activeRoleConfig();
+  const coder = cfg?.role_profiles?.coder || {};
+  const nickname = String(coder.nickname || coder.display_name || "猫猫");
+  const status = outcomeNaturalText(t?.final_outcome);
+  if (status === "评审通过") return `${nickname}完成了 · ${status}`;
+  return `${nickname}处理中 · ${status}`;
+}
+
+function roundsLabel(rounds) {
+  const n = Math.max(0, Number(rounds || 0));
+  if (!n) return "";
+  return `${n}轮`;
 }
 
 function roleAvatar(role) {
@@ -254,6 +306,19 @@ function showToast(text, kind = "neutral") {
     t.classList.remove("show");
     setTimeout(() => t.remove(), 180);
   }, 2200);
+}
+
+function showInlineCopyTip(btn, text, kind = "ok") {
+  if (!btn) return;
+  btn.dataset.tip = String(text || "");
+  btn.dataset.tipKind = kind;
+  btn.classList.add("show-tip");
+  clearTimeout(btn._tipTimer);
+  btn._tipTimer = setTimeout(() => {
+    btn.classList.remove("show-tip");
+    delete btn.dataset.tip;
+    delete btn.dataset.tipKind;
+  }, 1200);
 }
 
 function escapeHtml(v) {
@@ -472,12 +537,14 @@ function setRunStatus(text = "", running = false) {
 function updateActionAvailability() {
   const hasTask = !!state.selectedTaskId;
   const busy = !!state.busy;
+  const canCancel = !!state.selectedTaskId && state.runningTaskId === state.selectedTaskId;
   el.sendCommandBtn.disabled = busy;
   el.refreshBtn.disabled = busy;
   el.chatCommandInput.disabled = busy;
   el.copyTaskBtn.disabled = busy || !hasTask;
   el.exportReportBtn.disabled = busy || !hasTask;
   el.rerunTaskBtn.disabled = busy || !hasTask;
+  el.cancelRunBtn.disabled = !canCancel;
   el.clearRoundBtn.disabled = busy || !hasTask;
   el.saveRolesBtn.disabled = busy;
 }
@@ -485,6 +552,37 @@ function updateActionAvailability() {
 function setBusy(v) {
   state.busy = v;
   updateActionAvailability();
+}
+
+function isNearBottom(node) {
+  if (!node) return true;
+  return node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+}
+
+function updateJumpBottomVisibility() {
+  const shouldShow = !isNearBottom(el.chatStream);
+  el.jumpBottomBtn.classList.toggle("show", shouldShow);
+}
+
+function buildLiveDigest(detail, messagesData) {
+  const summary = detail?.summary || {};
+  const messages = messagesData?.messages || [];
+  const last = messages[messages.length - 1] || {};
+  const unresolved = Array.isArray(messagesData?.unresolved_must_fix)
+    ? messagesData.unresolved_must_fix.length
+    : 0;
+  return [
+    summary.final_status || "",
+    summary.final_outcome || "",
+    Array.isArray(summary.rounds) ? summary.rounds.length : 0,
+    messages.length,
+    last.id || "",
+    Number(last.ts || 0),
+    Number(last.ok === false ? -1 : last.ok === true ? 1 : 0),
+    messagesData?.current_stage || "",
+    messagesData?.final_outcome || "",
+    unresolved,
+  ].join("|");
 }
 
 function taskGroups(tasks) {
@@ -520,15 +618,17 @@ function renderTasks() {
         (t.task_id === state.selectedTaskId ? " active" : "");
       row.innerHTML = `
         <div class="task-head">
-          <div class="id">${t.task_id}</div>
+          <div class="task-title" title="${escapeHtml(t.task_id)}">${escapeHtml(taskTitleLine(t))}</div>
           <div class="task-right">
-            <span class="mini-time">${fmtTime(t.updated_ts)}</span>
+            <span class="mini-time">${fmtRelativeTime(t.updated_ts)}</span>
             ${Number(t.alert_count) > 0 ? `<span class="alert-badge">${t.alert_count}</span>` : ""}
           </div>
         </div>
-        <div class="main">${t.provider} · ${t.final_outcome || "-"}</div>
-        <div class="preview">${previewLine(t)}</div>
-        <div class="id">rounds ${t.rounds}</div>
+        <div class="main">${escapeHtml(taskStatusLine(t))}</div>
+        <div class="preview">${escapeHtml(previewLine(t))}</div>
+        <div class="task-foot">
+          <span class="round-dots" title="对话轮次">${roundsLabel(t.rounds)}</span>
+        </div>
       `;
       row.addEventListener("click", () => selectTask(t.task_id));
       box.appendChild(row);
@@ -547,6 +647,7 @@ function applyFilter() {
     if (!q) return true;
     return (
       t.task_id.toLowerCase().includes(q) ||
+      String(t.task_title || "").toLowerCase().includes(q) ||
       String(t.provider).toLowerCase().includes(q) ||
       String(t.final_outcome).toLowerCase().includes(q) ||
       String(t.last_preview || "").toLowerCase().includes(q)
@@ -626,9 +727,13 @@ async function refreshTaskLive(taskId) {
       getJson(`/api/tasks/${taskId}/messages`),
     ]);
     if (state.selectedTaskId !== taskId) return;
+    const nextDigest = buildLiveDigest(detail, messages);
+    const changed = nextDigest !== state.liveDigest;
     state.detail = detail;
     state.messagesData = messages;
-    renderTaskPage();
+    if (!changed) return;
+    state.liveDigest = nextDigest;
+    renderTaskPage({ preserveEvidence: true });
   } catch {
     // keep polling; transient errors are expected while background run is active
   } finally {
@@ -687,17 +792,19 @@ async function openEvidence(round, role, kind) {
 
 function renderChat() {
   const messages = filteredMessages();
+  const messageMap = new Map();
   const prev = el.chatStream;
   const prevScrollTop = prev.scrollTop;
-  const prevScrollHeight = prev.scrollHeight;
-  const prevClientHeight = prev.clientHeight;
-  const nearBottom = prevScrollHeight - prevScrollTop - prevClientHeight < 64;
+  const nearBottom = isNearBottom(prev);
   el.chatStream.innerHTML = "";
   if (!messages.length) {
     el.chatStream.innerHTML = '<div class="empty-block">当前筛选条件下没有消息。</div>';
+    updateJumpBottomVisibility();
     return;
   }
   messages.forEach((m) => {
+    const msgId = String(m.id || `${m.role}-${m.round ?? "na"}-${m.ts ?? Date.now()}`);
+    messageMap.set(msgId, m);
     const item = document.createElement("article");
     item.className = `chat-msg role-${m.role}`;
     const statusDot = m.ok === false ? "status-bad" : m.ok === true ? "status-ok" : "status-idle";
@@ -732,7 +839,14 @@ function renderChat() {
       </header>
       ${metaHtml}
       ${textHtml}
-      ${evidenceButtons ? `<div class="evidence-row"><span>Evidence:</span>${evidenceButtons}</div>` : ""}
+      <div class="msg-footer">
+        ${evidenceButtons ? `<div class="evidence-row"><span>Evidence:</span>${evidenceButtons}</div>` : `<div></div>`}
+        <button class="copy-msg-btn" data-copy-msg="${escapeHtml(msgId)}" title="复制消息" aria-label="复制消息">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Zm-4 6H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+        </button>
+      </div>
     `;
     el.chatStream.appendChild(item);
   });
@@ -743,6 +857,24 @@ function renderChat() {
       const role = btn.dataset.role;
       const kind = btn.dataset.kind;
       openEvidence(round, role, kind);
+    });
+  });
+
+  Array.from(el.chatStream.querySelectorAll(".copy-msg-btn")).forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const msgId = String(btn.dataset.copyMsg || "");
+      const msg = messageMap.get(msgId);
+      const text = String(msg?.text || "").trim();
+      if (!text) {
+        showInlineCopyTip(btn, "无内容", "warn");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        showInlineCopyTip(btn, "已复制", "ok");
+      } catch {
+        showInlineCopyTip(btn, "复制失败", "error");
+      }
     });
   });
 
@@ -762,6 +894,7 @@ function renderChat() {
     const maxTop = Math.max(0, el.chatStream.scrollHeight - el.chatStream.clientHeight);
     el.chatStream.scrollTop = Math.min(prevScrollTop, maxTop);
   }
+  updateJumpBottomVisibility();
 }
 
 function renderRoundTag() {
@@ -897,11 +1030,12 @@ function syncComposerWithCurrentTask() {
   const rounds = Number.isFinite(summary.max_iterations) ? Math.max(1, Math.floor(summary.max_iterations)) : DEFAULT_COMPOSER.maxIterations;
   if (!state.busy) {
     el.chatCommandInput.placeholder =
-      `/task --provider ${provider} --rounds ${rounds} 你的任务；/rerun 继续当前任务`;
+      `/task --provider ${provider} --rounds ${rounds} 你的任务；/confirm 开始实施；/rerun 继续当前任务`;
   }
 }
 
-function renderTaskPage() {
+function renderTaskPage(opts = {}) {
+  const preserveEvidence = !!opts.preserveEvidence;
   const summary = state.detail?.summary || {};
   el.taskTitle.textContent = `协作对话 · ${state.selectedTaskId}`;
   el.taskMeta.textContent = `${summary.provider || "-"} · ${summary.final_outcome || "-"}`;
@@ -915,9 +1049,10 @@ function renderTaskPage() {
   renderLatestFailure();
   renderMustFix();
   renderRoundTestResults().catch(() => {});
-  renderEvidencePlaceholder();
+  if (!preserveEvidence) renderEvidencePlaceholder();
   syncComposerWithCurrentTask();
   updateActionAvailability();
+  updateJumpBottomVisibility();
 }
 
 async function selectTask(taskId) {
@@ -932,6 +1067,7 @@ async function selectTask(taskId) {
 
   state.detail = detail;
   state.messagesData = messages;
+  state.liveDigest = buildLiveDigest(detail, messages);
   renderTaskPage();
 }
 
@@ -951,6 +1087,7 @@ function renderEmptyScreen() {
   el.testResults.textContent = "暂无测试结果。";
   el.mustFixList.innerHTML = "<li>无</li>";
   renderEvidencePlaceholder();
+  updateJumpBottomVisibility();
   updateActionAvailability();
 }
 
@@ -968,6 +1105,7 @@ async function loadTasks() {
     state.selectedTaskId = null;
     state.detail = null;
     state.messagesData = null;
+    state.liveDigest = "";
     renderEmptyScreen();
   }
 }
@@ -1019,7 +1157,17 @@ function parseCliLikeCommand(rawLine) {
     return { kind: "followup", message: prompt, provider, rounds };
   }
 
-  return { kind: "invalid", error: `未知命令 /${cmd}。可用命令：/task /ask /rerun /help` };
+  if (cmd === "confirm") {
+    return {
+      kind: "confirm",
+      message: prompt || "确认按方案实施",
+      provider,
+      rounds,
+      confirm: true,
+    };
+  }
+
+  return { kind: "invalid", error: `未知命令 /${cmd}。可用命令：/task /ask /confirm /rerun /help` };
 }
 
 function resolvedProvider(cmdProvider) {
@@ -1043,6 +1191,7 @@ function commandHelpText() {
     "/task --provider codex-cli --rounds 2 修复登录接口",
     "/ask 继续追问（进入当前会话）",
     "/ask --provider claude-cli --rounds 1 这个点再细化一下",
+    "/confirm 认可当前方案并开始编码实施",
     "/rerun",
     "/rerun --provider claude-cli --rounds 1 重新执行并缩短输出",
     "/help",
@@ -1074,7 +1223,7 @@ async function runNewTaskFromCommand({ prompt, provider, rounds }) {
   }
 }
 
-async function sendFollowupInThread({ message, provider, rounds }) {
+async function sendFollowupInThread({ message, provider, rounds, confirm = false }) {
   if (!state.selectedTaskId) {
     await runNewTaskFromCommand({ prompt: message, provider, rounds });
     return;
@@ -1104,6 +1253,7 @@ async function sendFollowupInThread({ message, provider, rounds }) {
     el.chatCommandInput.value = "";
     state.optimisticMessages.push(optimisticMessage);
     renderChat();
+    state.runningTaskId = taskId;
     setBusy(true);
     setRunStatus(`追问中：${taskId}`, true);
     startLivePolling(taskId);
@@ -1113,9 +1263,18 @@ async function sendFollowupInThread({ message, provider, rounds }) {
       maxIterations: resolvedRounds(rounds),
       role_config: state.roleConfig || DEFAULT_ROLE_CONFIG,
       client_message_id: clientMessageId,
+      confirm: !!confirm,
     });
-    setRunStatus(`已更新：${res.task_id}`, false);
-    showToast("追问已加入当前会话", "positive");
+    if (res?.pending_confirmation) {
+      setRunStatus(res.message || "等待铲屎官确认。发送 /confirm 开始实施。", false);
+      showToast("已记录追问，等待确认后实施", "warning");
+    } else if (String(res?.summary?.final_outcome || "").toLowerCase() === "canceled") {
+      setRunStatus(`已终止：${res.task_id}`, false);
+      showToast("运行已终止", "warning");
+    } else {
+      setRunStatus(`已更新：${res.task_id}`, false);
+      showToast(confirm ? "已确认，开始实施" : "追问已加入当前会话", "positive");
+    }
     removeOptimisticMessage(optimisticMessage.id);
     await loadTasks();
     if (res.task_id) await selectTask(res.task_id);
@@ -1126,6 +1285,7 @@ async function sendFollowupInThread({ message, provider, rounds }) {
     showToast(`追问失败：${err.message}`, "negative");
   } finally {
     stopLivePolling();
+    state.runningTaskId = null;
     setBusy(false);
   }
 }
@@ -1133,8 +1293,10 @@ async function sendFollowupInThread({ message, provider, rounds }) {
 async function rerunCurrentTask(opts = {}) {
   if (!state.selectedTaskId) return;
   try {
+    state.runningTaskId = state.selectedTaskId;
     setBusy(true);
     setRunStatus(`重跑中：${state.selectedTaskId}`, true);
+    startLivePolling(state.selectedTaskId);
     const promptOverride = String(opts.prompt || "").trim();
     const provider = opts.provider || undefined;
     const maxIterations = resolvedRounds(opts.rounds);
@@ -1144,16 +1306,44 @@ async function rerunCurrentTask(opts = {}) {
       maxIterations,
       role_config: state.roleConfig || DEFAULT_ROLE_CONFIG,
     });
-    showToast(`重跑完成：${res.task_id}`, "positive");
-    setRunStatus(`重跑完成：${res.task_id}`, false);
+    if (String(res?.summary?.final_outcome || "").toLowerCase() === "canceled") {
+      showToast(`重跑已终止：${res.task_id}`, "warning");
+      setRunStatus(`重跑已终止：${res.task_id}`, false);
+    } else {
+      showToast(`重跑完成：${res.task_id}`, "positive");
+      setRunStatus(`重跑完成：${res.task_id}`, false);
+    }
     await loadTasks();
     if (res.task_id) await selectTask(res.task_id);
   } catch (err) {
     setRunStatus(`重跑失败：${err.message}`, false);
     showToast(`重跑失败：${err.message}`, "negative");
   } finally {
+    stopLivePolling();
+    state.runningTaskId = null;
     setBusy(false);
   }
+}
+
+async function cancelCurrentRun() {
+  if (!state.selectedTaskId) return;
+  if (state.runningTaskId !== state.selectedTaskId) {
+    showToast("当前任务没有可终止的运行。", "warning");
+    return;
+  }
+  try {
+    setRunStatus("正在终止运行...", true);
+    const res = await postJson(`/api/tasks/${state.selectedTaskId}/cancel`, {});
+    showToast(res?.message || "已发送终止信号。", "warning");
+  } catch (err) {
+    showToast(`终止失败：${err.message}`, "negative");
+    setRunStatus(`终止失败：${err.message}`, false);
+  }
+}
+
+function jumpToBottom() {
+  el.chatStream.scrollTop = el.chatStream.scrollHeight;
+  updateJumpBottomVisibility();
 }
 
 async function handleComposerSubmit() {
@@ -1174,6 +1364,10 @@ async function handleComposerSubmit() {
     return;
   }
   if (parsed.kind === "followup") {
+    await sendFollowupInThread(parsed);
+    return;
+  }
+  if (parsed.kind === "confirm") {
     await sendFollowupInThread(parsed);
     return;
   }
@@ -1240,7 +1434,10 @@ el.clearRoundBtn.addEventListener("click", clearRoundFilter);
 el.copyTaskBtn.addEventListener("click", copyCurrentTaskId);
 el.exportReportBtn.addEventListener("click", exportCurrentReport);
 el.rerunTaskBtn.addEventListener("click", rerunCurrentTask);
+el.cancelRunBtn.addEventListener("click", cancelCurrentRun);
 el.sendCommandBtn.addEventListener("click", handleComposerSubmit);
+el.jumpBottomBtn.addEventListener("click", jumpToBottom);
+el.chatStream.addEventListener("scroll", updateJumpBottomVisibility);
 el.chatCommandInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
