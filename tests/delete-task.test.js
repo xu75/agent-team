@@ -35,24 +35,25 @@ function request(method, urlPath, body = null) {
 }
 
 function createMockTask(taskId) {
-  const date = taskId.split("T")[0];
-  const taskDir = path.join(LOGS_ROOT, date, `task-${taskId}`);
+  // taskId 格式: {timestamp}-{hash}，如 1771382424778-1568fc9e
+  const today = new Date().toISOString().slice(0, 10);
+  const taskDir = path.join(LOGS_ROOT, today, `task-${taskId}`);
   fs.mkdirSync(taskDir, { recursive: true });
   fs.writeFileSync(
     path.join(taskDir, "summary.json"),
     JSON.stringify({ task_id: taskId, final_status: "completed" })
   );
   fs.writeFileSync(path.join(taskDir, "task.md"), "Test task");
-  return taskDir;
+  return { taskDir, date: today };
 }
 
 async function runTests() {
   console.log("Running delete task API tests...\n");
 
-  // Test 1: Delete success
+  // Test 1: Delete success - 使用真实的 taskId 格式
   console.log("Test 1: Delete existing task - should return 200");
-  const testTaskId1 = "2099-01-01T00-00-00-001Z";
-  const taskDir1 = createMockTask(testTaskId1);
+  const testTaskId1 = "2099123456789-abcd1234";
+  const { taskDir: taskDir1, date: date1 } = createMockTask(testTaskId1);
   assert(fs.existsSync(taskDir1), "Mock task should exist before delete");
 
   const res1 = await request("DELETE", `/api/tasks/${testTaskId1}`);
@@ -62,14 +63,14 @@ async function runTests() {
   assert(!fs.existsSync(taskDir1), "Task directory should be deleted");
   console.log("  PASS\n");
 
-  // Test 2: Task not found (404)
+  // Test 2: Task not found (404) - 使用合法格式但不存在的 taskId
   console.log("Test 2: Delete non-existent task - should return 404");
-  const res2 = await request("DELETE", "/api/tasks/2099-12-31T23-59-59-999Z");
+  const res2 = await request("DELETE", "/api/tasks/9999999999999-deadbeef");
   assert.strictEqual(res2.status, 404, `Expected 404, got ${res2.status}`);
   assert(res2.body.error, "Should have error message");
   console.log("  PASS\n");
 
-  // Test 3: Invalid task ID format (400)
+  // Test 3: Invalid task ID format (400) - 不符合 {timestamp}-{hash} 格式
   console.log("Test 3: Delete with invalid task ID format - should return 400");
   const res3 = await request("DELETE", "/api/tasks/invalid-id");
   assert.strictEqual(res3.status, 400, `Expected 400, got ${res3.status}`);
@@ -85,12 +86,11 @@ async function runTests() {
   // Test 5: Path with slashes (400)
   console.log("Test 5: Task ID with slashes - should return 400");
   const res5 = await request("DELETE", "/api/tasks/2099-01-01/task");
-  // This will be parsed as a different route, but let's verify it doesn't delete anything
   assert(res5.status === 400 || res5.status === 404, `Expected 400 or 404, got ${res5.status}`);
   console.log("  PASS\n");
 
   // Cleanup test date directory if empty
-  const testDateDir = path.join(LOGS_ROOT, "2099-01-01");
+  const testDateDir = path.join(LOGS_ROOT, date1);
   if (fs.existsSync(testDateDir)) {
     try {
       fs.rmdirSync(testDateDir);

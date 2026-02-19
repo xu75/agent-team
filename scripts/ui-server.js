@@ -308,8 +308,15 @@ function getTaskDirs() {
     const entries = fs.readdirSync(dateDir, { withFileTypes: true });
     for (const e of entries) {
       if (!e.isDirectory()) continue;
-      if (!e.name.startsWith("task-")) continue;
-      const taskId = e.name.slice("task-".length);
+      // 支持 run-{timestamp}-{hash} 和 task-{timestamp}-{hash} 格式的目录名
+      let taskId;
+      if (e.name.startsWith("run-")) {
+        taskId = e.name.slice(4); // "run-".length === 4
+      } else if (e.name.startsWith("task-")) {
+        taskId = e.name.slice(5); // "task-".length === 5
+      } else {
+        continue;
+      }
       out.push({
         taskId,
         date,
@@ -1147,8 +1154,8 @@ const server = http.createServer(async (req, res) => {
         if (/[\/\\]|\.\./.test(taskId)) {
           return sendJson(res, 400, { error: "任务ID包含非法字符" });
         }
-        // 仅允许合法的任务ID格式（时间戳格式）
-        if (!/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(taskId)) {
+        // 允许合法的任务ID格式：{timestamp}-{hash}（如 1771382424778-1568fc9e）
+        if (!/^\d+-[a-f0-9]+$/.test(taskId)) {
           return sendJson(res, 400, { error: "任务ID格式不合法" });
         }
 
