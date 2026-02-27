@@ -394,11 +394,14 @@ function normalizeRoleConfig(input) {
   const arr = Array.isArray(input.models) ? input.models : [];
   base.models = base.models.map((m) => {
     const found = arr.find((x) => x?.id === m.id) || {};
-    return {
+    const entry = {
       id: m.id,
       name: m.name,
       provider: m.provider,
     };
+    const modelVal = (found.model || "").trim();
+    if (modelVal) entry.model = modelVal;
+    return entry;
   });
   const valid = new Set(base.models.map((m) => m.id));
   const st = input.stage_assignment && typeof input.stage_assignment === "object"

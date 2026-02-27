@@ -102,11 +102,14 @@ function normalizeRoleConfig(input) {
   const inModels = Array.isArray(input.models) ? input.models : [];
   const mergedModels = fallback.models.map((base) => {
     const found = inModels.find((m) => m && m.id === base.id) || {};
-    return {
+    const entry = {
       id: base.id,
       name: base.name,
       provider: base.provider,
     };
+    const modelVal = (found.model || "").trim();
+    if (modelVal) entry.model = modelVal;
+    return entry;
   });
 
   const validIds = new Set(mergedModels.map((m) => m.id));
@@ -232,7 +235,7 @@ function stageAssignmentToRoleProviders(roleConfig) {
     out[stage] = {
       model_id: modelId || null,
       provider: model?.provider || "claude-cli",
-      model: null,
+      model: model?.model || null,
     };
   }
   return out;

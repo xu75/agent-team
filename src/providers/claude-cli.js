@@ -10,7 +10,7 @@
  * - Keep authentication and environment concerns outside (handled by user's shell)
  */
 
-function buildClaudeCommand({ prompt }) {
+function buildClaudeCommand({ prompt, model }) {
   if (typeof prompt !== "string" || !prompt.trim()) {
     throw new Error("buildClaudeCommand: prompt must be a non-empty string");
   }
@@ -43,6 +43,11 @@ function buildClaudeCommand({ prompt }) {
     "--permission-mode",
     resolvedPermissionMode,
   ];
+
+  const resolvedModel = (model || process.env.CLAUDE_MODEL || "").trim();
+  if (resolvedModel) {
+    args.push("--model", resolvedModel);
+  }
 
   return { cmd, args };
 }

@@ -6,7 +6,7 @@ const { buildCodexCommand } = require("./codex-cli");
 
 function resolveProvider(provider, prompt, model) {
   if (provider === "claude-cli") {
-    const built = buildClaudeCommand({ prompt });
+    const built = buildClaudeCommand({ prompt, model });
     return { ...built, stdoutParseMode: "ndjson" };
   }
 

@@ -4,7 +4,8 @@
     {
       "id": "claude",
       "name": "Claude",
-      "provider": "claude-cli"
+      "provider": "claude-cli",
+      "model": "claude-opus-4-6"
     },
     {
       "id": "codex",
@@ -15,7 +16,7 @@
   "stage_assignment": {
     "coder": "claude",
     "reviewer": "codex",
-    "tester": "claude"
+    "tester": "codex"
   },
   "role_profiles": {
     "coder": {
