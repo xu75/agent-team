@@ -23,6 +23,13 @@ const state = {
   drafts: new Map(),
   // 新对话草稿模式
   isNewConversationDraft: false,
+  // ---- Chat mode ----
+  chatMode: false,          // true = 自由聊天模式, false = 流水线模式
+  chatThreadId: null,       // 当前聊天 thread ID
+  chatMessages: [],         // 当前任务的聊天消息列表
+  chatThreads: [],          // 所有聊天 threads
+  // 每个任务的聊天消息缓存：key = taskId, value = { messages: [], threadId: string|null }
+  chatPerTask: new Map(),
 };
 
 const el = {
@@ -67,12 +74,13 @@ const el = {
 let rightPanelCollapsed = false;
 
 const DEFAULT_ROLE_CONFIG = {
-  version: 2,
+  version: 3,
   models: [
     { id: "claude", name: "Claude", provider: "claude-cli" },
     { id: "codex", name: "Codex", provider: "codex-cli" },
+    { id: "glm", name: "GLM", provider: "claude-cli", settings_file: "~/.claude/settings_glm.json" },
   ],
-  stage_assignment: { coder: "codex", reviewer: "claude", tester: "claude" },
+  stage_assignment: { coder: "claude", reviewer: "codex", tester: "glm" },
   role_profiles: {
     coder: {
       display_name: "Codex",
@@ -200,7 +208,7 @@ function taskTitleLine(t) {
   if (title) return title;
   const fallback = String(t?.last_preview || "").trim();
   if (fallback) return fallback.length > 24 ? `${fallback.slice(0, 24)}...` : fallback;
-  return String(t?.task_id || "未命名任务");
+  return "未命名任务";
 }
 
 function outcomeNaturalText(outcome) {
@@ -245,11 +253,12 @@ function taskProjectInfo(t) {
   };
 }
 
-function roleAvatar(role) {
+function roleAvatar(role, catName) {
   if (role === "coder") return "🛠";
   if (role === "reviewer") return "🔍";
   if (role === "tester") return "🧪";
   if (role === "task") return "📌";
+  if (role === "chat") return catAvatarFor(catName);
   return "•";
 }
 
@@ -305,8 +314,6 @@ function summarizeReviewerMessage(obj) {
   lines.push(`建议优化：${nice.length} 项`);
   lines.push(`测试建议：${tests.length} 项`);
   lines.push(`安全建议：${security.length} 项`);
-  lines.push("");
-  lines.push("查看完整 JSON：点击下方 Evidence -> json");
   return lines.join("\n");
 }
 
@@ -323,8 +330,6 @@ function summarizeTesterMessage(obj) {
   cmds.slice(0, 3).forEach((x, i) => lines.push(`${i + 1}. ${x}`));
   if (cmds.length > 3) lines.push(`... 还有 ${cmds.length - 3} 条`);
   lines.push(`预期结果：${exp.length} 条`);
-  lines.push("");
-  lines.push("查看完整 JSON：点击下方 Evidence -> json");
   return lines.join("\n");
 }
 
@@ -396,10 +401,24 @@ function normalizeRoleConfig(input) {
     const found = arr.find((x) => x?.id === m.id) || {};
     return {
       id: m.id,
-      name: m.name,
-      provider: m.provider,
+      name: found.name || m.name,
+      provider: found.provider || m.provider,
+      model: found.model || m.model || undefined,
+      settings_file: found.settings_file || m.settings_file || undefined,
     };
   });
+  // Add any input models not in defaults (e.g. glm)
+  for (const m of arr) {
+    if (!m || !m.id) continue;
+    if (base.models.some((x) => x.id === m.id)) continue;
+    base.models.push({
+      id: m.id,
+      name: m.name || m.id,
+      provider: m.provider || "claude-cli",
+      model: m.model || undefined,
+      settings_file: m.settings_file || undefined,
+    });
+  }
   const valid = new Set(base.models.map((m) => m.id));
   const st = input.stage_assignment && typeof input.stage_assignment === "object"
     ? input.stage_assignment
@@ -436,6 +455,10 @@ function normalizeRoleConfig(input) {
       role_title: roleTitle,
       nickname: nickname || displayName,
     };
+  }
+  // Preserve cats config from input
+  if (input.cats && typeof input.cats === "object") {
+    base.cats = input.cats;
   }
   return base;
 }
@@ -781,6 +804,21 @@ function renderTimeline() {
   });
 }
 
+function chatMessageToPipelineFormat(m) {
+  const isUser = m.sender_type === "user";
+  return {
+    id: m.id,
+    role: isUser ? "task" : "chat",
+    role_label: isUser ? "铲屎官" : catDisplayName(m.cat_name),
+    round: null,
+    ts: m.ts || Date.now(),
+    text: m.text || "",
+    ok: null,
+    cat_name: m.cat_name || null,
+    _is_chat: true,
+  };
+}
+
 function filteredMessages() {
   const all = state.messagesData?.messages || [];
   const existingIds = new Set(all.map((m) => String(m.id || "")));
@@ -789,7 +827,9 @@ function filteredMessages() {
       String(m.task_id || "") === String(state.selectedTaskId || "") &&
       !existingIds.has(String(m.id || ""))
   );
-  const merged = [...all, ...pending].sort((a, b) => {
+  // Convert inline chat messages to pipeline format and merge
+  const chatInline = state.chatMessages.map(chatMessageToPipelineFormat);
+  const merged = [...all, ...pending, ...chatInline].sort((a, b) => {
     const ta = Number.isFinite(a.ts) ? a.ts : 0;
     const tb = Number.isFinite(b.ts) ? b.ts : 0;
     if (ta !== tb) return ta - tb;
@@ -799,7 +839,7 @@ function filteredMessages() {
     return String(a.role || "").localeCompare(String(b.role || ""));
   });
   if (!Number.isFinite(state.selectedRound)) return merged;
-  return merged.filter((m) => m.round === state.selectedRound || m.role === "task");
+  return merged.filter((m) => m.round === state.selectedRound || m.role === "task" || m._is_chat);
 }
 
 function removeOptimisticMessage(msgId) {
@@ -940,12 +980,14 @@ function renderChat() {
   for (const m of messages) {
     const g = groups[groups.length - 1];
     const sameRole = g && g.role === m.role;
+    // For chat messages, also require same cat to avoid grouping different cats
+    const sameCat = !m._is_chat || (g && g.catName === m.cat_name);
     const sameRound =
       g &&
       ((Number.isFinite(g.round) && Number.isFinite(m.round) && g.round === m.round) ||
         (!Number.isFinite(g.round) && !Number.isFinite(m.round)));
     const nearTs = g && Math.abs((m.ts || 0) - (g.lastTs || 0)) <= 5 * 60 * 1000;
-    if (sameRole && sameRound && nearTs) {
+    if (sameRole && sameCat && sameRound && nearTs) {
       g.messages.push(m);
       g.lastTs = m.ts || g.lastTs;
     } else {
@@ -953,6 +995,7 @@ function renderChat() {
         role: m.role,
         round: Number.isFinite(m.round) ? m.round : null,
         roleLabel: displayRoleLabel(m.role, m.role_label),
+        catName: m.cat_name || null,
         firstTs: m.ts || Date.now(),
         lastTs: m.ts || Date.now(),
         messages: [m],
@@ -960,14 +1003,25 @@ function renderChat() {
     }
   }
 
-  groups.forEach((g) => {
+  let prevIsChat = false;
+  groups.forEach((g, gi) => {
+    const isChat = g.role === "chat" || (g.role === "task" && g.messages.some((m) => m._is_chat));
+    // Insert separator when transitioning between pipeline and inline chat
+    if (gi > 0 && isChat !== prevIsChat) {
+      const sep = document.createElement("div");
+      sep.className = "chat-separator";
+      sep.innerHTML = `<span class="sep-label">${isChat ? "💬 @猫猫对话" : "🔄 流水线"}</span>`;
+      el.chatStream.appendChild(sep);
+    }
+    prevIsChat = isChat;
+
     const block = document.createElement("article");
     block.className = `chat-group role-${g.role}`;
     block.innerHTML = `
       <header class="group-head">
         <div class="lhs">
-          <span class="avatar">${roleAvatar(g.role)}</span>
-          <span class="role">${escapeHtml(g.roleLabel)}</span>
+          <span class="avatar">${roleAvatar(g.role, g.catName)}</span>
+          <span class="role"${g.role === "chat" && g.catName ? ` style="color:${catColorFor(g.catName)}"` : ""}>${escapeHtml(g.roleLabel)}</span>
           ${Number.isFinite(g.round) ? `<span class="round">R${g.round}</span>` : ""}
           <time class="group-time">${fmtTime(g.firstTs)}</time>
         </div>
@@ -1259,8 +1313,14 @@ async function selectTask(taskId) {
   // 退出新对话草稿模式
   exitNewConversationDraftMode();
 
+  // 保存当前任务的聊天消息
+  saveChatForCurrentTask();
+
   state.selectedTaskId = taskId;
   state.selectedRound = null;
+  // 恢复目标任务的聊天消息
+  restoreChatForTask(taskId);
+  state.chatMode = false;
   renderTasks();
 
   const [detail, messages] = await Promise.all([
@@ -1324,6 +1384,18 @@ async function loadTasks() {
 function parseCliLikeCommand(rawLine) {
   const line = String(rawLine || "").trim();
   if (!line) return { kind: "empty" };
+
+  // Detect @猫猫 mentions → chat mode
+  const mentionPattern = /@([\u4e00-\u9fff\w]+)/g;
+  const mentions = [];
+  let mm;
+  while ((mm = mentionPattern.exec(line)) !== null) {
+    mentions.push(mm[1]);
+  }
+  if (mentions.length > 0 && !line.startsWith("/")) {
+    return { kind: "chat", message: line, mentions };
+  }
+
   if (!line.startsWith("/")) return { kind: "followup", message: line, provider: null, rounds: null };
 
   const m = line.match(/^\/([a-zA-Z0-9_-]+)\s*(.*)$/);
@@ -1398,6 +1470,13 @@ function resolvedRounds(cmdRounds) {
 function commandHelpText() {
   return [
     "命令用法：",
+    "",
+    "聊天模式（@ 猫猫自由对话）：",
+    "@牛奶 帮我看看这段代码",
+    "@咖啡 review 一下这个改动",
+    "@Billy 写个测试用例",
+    "",
+    "流水线模式（自动走 Coder→Reviewer→Tester）：",
     "/task 任务描述",
     "/task --provider codex-cli --rounds 2 修复登录接口",
     "/ask 继续追问（进入当前会话）",
@@ -1421,10 +1500,11 @@ async function runNewTaskFromCommand({ prompt, provider, rounds }) {
       maxIterations,
       role_config: state.roleConfig || DEFAULT_ROLE_CONFIG,
     });
-    showToast(`任务已完成：${res.task_id}`, "positive");
     el.chatCommandInput.value = "";
-    setRunStatus(`完成：${res.task_id}`, false);
     await loadTasks();
+    const newTitle = taskTitleLine(state.tasks.find((t) => t.task_id === res.task_id));
+    showToast(`任务已完成：${newTitle}`, "positive");
+    setRunStatus(`完成：${newTitle}`, false);
     if (res.task_id) await selectTask(res.task_id);
   } catch (err) {
     setRunStatus(`运行失败：${err.message}`, false);
@@ -1440,6 +1520,7 @@ async function sendFollowupInThread({ message, provider, rounds, confirm = false
     return;
   }
   const taskId = state.selectedTaskId;
+  const taskTitle = taskTitleLine(state.tasks.find((t) => t.task_id === taskId));
   const clientMessageId = `client-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const optimisticMessage = {
     task_id: taskId,
@@ -1466,7 +1547,7 @@ async function sendFollowupInThread({ message, provider, rounds, confirm = false
     renderChat();
     state.runningTaskId = taskId;
     setBusy(true);
-    setRunStatus(`追问中：${taskId}`, true);
+    setRunStatus(`追问中：${taskTitle}`, true);
     startLivePolling(taskId);
     const res = await postJson(`/api/tasks/${taskId}/followup`, {
       message,
@@ -1480,10 +1561,10 @@ async function sendFollowupInThread({ message, provider, rounds, confirm = false
       setRunStatus(res.message || "等待铲屎官确认。发送 /confirm 开始实施。", false);
       showToast("已记录追问，等待确认后实施", "warning");
     } else if (String(res?.summary?.final_outcome || "").toLowerCase() === "canceled") {
-      setRunStatus(`已终止：${res.task_id}`, false);
+      setRunStatus(`已终止：${taskTitle}`, false);
       showToast("运行已终止", "warning");
     } else {
-      setRunStatus(`已更新：${res.task_id}`, false);
+      setRunStatus(`已更新：${taskTitle}`, false);
       showToast(confirm ? "已确认，开始实施" : "追问已加入当前会话", "positive");
     }
     removeOptimisticMessage(optimisticMessage.id);
@@ -1506,7 +1587,8 @@ async function rerunCurrentTask(opts = {}) {
   try {
     state.runningTaskId = state.selectedTaskId;
     setBusy(true);
-    setRunStatus(`重跑中：${state.selectedTaskId}`, true);
+    const rerunTitle = taskTitleLine(state.tasks.find((t) => t.task_id === state.selectedTaskId));
+    setRunStatus(`重跑中：${rerunTitle}`, true);
     startLivePolling(state.selectedTaskId);
     const promptOverride = String(opts.prompt || "").trim();
     const provider = opts.provider || undefined;
@@ -1517,14 +1599,15 @@ async function rerunCurrentTask(opts = {}) {
       maxIterations,
       role_config: state.roleConfig || DEFAULT_ROLE_CONFIG,
     });
-    if (String(res?.summary?.final_outcome || "").toLowerCase() === "canceled") {
-      showToast(`重跑已终止：${res.task_id}`, "warning");
-      setRunStatus(`重跑已终止：${res.task_id}`, false);
-    } else {
-      showToast(`重跑完成：${res.task_id}`, "positive");
-      setRunStatus(`重跑完成：${res.task_id}`, false);
-    }
     await loadTasks();
+    const doneTitle = taskTitleLine(state.tasks.find((t) => t.task_id === res.task_id));
+    if (String(res?.summary?.final_outcome || "").toLowerCase() === "canceled") {
+      showToast(`重跑已终止：${doneTitle}`, "warning");
+      setRunStatus(`重跑已终止：${doneTitle}`, false);
+    } else {
+      showToast(`重跑完成：${doneTitle}`, "positive");
+      setRunStatus(`重跑完成：${doneTitle}`, false);
+    }
     if (res.task_id) await selectTask(res.task_id);
   } catch (err) {
     setRunStatus(`重跑失败：${err.message}`, false);
@@ -1552,6 +1635,107 @@ async function cancelCurrentRun() {
   }
 }
 
+// ---- Chat per-task persistence ----
+
+function saveChatForCurrentTask() {
+  const key = state.selectedTaskId || "__new__";
+  if (state.chatMessages.length > 0 || state.chatThreadId) {
+    state.chatPerTask.set(key, {
+      messages: [...state.chatMessages],
+      threadId: state.chatThreadId,
+    });
+  }
+}
+
+function restoreChatForTask(taskId) {
+  const key = taskId || "__new__";
+  const saved = state.chatPerTask.get(key);
+  if (saved) {
+    state.chatMessages = [...saved.messages];
+    state.chatThreadId = saved.threadId;
+  } else {
+    state.chatMessages = [];
+    state.chatThreadId = null;
+  }
+}
+
+// ---- Chat mode functions ----
+
+function catAvatarFor(catName) {
+  const cats = activeRoleConfig()?.cats || {};
+  const cat = cats[catName];
+  return cat?.avatar || "🐱";
+}
+
+function catColorFor(catName) {
+  const cats = activeRoleConfig()?.cats || {};
+  const cat = cats[catName];
+  return cat?.color || "#888";
+}
+
+function catDisplayName(catName) {
+  const cats = activeRoleConfig()?.cats || {};
+  const cat = cats[catName];
+  return cat?.display_name || catName || "猫猫";
+}
+
+async function sendChatMessageUI(message) {
+  try {
+    setBusy(true);
+    setRunStatus("猫猫思考中...", true);
+
+    const body = {
+      message,
+      thread_id: state.chatThreadId || undefined,
+      role_config: state.roleConfig || undefined,
+    };
+
+    const res = await postJson("/api/chat", body);
+
+    if (!state.chatThreadId && res.thread_id) {
+      state.chatThreadId = res.thread_id;
+    }
+
+    // Add user message
+    if (res.user_message) {
+      state.chatMessages.push(res.user_message);
+    }
+
+    // Add cat responses
+    if (Array.isArray(res.responses)) {
+      for (const r of res.responses) {
+        if (r.message) state.chatMessages.push(r.message);
+      }
+    }
+
+    saveChatForCurrentTask();
+    renderChat();
+    el.chatStream.scrollTop = el.chatStream.scrollHeight;
+    el.chatCommandInput.value = "";
+    setRunStatus("", false);
+    showToast("猫猫已回复", "positive");
+  } catch (err) {
+    setRunStatus(`聊天失败：${err.message}`, false);
+    showToast(`聊天失败：${err.message}`, "negative");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function enterChatMode() {
+  state.chatMode = true;
+  // Do NOT reset selectedTaskId — keep the current session context visible
+  el.chatCommandInput.placeholder = "@ 猫猫名字发消息，如：@牛奶 帮我看看这段代码";
+  // Re-render the main chat view which now includes inline chat messages
+  renderChat();
+}
+
+function exitChatMode() {
+  state.chatMode = false;
+  // Keep chatMessages and chatThreadId — they are part of the inline conversation history
+  el.chatCommandInput.placeholder = '输入命令，如：/task 实现登录接口；/task --provider codex-cli --rounds 2 修复失败测试；/rerun 继续上个任务';
+}
+
 function jumpToBottom() {
   el.chatStream.scrollTop = el.chatStream.scrollHeight;
   updateJumpBottomVisibility();
@@ -1561,6 +1745,22 @@ async function handleComposerSubmit() {
   const raw = el.chatCommandInput.value.trim();
   const parsed = parseCliLikeCommand(raw);
   if (parsed.kind === "empty") return;
+
+  // @猫猫 chat mode
+  if (parsed.kind === "chat") {
+    if (!state.chatMode) enterChatMode();
+    clearDraft();
+    await sendChatMessageUI(parsed.message);
+    return;
+  }
+
+  // If already in chat mode and user types plain text, stay in chat mode
+  if (state.chatMode && parsed.kind === "followup") {
+    clearDraft();
+    await sendChatMessageUI(parsed.message);
+    return;
+  }
+
   if (parsed.kind === "help") {
     setRunStatus(commandHelpText(), false);
     return;
@@ -1575,7 +1775,10 @@ async function handleComposerSubmit() {
   if (state.isNewConversationDraft) {
     clearDraft(); // 清除新对话草稿
     exitNewConversationDraftMode();
-    if (parsed.kind === "task") {
+    if (parsed.kind === "chat") {
+      enterChatMode();
+      await sendChatMessageUI(parsed.message);
+    } else if (parsed.kind === "task") {
       await runNewTaskFromCommand(parsed);
     } else if (parsed.kind === "followup") {
       // 在新对话模式下，followup 也作为新任务
@@ -2103,6 +2306,10 @@ function renderNewConversationDraftScreen() {
 }
 
 async function startNewConversation() {
+  saveChatForCurrentTask();
+  if (state.chatMode) exitChatMode();
+  state.chatMessages = [];
+  state.chatThreadId = null;
   enterNewConversationDraftMode();
 }
 

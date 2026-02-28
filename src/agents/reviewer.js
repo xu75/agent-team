@@ -137,6 +137,7 @@ function validateReviewSchema(obj) {
 async function runReviewer({
   provider,
   model,
+  settingsFile,
   roleProfile,
   peerProfiles,
   taskPrompt,
@@ -153,6 +154,7 @@ async function runReviewer({
   const result = await executeProviderText({
     provider,
     model,
+    settingsFile,
     prompt,
     timeoutMs,
     streamOutput: false,

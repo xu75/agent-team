@@ -26,8 +26,10 @@ function buildTesterPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProf
     "",
     "Rules:",
     "- Keep commands minimal and deterministic.",
-    "- Prefer existing project test commands (npm test / node --test / pnpm test / yarn test).",
-    "- If no runnable tests exist, return commands as an empty array and explain in test_plan.",
+    "- ONLY use these allowed test commands: npm test, npm run test, node --test, pnpm test, yarn test.",
+    "- Any other command (node -e, custom scripts, shell one-liners, etc.) will be BLOCKED by the runner.",
+    "- You may append flags to allowed commands (e.g. \"npm test -- --grep foo\").",
+    "- If the task cannot be verified with allowed commands, return commands as an empty array and explain in test_plan.",
     "",
     "Task:",
     taskPrompt,
@@ -115,6 +117,7 @@ function validateTesterSchema(obj) {
 async function runTester({
   provider,
   model,
+  settingsFile,
   roleProfile,
   peerProfiles,
   taskPrompt,
@@ -131,6 +134,7 @@ async function runTester({
   const result = await executeProviderText({
     provider,
     model,
+    settingsFile,
     prompt,
     timeoutMs,
     streamOutput: false,
@@ -166,6 +170,11 @@ async function runTester({
   }
 
   const parsed = extractJsonObject(result.text);
+  // Normalize optional array fields so schema validation doesn't fail on omission
+  if (parsed && typeof parsed === "object") {
+    if (!Array.isArray(parsed.commands)) parsed.commands = [];
+    if (!Array.isArray(parsed.expected_results)) parsed.expected_results = [];
+  }
   const schema = validateTesterSchema(parsed);
 
   if (!schema.ok) {

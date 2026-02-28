@@ -171,6 +171,11 @@ async function runTask(taskPrompt, options = {}) {
     return cfg?.model || model;
   }
 
+  function settingsFileFor(role) {
+    const cfg = roleProviders[role];
+    return cfg?.settings_file || null;
+  }
+
   function modelIdFor(role) {
     const cfg = roleProviders[role];
     return cfg?.model_id || null;
@@ -218,6 +223,7 @@ async function runTask(taskPrompt, options = {}) {
       const proposal = await runCoder({
       provider: providerFor("coder"),
       model: modelFor("coder"),
+      settingsFile: settingsFileFor("coder"),
       roleProfile: profileFor("coder"),
       peerProfiles: peersFor("coder"),
       taskPrompt,
@@ -247,6 +253,7 @@ async function runTask(taskPrompt, options = {}) {
       const reviewer = await runReviewer({
       provider: providerFor("reviewer"),
       model: modelFor("reviewer"),
+      settingsFile: settingsFileFor("reviewer"),
       roleProfile: profileFor("reviewer"),
       peerProfiles: peersFor("reviewer"),
       taskPrompt,
@@ -280,6 +287,7 @@ async function runTask(taskPrompt, options = {}) {
       const tester = await runTester({
       provider: providerFor("tester"),
       model: modelFor("tester"),
+      settingsFile: settingsFileFor("tester"),
       roleProfile: profileFor("tester"),
       peerProfiles: peersFor("tester"),
       taskPrompt,
@@ -352,6 +360,7 @@ async function runTask(taskPrompt, options = {}) {
       const coder = await runCoder({
       provider: providerFor("coder"),
       model: modelFor("coder"),
+      settingsFile: settingsFileFor("coder"),
       roleProfile: profileFor("coder"),
       peerProfiles: peersFor("coder"),
       taskPrompt,
@@ -381,6 +390,7 @@ async function runTask(taskPrompt, options = {}) {
       const reviewer = await runReviewer({
       provider: providerFor("reviewer"),
       model: modelFor("reviewer"),
+      settingsFile: settingsFileFor("reviewer"),
       roleProfile: profileFor("reviewer"),
       peerProfiles: peersFor("reviewer"),
       taskPrompt,
@@ -440,6 +450,7 @@ async function runTask(taskPrompt, options = {}) {
       const tester = await runTester({
         provider: providerFor("tester"),
         model: modelFor("tester"),
+        settingsFile: settingsFileFor("tester"),
         roleProfile: profileFor("tester"),
         peerProfiles: peersFor("tester"),
         taskPrompt,
@@ -526,11 +537,47 @@ async function runTask(taskPrompt, options = {}) {
       }
 
       if (!testRun.allPassed) {
+        const blockedResults = testRun.results.filter(
+          (r) => !r.ok && r.stderr?.includes("blocked command")
+        );
+
+        if (
+          blockedResults.length > 0 &&
+          testRun.results.every((r) => r.ok || r.stderr?.includes("blocked command"))
+        ) {
+          // All failures are blocked commands → Tester's fault, no point iterating
+          mustFix = [
+            `Tester generated blocked command(s): ${blockedResults.map((r) => r.command).join("; ")}`,
+            `Only allowed: ${allowedTestCommands.join(", ")}`,
+          ];
+          finalOutcome = "tester_command_blocked";
+          transition(FSM_STATES.FINALIZE, { round, reason: "tester_command_blocked" });
+          break;
+        }
+
+        // Real test failure
         const failed = testRun.results.find((r) => !r.ok);
+        const stderrSnippet = failed?.stderr ? failed.stderr.slice(0, 500) : "";
         mustFix = [
           "Tests failed in tester stage",
           failed ? `Failed command: ${failed.command}` : "Unknown test failure",
-        ];
+          stderrSnippet ? `Error output: ${stderrSnippet}` : "",
+        ].filter(Boolean);
+
+        // Save failed command for repeated-failure detection
+        const roundRef2 = rounds[rounds.length - 1];
+        if (roundRef2) {
+          roundRef2._failed_command = failed ? failed.command : null;
+        }
+
+        // Check for repeated identical failure
+        const prevRound = rounds.length >= 2 ? rounds[rounds.length - 2] : null;
+        if (prevRound?._failed_command && failed && prevRound._failed_command === failed.command) {
+          finalOutcome = "repeated_test_failure";
+          transition(FSM_STATES.FINALIZE, { round, reason: "repeated_test_failure" });
+          break;
+        }
+
         finalOutcome = "test_failed";
         transition(FSM_STATES.ITERATE, {
           round,

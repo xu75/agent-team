@@ -3,15 +3,21 @@
 const { runCommandStreaming } = require("../engine/runner");
 const { buildClaudeCommand } = require("./claude-cli");
 const { buildCodexCommand } = require("./codex-cli");
+const { buildGeminiCommand } = require("./gemini-cli");
 
-function resolveProvider(provider, prompt, model) {
+function resolveProvider(provider, prompt, model, settingsFile) {
   if (provider === "claude-cli") {
-    const built = buildClaudeCommand({ prompt });
+    const built = buildClaudeCommand({ prompt, model, settingsFile });
     return { ...built, stdoutParseMode: "ndjson" };
   }
 
   if (provider === "codex-cli") {
     const built = buildCodexCommand({ prompt, model });
+    return { ...built, stdoutParseMode: "text" };
+  }
+
+  if (provider === "gemini-cli") {
+    const built = buildGeminiCommand({ prompt, model });
     return { ...built, stdoutParseMode: "text" };
   }
 
@@ -47,12 +53,13 @@ async function executeProviderText({
   provider = "claude-cli",
   prompt,
   model,
+  settingsFile,
   timeoutMs,
   streamOutput = false,
   eventMeta = {},
   abortSignal = null,
 }) {
-  const { cmd, args, stdoutParseMode } = resolveProvider(provider, prompt, model);
+  const { cmd, args, stdoutParseMode } = resolveProvider(provider, prompt, model, settingsFile);
   let text = "";
   const stderrLines = [];
   let permissionDeniedCount = 0;

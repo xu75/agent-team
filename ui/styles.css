@@ -1055,6 +1055,32 @@ h3 {
   background: #fff6ed;
 }
 
+.chat-group.role-chat .msg-bubble {
+  background: #f0f7ff;
+  border-left: 3px solid #7cb3e0;
+}
+
+.chat-separator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+  font-size: 11px;
+  color: #a09890;
+}
+
+.chat-separator::before,
+.chat-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(to right, transparent, #ddd6cf, transparent);
+}
+
+.chat-separator .sep-label {
+  white-space: nowrap;
+}
+
 .chat-group.role-task {
   align-self: flex-end;
   max-width: 62%;

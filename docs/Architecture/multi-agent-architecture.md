@@ -1,20 +1,28 @@
 # Agent Team System Architecture | 多智能体协作系统架构
 
-**Version | 版本**: V0.02  
-**Last updated | 最近更新**: 2026-02-15  
-**Status | 状态**: Baseline (system-level) | 系统级基线版本  
-**Scope | 范围**: Architecture plan + engineering principles (not implementation) | 架构方案 + 工程原则（非实现代码）
+**Version | 版本**: V0.03
+**Last updated | 最近更新**: 2026-02-28
+**Status | 状态**: Active (reflects current implementation) | 活跃版本（反映当前实现）
+**Scope | 范围**: Architecture plan + engineering principles + implementation status | 架构方案 + 工程原则 + 实现进度
 
 ---
 
 ## Changelog | 修改记录
 
-- **V0.02 (2026-02-15)**  
-  - 明确目标间优先级冲突：补充“阶段性聚焦”说明（M1–M3 聚焦单模型多角色闭环，M5 再引入多模型）。
-  - 新增核心原则“失败是常态”，将失败处理提升为主路径（first-class path）。
+- **V0.03 (2026-02-28)**
+  - 新增”猫猫聊天模式”（Chat Session）：@猫猫自由对话，独立于流水线的轻量交互通道。
+  - 多 Provider 已提前落地：Claude CLI（含 settings_file 切换 GLM 后端）、Codex CLI、Gemini CLI（placeholder）。
+  - 里程碑进度刷新：M1–M3 已完成，M4 进行中，M5 部分提前完成。
+  - 测试阶段健壮性增强：blocked command 检测、repeated failure 检测、tester prompt 收紧 allowlist。
+  - 角色人格化（cats config）：每只猫猫有 avatar、color、persona，支持 @mention 路由。
+  - 错误分类细化：新增 `tester_command_blocked`、`repeated_test_failure` outcome。
+
+- **V0.02 (2026-02-15)**
+  - 明确目标间优先级冲突：补充”阶段性聚焦”说明（M1–M3 聚焦单模型多角色闭环，M5 再引入多模型）。
+  - 新增核心原则”失败是常态”，将失败处理提升为主路径（first-class path）。
   - 强化工程化与复杂度控制的系统级定位。
 
-- **V0.01 (2026-02-15)**  
+- **V0.01 (2026-02-15)**
   - 初始系统级架构基线：分层（Provider/Engine/Agent/Orchestrator/Persistence/API+Worker/Frontend）、多模型策略、留痕与复盘、里程碑、风险与评审清单。
 
 ---
@@ -33,12 +41,18 @@
 
 为避免目标间资源竞争：
 
-- **M1–M3 阶段优先聚焦：单模型 + 多角色协作闭环**
-  - 目标是验证 Orchestrator、角色契约、测试回传与迭代机制是否稳定。
-- **M5 阶段再引入多模型兼容与策略路由**
-  - 多 Provider 适配与测试矩阵复杂度较高，应在协作闭环成熟后再扩展。
+- **M1–M3 已完成：单模型 + 多角色协作闭环**
+  - Orchestrator FSM、角色契约、测试回传与迭代机制已稳定运行。
+  - Coder → Reviewer → Tester 流水线闭环已验证。
+- **M4 进行中：前端面板 + 猫猫聊天模式**
+  - Timeline UI、chat stream、role config 面板已上线。
+  - 新增 Chat Session 引擎，支持 @猫猫 自由对话。
+- **M5 部分提前完成：多 Provider 接入**
+  - Claude CLI（含 --settings 切换 GLM 后端）、Codex CLI 已投产。
+  - Gemini CLI placeholder 已就位，待 CLI 工具成熟后接入。
+  - per-role provider 分配已实现（role-config.json stage_assignment）。
 
-说明：目标 1（多 Agent 协作）与目标 2（多模型兼容）在 MVP 阶段存在竞争关系，因此需阶段性聚焦，避免系统复杂度过早膨胀。
+说明：目标 2（多模型兼容）因 settings_file 方案的低成本特性，已提前部分落地，未显著增加系统复杂度。
 
 ## 核心原则
 
@@ -100,14 +114,15 @@
 - `healthCheck()`：可用性、鉴权状态、配额状态
 - `normalize(event) -> RunEvent`：把各家事件转成统一格式
 
-适配器示例：
-- `ClaudeCliAdapter`：`claude -p ... --output-format stream-json --verbose`
-- `OpenAIApiAdapter` / `GeminiApiAdapter`：走 API（或各自 CLI）
-- `BedrockAdapter` / `VertexAdapter`：云平台托管（可选）
+已实现适配器：
+- `claude-cli`：`claude -p ... --output-format stream-json --verbose`，支持 `--settings` 切换后端（如 GLM）、`--model` 指定模型
+- `codex-cli`：`codex -q --full-auto`，纯文本输出模式
+- `gemini-cli`：placeholder，`gemini --model ...`，纯文本输出模式
 
-切换策略：
-- 同一角色可选多个 Provider（例如 Reviewer 可用 Codex/Claude）
-- 编排器按成本、延迟、可用性、质量进行分配与 fallback
+切换策略（已实现）：
+- `role-config.json` 中 `stage_assignment` 指定每个角色使用哪个 model_id
+- `models[]` 定义 provider、model、settings_file 的映射
+- Coordinator 运行时通过 `roleProviders` 自动路由
 
 ---
 
@@ -161,8 +176,33 @@ Engine 输出统一 `RunEvent`（建议 JSON schema）：
 
 终止条件：
 - must-fix 清零 + 测试通过
-- 达到迭代上限 → 输出“最佳努力 + 未解决清单”
+- 达到迭代上限 → 输出”最佳努力 + 未解决清单”
 - 触发安全红线 → 需要人工决策
+- blocked command 全部失败 → 停止迭代（tester 问题，非 coder 问题）
+- 连续两轮相同测试命令失败 → 停止迭代（避免死循环）
+
+## 2.5 Chat Session Engine（猫猫聊天引擎）— 新增
+
+独立于流水线的轻量交互通道，用于 @猫猫 自由对话。
+
+设计要点：
+- @mention 解析：支持 display_name、nickname、aliases 多种匹配
+- 人格化 prompt：每只猫猫有独立 persona，对话时注入性格描述和同事关系
+- 对话历史：per-thread JSONL 持久化，最近 20 条作为上下文窗口
+- Provider 路由：复用 role-config.json 中 cats → model_id → models 的映射链
+- 多猫并发：同时 @多只猫猫时 Promise.all 并行调用
+
+数据模型：
+```
+logs/threads/<thread-id>/
+  meta.json          # { thread_id, title, created_at }
+  messages.jsonl     # 每行一条 { id, sender, sender_type, cat_name, text, ts }
+```
+
+与流水线模式的关系：
+- 聊天模式和流水线模式互斥切换，共享同一个 UI composer
+- 聊天模式不走 FSM，不产生 round/summary
+- 未来可考虑：聊天中 /task 命令无缝切换到流水线
 
 ---
 
@@ -237,32 +277,39 @@ logs/YYYY-MM-DD/task-<id>/
 
 # 5. 模块化开发路线（降低复杂度的里程碑）
 
-Milestone 1：单模型 + 单角色（MVP）
+Milestone 1：单模型 + 单角色（MVP）✅ 已完成
 - `ClaudeCliAdapter + Engine`
-- 先做 CoreDev：跑通流式输出、保存 logs、输出补丁
+- CoreDev：流式输出、保存 logs、输出补丁
 
-Milestone 2：两角色闭环（Coder + Reviewer）
+Milestone 2：两角色闭环（Coder + Reviewer）✅ 已完成
 - Reviewer 输出结构化 JSON（must_fix 等）
 - Coordinator 执行 1–3 轮迭代
+- FSM 状态机驱动（intake → plan → build → review → iterate → finalize）
 
-Milestone 3：加入 Tester（质量门槛）
-- 自动生成/更新测试
-- 本地或 CI 执行
-- 失败自动回传到 Coder（带日志）
+Milestone 3：加入 Tester（质量门槛）✅ 已完成
+- Tester 输出结构化 JSON（test_plan + commands）
+- Allowlist runner 执行测试命令
+- 失败自动回传到 Coder（带 stderr snippet）
+- Blocked command 检测 + repeated failure 检测
 
-Milestone 4：前端面板（可视化与回放）
-- Timeline + Diff + Test + Replay
-- 重点：能“点到某一回合、看到原始证据”，对抗幻觉与误判
+Milestone 4：前端面板 + 猫猫聊天模式 🔧 进行中
+- Timeline + Chat Stream + Role Config 面板已上线
+- 新增 Chat Session 引擎（@猫猫 自由对话）
+- 待完成：Diff Viewer、Test Panel、Replay 回放
+- 待完成：聊天历史 thread 列表 UI
 
-Milestone 5：多 Provider + 策略路由
-- 引入 OpenAI/Gemini/Codex 等
-- 支持 per-role 选择与 fallback
-- 可配置：成本优先/质量优先/速度优先
+Milestone 5：多 Provider + 策略路由 ⚡ 部分提前完成
+- Claude CLI（含 --settings 切换 GLM）、Codex CLI 已投产
+- Gemini CLI placeholder 已就位
+- per-role 分配已实现
+- 待完成：fallback 策略（provider 不可用时自动切换）
+- 待完成：成本/质量/速度策略路由
 
-Milestone 6：生产化（隔离与可靠性）
+Milestone 6：生产化（隔离与可靠性）📋 待启动
 - worktree/临时分支隔离
 - secrets hygiene、权限最小化
 - 失败降级策略（provider 不可用时替换）
+- 重试策略（backoff + jitter，参见 error-handling-matrix.md）
 
 ---
 
@@ -287,13 +334,17 @@ Milestone 6：生产化（隔离与可靠性）
 
 ---
 
-# 7. 风险点与对策（给 Reviewer AI 的“挑刺入口”）
+# 7. 风险点与对策（给 Reviewer AI 的”挑刺入口”）
 
 1. **提示词漂移**：角色输出格式不稳定 → schema 验证 + 自动纠偏
 2. **幻觉型结论**：看似专业但无证据 → 强制引用 logs/diff/test 作为证据链
 3. **模型差异**：同一角色换模型表现不同 → Provider 抽象 + 记录模型/版本/参数
 4. **定位困难**：没有原始流/没有 diff → 事件溯源 + 每回合固定落盘
 5. **安全风险**：密钥泄露/越权写文件 → 最小权限、输出过滤、审计与 secrets 扫描
+6. **Tester 生成非法命令**：Tester 输出 allowlist 之外的命令 → blocked command 检测 + 直接终止（已实现）
+7. **测试死循环**：相同命令连续失败 → repeated failure 检测 + 自动停止（已实现）
+8. **聊天模式人格一致性**：不同 provider 对 persona prompt 的遵从度不同 → 需要 per-provider 调优 persona 模板
+9. **settings_file 路径安全**：用户可配置任意 settings 文件 → expandHome 仅处理 `~/`，需防止路径穿越
 
 ---
 

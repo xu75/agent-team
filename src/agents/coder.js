@@ -50,6 +50,7 @@ function buildCoderPrompt({
 async function runCoder({
   provider,
   model,
+  settingsFile,
   roleProfile,
   peerProfiles,
   taskPrompt,
@@ -63,6 +64,7 @@ async function runCoder({
   return executeProviderText({
     provider,
     model,
+    settingsFile,
     prompt,
     timeoutMs,
     streamOutput: true,

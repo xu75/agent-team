@@ -5,6 +5,13 @@ const path = require("node:path");
 const http = require("node:http");
 const { URL } = require("node:url");
 const { runTask } = require("../src/coordinator");
+const {
+  createThread,
+  readMessages,
+  readThreadMeta,
+  listThreads,
+  sendChatMessage,
+} = require("../src/engine/chat-session");
 
 const ROOT = path.resolve(__dirname, "..");
 const UI_ROOT = path.join(ROOT, "ui");
@@ -31,15 +38,16 @@ const DEFAULT_STAGE_DUTY = Object.freeze({
 const ROLE_DUTY_OPTIONS = Object.freeze(["CoreDev", "Reviewer", "Tester"]);
 
 const DEFAULT_ROLE_CONFIG = Object.freeze({
-  version: 2,
+  version: 3,
   models: [
     { id: "claude", name: "Claude", provider: "claude-cli" },
     { id: "codex", name: "Codex", provider: "codex-cli" },
+    { id: "glm", name: "GLM", provider: "claude-cli", settings_file: "~/.claude/settings_glm.json" },
   ],
   stage_assignment: {
-    coder: "codex",
-    reviewer: "claude",
-    tester: "claude",
+    coder: "claude",
+    reviewer: "codex",
+    tester: "glm",
   },
   role_profiles: {
     coder: {
@@ -104,10 +112,24 @@ function normalizeRoleConfig(input) {
     const found = inModels.find((m) => m && m.id === base.id) || {};
     return {
       id: base.id,
-      name: base.name,
-      provider: base.provider,
+      name: found.name || base.name,
+      provider: found.provider || base.provider,
+      model: found.model || base.model || undefined,
+      settings_file: found.settings_file || base.settings_file || undefined,
     };
   });
+  // Add any input models not in fallback (e.g. glm)
+  for (const m of inModels) {
+    if (!m || !m.id) continue;
+    if (mergedModels.some((x) => x.id === m.id)) continue;
+    mergedModels.push({
+      id: m.id,
+      name: m.name || m.id,
+      provider: m.provider || "claude-cli",
+      model: m.model || undefined,
+      settings_file: m.settings_file || undefined,
+    });
+  }
 
   const validIds = new Set(mergedModels.map((m) => m.id));
   const stageIn = input.stage_assignment && typeof input.stage_assignment === "object"
@@ -166,10 +188,11 @@ function normalizeRoleConfig(input) {
   }
 
   return {
-    version: 2,
+    version: input.version || 3,
     models: mergedModels,
     stage_assignment: stage,
     role_profiles: roleProfiles,
+    cats: input.cats && typeof input.cats === "object" ? input.cats : undefined,
   };
 }
 
@@ -232,7 +255,8 @@ function stageAssignmentToRoleProviders(roleConfig) {
     out[stage] = {
       model_id: modelId || null,
       provider: model?.provider || "claude-cli",
-      model: null,
+      model: model?.model || null,
+      settings_file: model?.settings_file || null,
     };
   }
   return out;
@@ -972,6 +996,67 @@ const server = http.createServer(async (req, res) => {
   const p = u.pathname;
 
   try {
+    // ---- Chat mode endpoints ----
+
+    if (p === "/api/threads" && req.method === "GET") {
+      return sendJson(res, 200, { threads: listThreads(LOGS_ROOT) });
+    }
+
+    if (p === "/api/threads" && req.method === "POST") {
+      const body = await readRequestJson(req);
+      const title = String(body.title || "").trim() || "新对话";
+      const meta = createThread(LOGS_ROOT, title);
+      return sendJson(res, 200, { ok: true, thread: meta });
+    }
+
+    if (p.startsWith("/api/threads/") && req.method === "GET") {
+      const seg = p.split("/").filter(Boolean);
+      if (seg.length === 3) {
+        const threadId = seg[2];
+        const meta = readThreadMeta(LOGS_ROOT, threadId);
+        if (!meta) return sendJson(res, 404, { error: "thread not found" });
+        return sendJson(res, 200, meta);
+      }
+      if (seg.length === 4 && seg[3] === "messages") {
+        const threadId = seg[2];
+        const messages = readMessages(LOGS_ROOT, threadId);
+        return sendJson(res, 200, { thread_id: threadId, messages });
+      }
+    }
+
+    if (p === "/api/chat" && req.method === "POST") {
+      const body = await readRequestJson(req);
+      const message = String(body.message || "").trim();
+      if (!message) return sendJson(res, 400, { error: "message is required" });
+
+      let threadId = body.thread_id ? String(body.thread_id).trim() : null;
+      if (!threadId) {
+        const preview = message.length > 20 ? message.slice(0, 20) + "..." : message;
+        const meta = createThread(LOGS_ROOT, preview);
+        threadId = meta.thread_id;
+      }
+
+      const roleConfig = body.role_config
+        ? normalizeRoleConfig(body.role_config)
+        : readRoleConfig();
+
+      const result = await sendChatMessage({
+        logsRoot: LOGS_ROOT,
+        threadId,
+        userText: message,
+        roleConfig,
+      });
+
+      return sendJson(res, 200, {
+        ok: true,
+        thread_id: threadId,
+        user_message: result.user_message,
+        responses: result.responses,
+      });
+    }
+
+    // ---- Existing endpoints ----
+
     if (p === "/api/roles" && req.method === "GET") {
       return sendJson(res, 200, { role_config: readRoleConfig() });
     }

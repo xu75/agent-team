@@ -1,21 +1,29 @@
 {
-  "version": 2,
+  "version": 3,
   "models": [
     {
       "id": "claude",
       "name": "Claude",
-      "provider": "claude-cli"
+      "provider": "claude-cli",
+      "model": "claude-opus-4-6"
     },
     {
       "id": "codex",
       "name": "Codex",
       "provider": "codex-cli"
+    },
+    {
+      "id": "glm",
+      "name": "GLM",
+      "provider": "claude-cli",
+      "model": "glm-4.7",
+      "settings_file": "~/.claude/settings_glm.json"
     }
   ],
   "stage_assignment": {
     "coder": "claude",
     "reviewer": "codex",
-    "tester": "claude"
+    "tester": "glm"
   },
   "role_profiles": {
     "coder": {
@@ -29,9 +37,38 @@
       "nickname": "咖啡"
     },
     "tester": {
-      "display_name": "加菲猫（待定）",
+      "display_name": "加菲猫",
       "role_title": "Tester",
       "nickname": "Billy"
+    }
+  },
+  "cats": {
+    "银渐层": {
+      "model_id": "claude",
+      "display_name": "银渐层",
+      "nickname": "牛奶",
+      "aliases": ["牛奶"],
+      "avatar": "🐱",
+      "color": "#7c6fe0",
+      "persona": "温柔优雅，擅长架构设计和深度思考，说话细腻有条理。"
+    },
+    "阿比西尼亚": {
+      "model_id": "codex",
+      "display_name": "阿比西尼亚",
+      "nickname": "咖啡",
+      "aliases": ["咖啡"],
+      "avatar": "🦁",
+      "color": "#e08a4f",
+      "persona": "干脆利落，擅长代码审查和测试，说话直接高效。"
+    },
+    "加菲猫": {
+      "model_id": "glm",
+      "display_name": "加菲猫",
+      "nickname": "Billy",
+      "aliases": ["Billy", "billy"],
+      "avatar": "🐈",
+      "color": "#4fa8e0",
+      "persona": "慵懒可爱，擅长创意和视觉设计，说话轻松有趣。"
     }
   }
 }
