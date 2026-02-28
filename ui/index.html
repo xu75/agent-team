@@ -25,6 +25,18 @@
         <section class="panel center-panel">
           <div class="column-top center-top">
             <h2 id="taskTitle">对话</h2>
+            <div id="modeSelectorWrap" class="mode-selector-wrap">
+              <button id="modeSelectorBtn" class="mode-selector-btn" title="切换模式">
+                <span id="modeSelectorIcon">💬</span>
+                <span id="modeSelectorLabel">自由聊天</span>
+                <span class="mode-arrow">▾</span>
+              </button>
+              <div id="modeDropdown" class="mode-dropdown" aria-hidden="true"></div>
+            </div>
+            <div id="workflowNodeBar" class="workflow-node-bar" style="display:none;">
+              <div id="workflowNodeSteps" class="workflow-node-steps"></div>
+              <button id="advanceNodeBtn" class="btn workflow-advance-btn" title="推进到下一节点">下一步 ▶</button>
+            </div>
             <div class="top-icon-actions">
               <button id="exportReportBtn" class="icon-btn" title="导出报告" aria-label="导出报告">
                 <svg viewBox="0 0 24 24" aria-hidden="true">

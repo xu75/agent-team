@@ -25,9 +25,11 @@ function buildCoderPrompt({
     `Nickname rules: call reviewer as "${reviewerNick}", tester as "${testerNick}".`
   );
   if (mode === "proposal") {
+    lines.push("IMPORTANT: This is PROPOSAL PHASE ONLY. You MUST NOT modify any files or write any code.");
     lines.push("Produce a concise implementation proposal only.");
-    lines.push("Do not claim files are edited. This step is planning before operator confirmation.");
+    lines.push("Do not claim files are edited. Do not use any file-editing tools. This step is planning before operator confirmation.");
     lines.push("Include: approach, touched files (planned), key risks, and rollout notes.");
+    lines.push("Wait for operator to send /confirm before making any actual changes.");
   } else {
     lines.push("Produce a concise implementation answer for the task.");
     lines.push("If reviewer must-fix items exist, fix them first.");
@@ -70,6 +72,8 @@ async function runCoder({
     streamOutput: true,
     eventMeta,
     abortSignal,
+    // In proposal mode, use plan permission to prevent file edits
+    permissionMode: mode === "proposal" ? "plan" : undefined,
   });
 }
 

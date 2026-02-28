@@ -30,6 +30,13 @@ const state = {
   chatThreads: [],          // 所有聊天 threads
   // 每个任务的聊天消息缓存：key = taskId, value = { messages: [], threadId: string|null }
   chatPerTask: new Map(),
+  chatBusy: false,           // true when a chat request is in-flight (for cancel button)
+  // ---- Session mode ----
+  availableModes: [],       // [{id, label, icon, desc}, ...]
+  currentMode: "free_chat", // 当前 thread 的模式
+  currentModeState: {},     // 模式专属状态（如狼人杀角色分配）
+  _fetchModeSeq: 0,        // fetchThreadMode 竞态保护序号
+  modeDropdownOpen: false,
   mentionSuggest: {
     open: false,
     start: 0,
@@ -78,6 +85,14 @@ const el = {
   evidenceViewer: document.getElementById("evidenceViewer"),
   mustFixList: document.getElementById("mustFixList"),
   mentionSuggest: document.getElementById("mentionSuggest"),
+  modeSelectorWrap: document.getElementById("modeSelectorWrap"),
+  modeSelectorBtn: document.getElementById("modeSelectorBtn"),
+  modeSelectorIcon: document.getElementById("modeSelectorIcon"),
+  modeSelectorLabel: document.getElementById("modeSelectorLabel"),
+  modeDropdown: document.getElementById("modeDropdown"),
+  workflowNodeBar: document.getElementById("workflowNodeBar"),
+  workflowNodeSteps: document.getElementById("workflowNodeSteps"),
+  advanceNodeBtn: document.getElementById("advanceNodeBtn"),
 };
 
 let rightPanelCollapsed = false;
@@ -653,7 +668,9 @@ function setRunStatus(text = "", running = false) {
 function updateActionAvailability() {
   const hasTask = !!state.selectedTaskId;
   const busy = !!state.busy;
-  const canCancel = !!state.selectedTaskId && state.runningTaskId === state.selectedTaskId;
+  const canCancelTask = !!state.selectedTaskId && state.runningTaskId === state.selectedTaskId;
+  const canCancelChat = busy && state.chatBusy;
+  const canCancel = canCancelTask || canCancelChat;
   const setDisabled = (node, value) => {
     if (node) node.disabled = value;
   };
@@ -846,10 +863,13 @@ function renderTimeline() {
 
 function chatMessageToPipelineFormat(m) {
   const isUser = m.sender_type === "user";
-  return {
+  const chatRoleLabel = !isUser
+    ? (m.cat_name ? catDisplayName(m.cat_name) : String(m.sender || m.cat_name || "猫猫"))
+    : "铲屎官";
+  const msg = {
     id: m.id,
     role: isUser ? "task" : "chat",
-    role_label: isUser ? "铲屎官" : catDisplayName(m.cat_name),
+    role_label: chatRoleLabel,
     round: null,
     ts: m.ts || Date.now(),
     text: m.text || "",
@@ -857,6 +877,10 @@ function chatMessageToPipelineFormat(m) {
     cat_name: m.cat_name || null,
     _is_chat: true,
   };
+  if (m.provider) msg.provider = m.provider;
+  if (m.model) msg.model = m.model;
+  if (Number.isFinite(m.duration_ms)) msg.duration_ms = m.duration_ms;
+  return msg;
 }
 
 function filteredMessages() {
@@ -867,8 +891,11 @@ function filteredMessages() {
       String(m.task_id || "") === String(state.selectedTaskId || "") &&
       !existingIds.has(String(m.id || ""))
   );
-  // Convert inline chat messages to pipeline format and merge
-  const chatInline = state.chatMessages.map(chatMessageToPipelineFormat);
+  // Only keep optimistic inline chat messages; persisted thread messages come from messagesData.
+  const chatInline = state.chatMessages
+    .filter((m) => !!m?._optimistic)
+    .map(chatMessageToPipelineFormat)
+    .filter((m) => !existingIds.has(String(m.id || "")));
   const merged = [...all, ...pending, ...chatInline].sort((a, b) => {
     const ta = Number.isFinite(a.ts) ? a.ts : 0;
     const tb = Number.isFinite(b.ts) ? b.ts : 0;
@@ -1012,7 +1039,10 @@ function renderChat() {
   const nearBottom = isNearBottom(prev);
   el.chatStream.innerHTML = "";
   if (!messages.length) {
-    el.chatStream.innerHTML = '<div class="empty-block">当前筛选条件下没有消息。</div>';
+    const emptyText = state.isNewConversationDraft
+      ? "输入内容后发送，将自动创建新对话。使用 @猫名 可直接发起 mention 对话。"
+      : "当前筛选条件下没有消息。";
+    el.chatStream.innerHTML = `<div class="empty-block">${escapeHtml(emptyText)}</div>`;
     updateJumpBottomVisibility();
     return;
   }
@@ -1034,7 +1064,10 @@ function renderChat() {
       groups.push({
         role: m.role,
         round: Number.isFinite(m.round) ? m.round : null,
-        roleLabel: displayRoleLabel(m.role, m.role_label),
+        roleLabel:
+          m.role === "chat"
+            ? (m.cat_name ? catDisplayName(m.cat_name) : String(m.role_label || "猫猫"))
+            : displayRoleLabel(m.role, m.role_label),
         catName: m.cat_name || null,
         firstTs: m.ts || Date.now(),
         lastTs: m.ts || Date.now(),
@@ -1046,13 +1079,6 @@ function renderChat() {
   let prevIsChat = false;
   groups.forEach((g, gi) => {
     const isChat = g.role === "chat" || (g.role === "task" && g.messages.some((m) => m._is_chat));
-    // Insert separator when transitioning between pipeline and inline chat
-    if (gi > 0 && isChat !== prevIsChat) {
-      const sep = document.createElement("div");
-      sep.className = "chat-separator";
-      sep.innerHTML = `<span class="sep-label">${isChat ? "💬 @猫猫对话" : "🔄 流水线"}</span>`;
-      el.chatStream.appendChild(sep);
-    }
     prevIsChat = isChat;
 
     const block = document.createElement("article");
@@ -1306,6 +1332,12 @@ function renderMustFix() {
 }
 
 function syncComposerWithCurrentTask() {
+  if (state.chatMode) {
+    if (!state.busy) {
+      el.chatCommandInput.placeholder = "@ 猫猫名字发消息，如：@牛奶 帮我看看这段代码";
+    }
+    return;
+  }
   const summary = state.detail?.summary || {};
   const cfg = state.roleConfig || DEFAULT_ROLE_CONFIG;
   const coderModel = modelMap().get(cfg?.stage_assignment?.coder);
@@ -1321,13 +1353,21 @@ function renderTaskPage(opts = {}) {
   const preserveEvidence = !!opts.preserveEvidence;
   const summary = state.detail?.summary || {};
   const selected = state.tasks.find((t) => t.task_id === state.selectedTaskId);
-  el.taskTitle.textContent = String(selected?.task_title || selected?.task_id || "对话");
-  el.taskMeta.textContent = `${summary.provider || "-"} · ${summary.final_outcome || "-"}`;
-  el.taskMeta.className = `meta-pill ${toneFromOutcome(summary.final_outcome)}`.trim();
-  if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = `Task: ${state.selectedTaskId || "-"}`;
-  if (el.rightRuntimeHint) {
-    const current = state.messagesData?.current_stage || summary.final_status || "-";
-    el.rightRuntimeHint.textContent = `${summary.provider || "-"} · ${current}`;
+  if (state.isNewConversationDraft) {
+    el.taskTitle.textContent = "新对话";
+    el.taskMeta.className = "meta-pill";
+    el.taskMeta.textContent = "草稿";
+    if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = "Task: draft";
+    if (el.rightRuntimeHint) el.rightRuntimeHint.textContent = "新对话草稿";
+  } else {
+    el.taskTitle.textContent = String(selected?.task_title || selected?.task_id || "对话");
+    el.taskMeta.textContent = `${summary.provider || "-"} · ${summary.final_outcome || "-"}`;
+    el.taskMeta.className = `meta-pill ${toneFromOutcome(summary.final_outcome)}`.trim();
+    if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = `Task: ${state.selectedTaskId || "-"}`;
+    if (el.rightRuntimeHint) {
+      const current = state.messagesData?.current_stage || summary.final_status || "-";
+      el.rightRuntimeHint.textContent = `${summary.provider || "-"} · ${current}`;
+    }
   }
   renderRoundTag();
   renderTimeline();
@@ -1363,8 +1403,19 @@ async function selectTask(taskId) {
   state.selectedTaskId = taskId;
   state.selectedRound = null;
   // 恢复目标任务的聊天消息
-  restoreChatForTask(taskId);
-  state.chatMode = false;
+  await restoreChatForTask(taskId);
+  // 如果该任务有关联的 thread，自动恢复 chatMode
+  if (state.chatThreadId) {
+    state.chatMode = true;
+    fetchThreadMode(state.chatThreadId);
+  } else {
+    state.chatMode = false;
+    // 无 thread 时，从 localStorage 恢复该任务上次选择的模式（白名单校验）
+    const savedMode = restoreTaskMode(taskId);
+    safeSetCurrentMode(savedMode);
+    state.currentModeState = {};
+  }
+  renderModeSelector();
   renderTasks();
 
   const [detail, messages] = await Promise.all([
@@ -1375,6 +1426,12 @@ async function selectTask(taskId) {
   state.detail = detail;
   state.messagesData = messages;
   state.liveDigest = buildLiveDigest(detail, messages);
+  if (detail?._is_thread) {
+    state.chatThreadId = detail._thread_id || taskId;
+    state.chatMode = true;
+    saveThreadMapping(taskId, state.chatThreadId);
+    fetchThreadMode(state.chatThreadId);
+  }
   renderTaskPage();
 
   // 恢复该对话的草稿
@@ -1404,6 +1461,7 @@ function renderEmptyScreen() {
   setEvidenceDrawerOpen(false);
   updateJumpBottomVisibility();
   updateActionAvailability();
+  renderModeSelector();
 }
 
 async function loadTasks() {
@@ -1440,7 +1498,9 @@ function parseCliLikeCommand(rawLine) {
     return { kind: "chat", message: line, mentions };
   }
 
-  if (!line.startsWith("/")) return { kind: "followup", message: line, provider: null, rounds: null };
+  if (!line.startsWith("/")) {
+    return { kind: "followup", message: line, provider: null, rounds: null, fromSlashCommand: false };
+  }
 
   const m = line.match(/^\/([a-zA-Z0-9_-]+)\s*(.*)$/);
   if (!m) return { kind: "invalid", error: "无法解析命令。" };
@@ -1481,7 +1541,7 @@ function parseCliLikeCommand(rawLine) {
 
   if (cmd === "ask" || cmd === "followup") {
     if (!prompt) return { kind: "invalid", error: "用法：/ask [--provider ...] [--rounds N] 追问内容" };
-    return { kind: "followup", message: prompt, provider, rounds };
+    return { kind: "followup", message: prompt, provider, rounds, fromSlashCommand: true };
   }
 
   if (cmd === "confirm") {
@@ -1532,6 +1592,34 @@ function commandHelpText() {
   ].join("\n");
 }
 
+function selectedConversationEntry() {
+  return state.tasks.find((t) => t.task_id === state.selectedTaskId) || null;
+}
+
+function isSelectedThreadConversation() {
+  if (state.detail?._is_thread) return true;
+  const selected = selectedConversationEntry();
+  if (selected?._is_thread) return true;
+  return !!(state.chatThreadId && state.selectedTaskId && String(state.chatThreadId) === String(state.selectedTaskId));
+}
+
+async function refreshSelectedSessionData(opts = {}) {
+  const preserveEvidence = opts.preserveEvidence !== false;
+  if (!state.selectedTaskId) return;
+  const [detail, messages] = await Promise.all([
+    getJson(`/api/tasks/${state.selectedTaskId}`),
+    getJson(`/api/tasks/${state.selectedTaskId}/messages`),
+  ]);
+  state.detail = detail;
+  state.messagesData = messages;
+  state.liveDigest = buildLiveDigest(detail, messages);
+  if (detail?._is_thread) {
+    state.chatThreadId = detail._thread_id || state.selectedTaskId;
+    state.chatMode = true;
+  }
+  renderTaskPage({ preserveEvidence });
+}
+
 async function runNewTaskFromCommand({ prompt, provider, rounds }) {
   try {
     setBusy(true);
@@ -1561,6 +1649,11 @@ async function runNewTaskFromCommand({ prompt, provider, rounds }) {
 async function sendFollowupInThread({ message, provider, rounds, confirm = false }) {
   if (!state.selectedTaskId) {
     await runNewTaskFromCommand({ prompt: message, provider, rounds });
+    return;
+  }
+  if (isSelectedThreadConversation()) {
+    if (!state.chatMode) enterChatMode();
+    await sendChatMessageUI(message);
     return;
   }
   const taskId = state.selectedTaskId;
@@ -1664,6 +1757,21 @@ async function rerunCurrentTask(opts = {}) {
 }
 
 async function cancelCurrentRun() {
+  // Cancel chat request if in chat busy state
+  if (state.chatBusy) {
+    try {
+      setRunStatus("正在终止聊天...", true);
+      const body = state.chatThreadId ? { thread_id: state.chatThreadId } : {};
+      const res = await postJson("/api/chat/cancel", body);
+      showToast(res?.message || "已发送终止信号。", "warning");
+      setRunStatus("已终止", false);
+    } catch (err) {
+      showToast(`终止失败：${err.message}`, "negative");
+      setRunStatus(`终止失败：${err.message}`, false);
+    }
+    return;
+  }
+  // Cancel task run
   if (!state.selectedTaskId) return;
   if (state.runningTaskId !== state.selectedTaskId) {
     showToast("当前任务没有可终止的运行。", "warning");
@@ -1681,25 +1789,121 @@ async function cancelCurrentRun() {
 
 // ---- Chat per-task persistence ----
 
-function saveChatForCurrentTask() {
-  const key = state.selectedTaskId || "__new__";
-  if (state.chatMessages.length > 0 || state.chatThreadId) {
-    state.chatPerTask.set(key, {
-      messages: [...state.chatMessages],
-      threadId: state.chatThreadId,
-    });
-  }
+const THREAD_MAP_KEY = "catcafe_task_thread_map";
+
+function loadThreadMap() {
+  try {
+    return JSON.parse(localStorage.getItem(THREAD_MAP_KEY) || "{}");
+  } catch { return {}; }
 }
 
-function restoreChatForTask(taskId) {
+function saveThreadMapping(taskKey, threadId) {
+  if (!taskKey || !threadId) return;
+  const map = loadThreadMap();
+  map[taskKey] = threadId;
+  localStorage.setItem(THREAD_MAP_KEY, JSON.stringify(map));
+}
+
+// ---- Per-task mode persistence (localStorage) ----
+const TASK_MODE_KEY = "catcafe_task_mode_map";
+
+function loadTaskModeMap() {
+  try {
+    return JSON.parse(localStorage.getItem(TASK_MODE_KEY) || "{}");
+  } catch { return {}; }
+}
+
+function saveTaskMode(taskKey, modeId) {
+  if (!taskKey || !modeId) return;
+  const map = loadTaskModeMap();
+  map[taskKey] = modeId;
+  localStorage.setItem(TASK_MODE_KEY, JSON.stringify(map));
+}
+
+function restoreTaskMode(taskKey) {
+  if (!taskKey) return null;
+  const map = loadTaskModeMap();
+  return map[taskKey] || null;
+}
+
+async function refreshTasksList() {
+  const data = await getJson("/api/tasks");
+  state.tasks = data.tasks || [];
+  applyFilter();
+}
+
+function buildThreadTitleFromMessage(message) {
+  const normalized = String(message || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "新对话";
+  return normalized.length > 20 ? `${normalized.slice(0, 20)}...` : normalized;
+}
+
+function adoptThreadSession(threadId) {
+  if (!threadId) return;
+  const previousKey = state.selectedTaskId || "__new__";
+  if (state.isNewConversationDraft) {
+    const draft = state.drafts.get("__new__");
+    if (draft) state.drafts.set(threadId, draft);
+  }
+  saveThreadMapping(previousKey, threadId);
+  saveThreadMapping(threadId, threadId);
+  if (!state.selectedTaskId || state.isNewConversationDraft) {
+    exitNewConversationDraftMode();
+    state.selectedTaskId = threadId;
+    state.selectedRound = null;
+    state.detail = null;
+    state.messagesData = null;
+    state.liveDigest = "";
+  }
+  state.chatThreadId = threadId;
+}
+
+async function ensureChatSession(initialMessage = "", preferredMode = state.currentMode) {
+  if (state.chatThreadId) return { threadId: state.chatThreadId, created: false };
+  const created = await postJson("/api/threads", {
+    title: buildThreadTitleFromMessage(initialMessage),
+    mode: preferredMode,
+  });
+  const threadId = created?.thread?.thread_id;
+  if (!threadId) throw new Error("创建对话失败：未返回 thread_id");
+  adoptThreadSession(threadId);
+  safeSetCurrentMode(created?.thread?.mode || preferredMode || state.currentMode);
+  state.currentModeState = created?.thread?.mode_state || {};
+  saveTaskMode(state.selectedTaskId || "__new__", state.currentMode);
+  renderModeSelector();
+  await refreshTasksList();
+  renderTaskPage({ preserveEvidence: true });
+  fetchThreadMode(threadId);
+  return { threadId, created: true };
+}
+
+function saveChatForCurrentTask() {
+  const key = state.selectedTaskId || "__new__";
+  const optimistic = state.chatMessages.filter((m) => !!m?._optimistic);
+  if (optimistic.length > 0 || state.chatThreadId) {
+    state.chatPerTask.set(key, {
+      messages: [...optimistic],
+      threadId: state.chatThreadId,
+    });
+    saveThreadMapping(key, state.chatThreadId);
+  } else {
+    state.chatPerTask.delete(key);
+  }
+  // 始终持久化当前任务的模式选择
+  saveTaskMode(key, state.currentMode);
+}
+
+async function restoreChatForTask(taskId) {
   const key = taskId || "__new__";
   const saved = state.chatPerTask.get(key);
-  if (saved) {
-    state.chatMessages = [...saved.messages];
-    state.chatThreadId = saved.threadId;
-  } else {
-    state.chatMessages = [];
-    state.chatThreadId = null;
+  state.chatMessages = (saved?.messages || []).filter((m) => !!m?._optimistic);
+  state.chatThreadId = saved?.threadId || null;
+  // Restore thread binding from localStorage mapping.
+  const map = loadThreadMap();
+  const threadId = map[key];
+  if (threadId) {
+    state.chatThreadId = threadId;
+    fetchThreadMode(threadId);
   }
 }
 
@@ -1890,11 +2094,15 @@ async function sendChatMessageUI(message) {
     cat_name: null,
     text: String(message || ""),
     ts: Date.now(),
+    _optimistic: true,
   };
 
   try {
     setBusy(true);
+    state.chatBusy = true;
+    updateActionAvailability();
     setRunStatus("猫猫思考中...", true);
+    await ensureChatSession(message, state.currentMode);
     state.chatMessages.push(optimisticUserMessage);
     saveChatForCurrentTask();
     renderChat();
@@ -1906,46 +2114,276 @@ async function sendChatMessageUI(message) {
       message,
       thread_id: state.chatThreadId || undefined,
       role_config: state.roleConfig || undefined,
+      mode: state.currentMode || undefined,
     };
 
     const res = await postJson("/api/chat", body);
 
-    if (!state.chatThreadId && res.thread_id) {
-      state.chatThreadId = res.thread_id;
+    if (res.thread_id && String(res.thread_id) !== String(state.chatThreadId || "")) {
+      adoptThreadSession(res.thread_id);
+      fetchThreadMode(res.thread_id);
     }
 
-    // Replace optimistic user message with persisted user message
-    if (res.user_message) {
-      const idx = state.chatMessages.findIndex((m) => String(m.id) === optimisticId);
-      if (idx >= 0) {
-        state.chatMessages[idx] = res.user_message;
-      } else {
-        state.chatMessages.push(res.user_message);
-      }
-    }
-
-    // Add cat responses
-    if (Array.isArray(res.responses)) {
-      for (const r of res.responses) {
-        if (r.message) state.chatMessages.push(r.message);
-      }
-    }
-
+    state.chatMessages = state.chatMessages.filter((m) => String(m.id) !== optimisticId);
     saveChatForCurrentTask();
-    renderChat();
+    await refreshTasksList();
+    await refreshSelectedSessionData({ preserveEvidence: true });
     el.chatStream.scrollTop = el.chatStream.scrollHeight;
     setRunStatus("", false);
     showToast("猫猫已回复", "positive");
   } catch (err) {
     state.chatMessages = state.chatMessages.filter((m) => String(m.id) !== optimisticId);
     saveChatForCurrentTask();
-    renderChat();
+    renderTaskPage({ preserveEvidence: true });
     setRunStatus(`聊天失败：${err.message}`, false);
     showToast(`聊天失败：${err.message}`, "negative");
   } finally {
+    state.chatBusy = false;
     setBusy(false);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Session Mode — fetch, render, switch
+// ---------------------------------------------------------------------------
+
+const FALLBACK_MODES = Object.freeze([
+  { id: "free_chat", label: "自由聊天", icon: "💬", desc: "猫猫们自由讨论，随意聊天" },
+  { id: "workflow",  label: "流程执行", icon: "⚙️", desc: "严格流程：Coder → Reviewer → Tester" },
+  { id: "werewolf",  label: "狼人杀",   icon: "🐺", desc: "猫猫们玩狼人杀游戏" },
+  { id: "quiz",      label: "出题答题", icon: "🧩", desc: "猫猫之间互相出题答题" },
+]);
+
+function isValidModeList(modes) {
+  return Array.isArray(modes) && modes.length > 0
+    && modes.every((m) => m && typeof m.id === "string" && typeof m.label === "string");
+}
+
+async function fetchAvailableModes() {
+  try {
+    const data = await getJson("/api/modes");
+    const modes = data.modes;
+    // 校验：必须是非空数组且每项有 id/label，否则视为非法
+    if (isValidModeList(modes)) {
+      state.availableModes = modes;
+    } else {
+      console.warn("[CatCafe] /api/modes 返回数据结构非法，使用本地 FALLBACK_MODES", data);
+    }
+  } catch (err) {
+    console.warn("[CatCafe] /api/modes 请求失败，使用本地 FALLBACK_MODES", err);
+  }
+  // 兜底：API 失败、返回空数组、或结构非法时，使用完整默认模式列表
+  if (!state.availableModes.length) {
+    state.availableModes = [...FALLBACK_MODES];
+    console.info("[CatCafe] availableModes 已加载 FALLBACK_MODES，共", state.availableModes.length, "个模式");
+  }
+}
+
+/** 校验 modeId 是否在当前 availableModes 白名单中 */
+function isKnownMode(modeId) {
+  return state.availableModes.some((m) => m.id === modeId);
+}
+
+/** 安全地设置 currentMode，非法值回退到 free_chat */
+function safeSetCurrentMode(modeId) {
+  if (modeId && isKnownMode(modeId)) {
+    state.currentMode = modeId;
+  } else {
+    state.currentMode = "free_chat";
+  }
+}
+
+async function fetchThreadMode(threadId) {
+  if (!threadId) return;
+  const seq = ++state._fetchModeSeq;
+  try {
+    const data = await getJson(`/api/threads/${threadId}/mode`);
+    // 竞态保护：如果在等待期间又发起了新请求，丢弃旧响应
+    if (seq !== state._fetchModeSeq) return;
+    safeSetCurrentMode(data.mode);
+    state.currentModeState = data.mode_state || {};
+    if (data.workflow_nodes) {
+      state.currentModeState._workflow_nodes = data.workflow_nodes;
+    }
+    // 持久化当前任务的模式
+    saveTaskMode(state.selectedTaskId || "__new__", state.currentMode);
+    renderModeSelector();
+  } catch {}
+}
+
+async function switchMode(modeId) {
+  try {
+    // 切换模式时自动进入 chatMode
+    if (!state.chatMode) {
+      state.chatMode = true;
+      el.chatCommandInput.placeholder = "@ 猫猫名字发消息，如：@牛奶 帮我看看这段代码";
+    }
+    // If no thread yet, create one with the desired mode and bind it to current session.
+    if (!state.chatThreadId) {
+      const ensured = await ensureChatSession(el.chatCommandInput?.value || "", modeId);
+      if (ensured.created) {
+        safeSetCurrentMode(modeId);
+        saveTaskMode(state.selectedTaskId || "__new__", state.currentMode);
+        renderModeSelector();
+        const modeInfo = state.availableModes.find((m) => m.id === modeId);
+        showToast(`已切换到${modeInfo?.label || modeId}模式`, "positive");
+        fetchThreadMode(ensured.threadId);
+        return;
+      }
+    }
+    if (!state.chatThreadId) {
+      throw new Error("当前没有可用会话");
+    }
+    const data = await fetch(`/api/threads/${state.chatThreadId}/mode`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: modeId }),
+    }).then((r) => r.json());
+    if (data.ok) {
+      safeSetCurrentMode(data.mode);
+      state.currentModeState = data.mode_state || {};
+      saveTaskMode(state.selectedTaskId || "__new__", state.currentMode);
+      renderModeSelector();
+      showToast(`已切换到${data.mode_label}模式`, "positive");
+      // Fetch full mode info (includes workflow_nodes)
+      fetchThreadMode(state.chatThreadId);
+      if (isSelectedThreadConversation()) {
+        await refreshSelectedSessionData({ preserveEvidence: true });
+      }
+    }
+  } catch (err) {
+    showToast(`切换模式失败：${err.message}`, "negative");
+  }
+}
+
+function renderModeSelector() {
+  // 防御：如果 availableModes 为空（极端时序），立即加载 fallback
+  if (!state.availableModes.length) {
+    state.availableModes = [...FALLBACK_MODES];
+    console.warn("[CatCafe] renderModeSelector: availableModes 为空，已加载 FALLBACK_MODES");
+  }
+
+  // 模式选择器常驻显示，不依赖 chatMode / chatThreadId
+  el.modeSelectorWrap.style.display = "";
+
+  const current = state.availableModes.find((m) => m.id === state.currentMode)
+    || state.availableModes[0]
+    || { id: "free_chat", label: "自由聊天", icon: "💬" };
+  el.modeSelectorIcon.textContent = current.icon;
+  el.modeSelectorLabel.textContent = current.label;
+
+  renderWorkflowNodeBar();
+}
+
+function renderWorkflowNodeBar() {
+  const isWorkflow = state.currentMode === "workflow" && state.chatMode;
+  el.workflowNodeBar.style.display = isWorkflow ? "" : "none";
+  if (!isWorkflow) return;
+
+  const ms = state.currentModeState || {};
+  const currentNode = ms.current_node || "coder";
+  const completed = ms.completed_nodes || [];
+  const nodes = ms._workflow_nodes || [
+    { id: "coder", label: "编码", role: "CoreDev" },
+    { id: "reviewer", label: "评审", role: "Reviewer" },
+    { id: "tester", label: "测试", role: "Tester" },
+  ];
+
+  const roleMap = ms.role_map || {};
+  // Reverse map: role → cat_name
+  const roleToCat = {};
+  for (const [cat, role] of Object.entries(roleMap)) {
+    roleToCat[role] = cat;
+  }
+
+  const stepsHtml = nodes.map((n) => {
+    let cls = "wf-step";
+    if (completed.includes(n.id)) cls += " done";
+    else if (n.id === currentNode) cls += " active";
+    const catName = roleToCat[n.role] || "";
+    const catLabel = catName ? ` (${catName})` : "";
+    return `<span class="${cls}" data-node="${n.id}">
+      <span class="wf-step-marker">${completed.includes(n.id) ? "✓" : n.id === currentNode ? "▶" : "○"}</span>
+      <span class="wf-step-label">${n.label}${catLabel}</span>
+    </span>`;
+  });
+
+  el.workflowNodeSteps.innerHTML = stepsHtml.join('<span class="wf-arrow">→</span>');
+
+  // Hide advance button if at last node and it's completed
+  const allDone = completed.length >= nodes.length;
+  el.advanceNodeBtn.style.display = allDone ? "none" : "";
+}
+
+async function advanceWorkflowNode() {
+  if (!state.chatThreadId) return;
+  try {
+    const data = await fetch(`/api/threads/${state.chatThreadId}/advance`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }).then((r) => r.json());
+    if (data.ok) {
+      state.currentModeState = data.mode_state || {};
+      renderWorkflowNodeBar();
+      if (data.finished) {
+        showToast("流程已全部完成", "positive");
+      } else {
+        showToast(data.message || "已推进到下一节点", "positive");
+      }
+    }
+  } catch (err) {
+    showToast(`推进失败：${err.message}`, "negative");
+  }
+}
+
+function renderModeDropdown() {
+  // 防御：确保 availableModes 非空
+  if (!state.availableModes.length) {
+    state.availableModes = [...FALLBACK_MODES];
+  }
+  const items = state.availableModes.map((m) => {
+    const active = m.id === state.currentMode ? " active" : "";
+    return `<button class="mode-dropdown-item${active}" data-mode="${m.id}">
+      <span class="mode-item-icon">${m.icon}</span>
+      <span class="mode-item-info">
+        <span class="mode-item-label">${m.label}</span>
+        <span class="mode-item-desc">${m.desc}</span>
+      </span>
+    </button>`;
+  });
+  el.modeDropdown.innerHTML = items.join("");
+}
+
+function toggleModeDropdown(forceClose) {
+  const open = forceClose ? false : !state.modeDropdownOpen;
+  state.modeDropdownOpen = open;
+  el.modeDropdown.setAttribute("aria-hidden", String(!open));
+  if (open) renderModeDropdown();
+}
+
+// Mode selector event listeners
+el.modeSelectorBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleModeDropdown();
+});
+
+el.modeDropdown.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-mode]");
+  if (!btn) return;
+  const modeId = btn.dataset.mode;
+  toggleModeDropdown(true);
+  if (modeId !== state.currentMode) switchMode(modeId);
+});
+
+// Close dropdown on outside click
+document.addEventListener("click", () => {
+  if (state.modeDropdownOpen) toggleModeDropdown(true);
+});
+
+// Advance workflow node button
+el.advanceNodeBtn.addEventListener("click", () => {
+  advanceWorkflowNode();
+});
 
 function enterChatMode() {
   state.chatMode = true;
@@ -1954,11 +2392,15 @@ function enterChatMode() {
   updateMentionSuggest();
   // Re-render the main chat view which now includes inline chat messages
   renderChat();
+  renderModeSelector();
+  if (state.chatThreadId) fetchThreadMode(state.chatThreadId);
 }
 
 function exitChatMode() {
   state.chatMode = false;
   hideMentionSuggest();
+  toggleModeDropdown(true);
+  renderModeSelector();
   // Keep chatMessages and chatThreadId — they are part of the inline conversation history
   el.chatCommandInput.placeholder = '输入命令，如：/task 实现登录接口；/task --provider codex-cli --rounds 2 修复失败测试；/rerun 继续上个任务';
 }
@@ -1982,7 +2424,7 @@ async function handleComposerSubmit() {
   }
 
   // If already in chat mode and user types plain text, stay in chat mode
-  if (state.chatMode && parsed.kind === "followup") {
+  if (state.chatMode && parsed.kind === "followup" && !parsed.fromSlashCommand) {
     clearDraft();
     await sendChatMessageUI(parsed.message);
     return;
@@ -2487,8 +2929,8 @@ function enterNewConversationDraftMode() {
   // 更新左侧列表选中状态
   renderTasks();
 
-  // 更新中间面板显示
-  renderNewConversationDraftScreen();
+  // 统一走主会话渲染路径
+  renderTaskPage();
 
   // 恢复新对话的草稿（如果有）
   const newDraft = state.drafts.get("__new__") || "";
@@ -2503,40 +2945,14 @@ function exitNewConversationDraftMode() {
   state.isNewConversationDraft = false;
 }
 
-function renderNewConversationDraftScreen() {
-  el.taskTitle.textContent = "新对话";
-  el.taskMeta.className = "meta-pill";
-  el.taskMeta.textContent = "草稿";
-  if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = "Task: draft";
-  el.timeline.innerHTML = '<div class="timeline-empty">输入内容后发送，将自动创建新对话。</div>';
-  if (el.roundTag) el.roundTag.textContent = "";
-  el.chatStream.innerHTML = `
-    <div class="empty-block" style="text-align:center;padding:32px 16px;">
-      <div style="font-size:32px;margin-bottom:12px;">✨</div>
-      <div style="font-size:14px;color:#6d635c;margin-bottom:8px;">新对话</div>
-      <div style="font-size:12px;color:#9a9088;">在下方输入框输入内容，发送后自动创建对话</div>
-    </div>
-  `;
-  el.liveStage.innerHTML = '<div class="stage-card"><div class="k">状态</div><div class="v">等待输入</div></div>';
-  el.agentStatus.innerHTML = "";
-  el.stats.innerHTML = "";
-  el.latestFailure.className = "plain-block warning";
-  el.latestFailure.textContent = "暂无";
-  el.testResults.className = "plain-block warning";
-  el.testResults.textContent = "暂无";
-  el.mustFixList.innerHTML = "<li>无</li>";
-  setMoreActionsMenu(false);
-  if (el.rightRuntimeHint) el.rightRuntimeHint.textContent = "新对话草稿";
-  renderEvidencePlaceholder();
-  setEvidenceDrawerOpen(false);
-  updateJumpBottomVisibility();
-}
-
 async function startNewConversation() {
   saveChatForCurrentTask();
   if (state.chatMode) exitChatMode();
   state.chatMessages = [];
   state.chatThreadId = null;
+  safeSetCurrentMode("free_chat");
+  state.currentModeState = {};
+  renderModeSelector();
   enterNewConversationDraftMode();
 }
 
@@ -2704,7 +3120,13 @@ try {
 } catch {
   setRightPanelCollapsed(false);
 }
-Promise.all([loadRoleConfig(), loadTasks()])
+// 先加载角色配置和可用模式，再加载任务列表（任务加载会触发 selectTask → renderModeSelector，
+// 此时 availableModes 必须已就绪，否则下拉菜单为空）
+Promise.all([loadRoleConfig(), fetchAvailableModes()])
+  .then(() => loadTasks())
+  .then(() => {
+    renderModeSelector();
+  })
   .catch((err) => {
     el.taskList.innerHTML = `<div class="empty-block">加载失败: ${err.message}</div>`;
     setRunStatus(`加载失败：${err.message}`, false);

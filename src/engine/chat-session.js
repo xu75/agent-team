@@ -3,6 +3,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { executeProviderText } = require("../providers/execute-provider");
+const { DEFAULT_MODE, isValidMode, buildModePrompt, WORKFLOW_NODES, buildWorkflowModeState } = require("../modes/mode-registry");
 
 /**
  * Chat Session Engine
@@ -132,8 +133,8 @@ function buildChatPrompt(cat, userMessage, history, peerCats) {
 // Chat message model
 // ---------------------------------------------------------------------------
 
-function createMessage({ sender, sender_type, cat_name, text, ts }) {
-  return {
+function createMessage({ sender, sender_type, cat_name, text, ts, provider, model, duration_ms }) {
+  const msg = {
     id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
     sender: sender || "铲屎官",
     sender_type: sender_type || "user", // "user" | "cat"
@@ -141,6 +142,10 @@ function createMessage({ sender, sender_type, cat_name, text, ts }) {
     text: String(text || ""),
     ts: ts || Date.now(),
   };
+  if (provider) msg.provider = provider;
+  if (model) msg.model = model;
+  if (Number.isFinite(duration_ms)) msg.duration_ms = duration_ms;
+  return msg;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,10 +162,39 @@ function ensureThreadDir(logsRoot, threadId) {
   return dir;
 }
 
-function createThread(logsRoot, title) {
+function createThread(logsRoot, title, mode, roleConfig) {
   const threadId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const dir = ensureThreadDir(logsRoot, threadId);
-  const meta = { thread_id: threadId, title: title || "新对话", created_at: Date.now() };
+  const effectiveMode = (mode && isValidMode(mode)) ? mode : DEFAULT_MODE;
+  // Auto-initialize mode_state for workflow mode
+  let modeStateInit = {};
+  if (effectiveMode === "workflow" && roleConfig) {
+    modeStateInit = buildWorkflowModeState(roleConfig);
+  }
+  const meta = {
+    thread_id: threadId,
+    title: title || "新对话",
+    mode: effectiveMode,
+    mode_state: modeStateInit,
+    created_at: Date.now(),
+  };
+  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n", "utf8");
+  return meta;
+}
+
+function updateThreadMode(logsRoot, threadId, mode, modeState, roleConfig) {
+  const meta = readThreadMeta(logsRoot, threadId);
+  if (!meta) return null;
+  if (mode && isValidMode(mode)) meta.mode = mode;
+  if (modeState !== undefined) {
+    meta.mode_state = modeState;
+  } else if (mode === "workflow" && roleConfig) {
+    // Auto-init workflow state when switching to workflow without explicit state
+    meta.mode_state = buildWorkflowModeState(roleConfig);
+  } else if (mode && mode !== "workflow") {
+    meta.mode_state = {};
+  }
+  const dir = threadDir(logsRoot, threadId);
   fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n", "utf8");
   return meta;
 }
@@ -217,15 +251,33 @@ async function sendChatMessage({
   const models = roleConfig?.models || [];
   const catLookup = buildCatLookup(cats);
 
+  // Read thread meta for mode info
+  const threadMeta = readThreadMeta(logsRoot, threadId) || {};
+  const mode = threadMeta.mode || DEFAULT_MODE;
+  const modeState = threadMeta.mode_state || {};
+
   // Parse @mentions
   const { targets, cleanText } = parseMentions(userText, catLookup);
 
   // Build effective targets:
-  // 1. If explicit @mention → only those cats respond for this message
-  // 2. If no @mention → default to all cats
+  // 1. workflow mode → always follow current workflow node (ignore @mention routing)
+  // 2. other modes + explicit @mention → only mentioned cats respond
+  // 3. other modes + no @mention → all cats
   const catNames = Object.keys(cats);
   let effectiveTargets;
-  if (targets.length > 0) {
+  if (mode === "workflow") {
+    const currentNode = modeState?.current_node || "coder";
+    const node = WORKFLOW_NODES.find((n) => n.id === currentNode) || WORKFLOW_NODES[0];
+    const roleMap = modeState?.role_map || {};
+    // Find the cat(s) assigned to the current node's role
+    const activeCats = catNames.filter((n) => roleMap[n] === node.role);
+    if (activeCats.length > 0) {
+      effectiveTargets = activeCats.map((n) => ({ ...cats[n], cat_name: n }));
+    } else {
+      // Fallback: all cats (shouldn't happen with proper init)
+      effectiveTargets = catNames.map((n) => ({ ...cats[n], cat_name: n }));
+    }
+  } else if (targets.length > 0) {
     effectiveTargets = targets;
   } else {
     effectiveTargets = catNames.map((n) => ({ ...cats[n], cat_name: n }));
@@ -254,8 +306,9 @@ async function sendChatMessage({
     effectiveTargets.map(async (cat) => {
       const { provider, model, settingsFile } = resolveProviderForCat(cat, models);
       const peerCats = allCatEntries.filter((c) => c.cat_name !== cat.cat_name);
-      const prompt = buildChatPrompt(cat, cleanText || userText, history, peerCats);
+      const prompt = buildModePrompt(mode, cat, cleanText || userText, history, peerCats, modeState);
 
+      const t0 = Date.now();
       const result = await executeProviderText({
         provider,
         model,
@@ -266,12 +319,16 @@ async function sendChatMessage({
         eventMeta: { cat_name: cat.cat_name, mode: "chat" },
         abortSignal,
       });
+      const durationMs = Date.now() - t0;
 
       const catMsg = createMessage({
         sender: cat.display_name || cat.cat_name,
         sender_type: "cat",
         cat_name: cat.cat_name,
         text: result.text || "(无回复)",
+        provider,
+        model,
+        duration_ms: durationMs,
       });
       appendMessage(logsRoot, threadId, catMsg);
 
@@ -297,6 +354,7 @@ module.exports = {
   parseMentions,
   resolveProviderForCat,
   createThread,
+  updateThreadMode,
   appendMessage,
   readMessages,
   readThreadMeta,
