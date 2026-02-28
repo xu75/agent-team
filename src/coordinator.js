@@ -91,6 +91,12 @@ function buildTimeline(taskId, stateEvents) {
   };
 }
 
+function isProviderRunOk(result) {
+  const code = Number(result?.exit?.code);
+  const hasExitFailure = Number.isFinite(code) && code !== 0;
+  return !result?.error_class && !hasExitFailure;
+}
+
 async function runTask(taskPrompt, options = {}) {
   if (typeof taskPrompt !== "string" || !taskPrompt.trim()) {
     throw new Error("taskPrompt must be a non-empty string");
@@ -248,6 +254,26 @@ async function runTask(taskPrompt, options = {}) {
     });
     copyRunArtifacts(proposal.runDir, roundPath, "coder");
 
+    if (!isProviderRunOk(proposal) || !String(proposal.text || "").trim()) {
+      const reason = proposal.error_class || "coder_runtime_error";
+      finalOutcome = reason;
+      mustFix = [`Coder failed in proposal phase: ${reason}`];
+      rounds.push({
+        round,
+        phase: "proposal",
+        coder: {
+          run_id: proposal.runId,
+          exit_code: proposal.exit?.code ?? null,
+        },
+        reviewer: null,
+        tester: null,
+      });
+      transition(FSM_STATES.FINALIZE, {
+        round,
+        reason,
+      });
+    } else {
+
     transition(FSM_STATES.REVIEW, { round, reason: "roundtable_reviewer" });
       throwIfAborted();
       const reviewer = await runReviewer({
@@ -345,6 +371,7 @@ async function runTask(taskPrompt, options = {}) {
       round,
       reason: "await_operator_confirm",
     });
+    }
     } else {
     transition(FSM_STATES.PLAN, { reason: "implementation_confirmed" });
 
@@ -383,6 +410,25 @@ async function runTask(taskPrompt, options = {}) {
       exit: coder.exit,
     });
     copyRunArtifacts(coder.runDir, roundPath, "coder");
+
+    if (!isProviderRunOk(coder) || !String(coder.text || "").trim()) {
+      finalOutcome = coder.error_class || "coder_runtime_error";
+      mustFix = [`Coder failed in implementation phase: ${finalOutcome}`];
+      rounds.push({
+        round,
+        phase: "implementation",
+        coder: {
+          run_id: coder.runId,
+          exit_code: coder.exit?.code ?? null,
+        },
+        reviewer: null,
+      });
+      transition(FSM_STATES.FINALIZE, {
+        round,
+        reason: finalOutcome,
+      });
+      break;
+    }
 
     transition(FSM_STATES.REVIEW, { round, reason: "start_reviewer" });
 

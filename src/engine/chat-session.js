@@ -220,14 +220,16 @@ async function sendChatMessage({
   // Parse @mentions
   const { targets, cleanText } = parseMentions(userText, catLookup);
 
-  // If no @mention, default to first cat
+  // Build effective targets:
+  // 1. If explicit @mention → only those cats respond for this message
+  // 2. If no @mention → default to all cats
   const catNames = Object.keys(cats);
-  const effectiveTargets =
-    targets.length > 0
-      ? targets
-      : catNames.length > 0
-        ? [{ ...cats[catNames[0]], cat_name: catNames[0] }]
-        : [];
+  let effectiveTargets;
+  if (targets.length > 0) {
+    effectiveTargets = targets;
+  } else {
+    effectiveTargets = catNames.map((n) => ({ ...cats[n], cat_name: n }));
+  }
 
   if (effectiveTargets.length === 0) {
     throw new Error("没有可用的猫猫，请检查 role-config.json 中的 cats 配置。");

@@ -58,7 +58,12 @@ function buildClaudeCommand({ prompt, model, settingsFile }) {
     args.push("--settings", expandHome(settingsFile.trim()));
   }
 
-  if (model && typeof model === "string" && model.trim()) {
+  // NOTE:
+  // Some custom BASE_URL backends do not support stable model ids via --model.
+  // Default behavior: do NOT pass --model; let backend/server-side default model resolve.
+  // Set CLAUDE_USE_MODEL_ARG=1 to restore explicit --model passing.
+  const useModelArg = /^(1|true|yes)$/i.test(String(process.env.CLAUDE_USE_MODEL_ARG || "").trim());
+  if (useModelArg && model && typeof model === "string" && model.trim()) {
     args.push("--model", model.trim());
   }
 

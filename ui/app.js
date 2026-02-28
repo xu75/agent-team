@@ -30,6 +30,14 @@ const state = {
   chatThreads: [],          // 所有聊天 threads
   // 每个任务的聊天消息缓存：key = taskId, value = { messages: [], threadId: string|null }
   chatPerTask: new Map(),
+  mentionSuggest: {
+    open: false,
+    start: 0,
+    end: 0,
+    query: "",
+    items: [],
+    activeIndex: 0,
+  },
 };
 
 const el = {
@@ -69,6 +77,7 @@ const el = {
   evidenceMeta: document.getElementById("evidenceMeta"),
   evidenceViewer: document.getElementById("evidenceViewer"),
   mustFixList: document.getElementById("mustFixList"),
+  mentionSuggest: document.getElementById("mentionSuggest"),
 };
 
 let rightPanelCollapsed = false;
@@ -254,12 +263,42 @@ function taskProjectInfo(t) {
 }
 
 function roleAvatar(role, catName) {
-  if (role === "coder") return "🛠";
-  if (role === "reviewer") return "🔍";
-  if (role === "tester") return "🧪";
+  if (role === "coder") return stageRoleAvatar("coder") || "🛠";
+  if (role === "reviewer") return stageRoleAvatar("reviewer") || "🔍";
+  if (role === "tester") return stageRoleAvatar("tester") || "🧪";
   if (role === "task") return "📌";
   if (role === "chat") return catAvatarFor(catName);
   return "•";
+}
+
+function stageRoleAvatar(stageRole) {
+  const cfg = activeRoleConfig();
+  const cats = cfg?.cats;
+  if (!cats || typeof cats !== "object") return null;
+  const profile = cfg?.role_profiles?.[stageRole] || {};
+  const candidates = [
+    profile.display_name,
+    profile.nickname,
+  ]
+    .map((x) => String(x || "").trim().toLowerCase())
+    .filter(Boolean);
+  if (candidates.length === 0) return null;
+
+  for (const [name, cat] of Object.entries(cats)) {
+    const aliases = Array.isArray(cat?.aliases) ? cat.aliases : [];
+    const keys = [
+      name,
+      cat?.display_name,
+      cat?.nickname,
+      ...aliases,
+    ]
+      .map((x) => String(x || "").trim().toLowerCase())
+      .filter(Boolean);
+    if (candidates.some((x) => keys.includes(x)) && cat?.avatar) {
+      return cat.avatar;
+    }
+  }
+  return null;
 }
 
 function metaLine(m) {
@@ -630,6 +669,7 @@ function updateActionAvailability() {
 
 function setBusy(v) {
   state.busy = v;
+  if (v) hideMentionSuggest();
   updateActionAvailability();
 }
 
@@ -1052,10 +1092,14 @@ function renderChat() {
       const rawText = String(renderedText || "");
       const lineCount = rawText.split("\n").length;
       const collapsible = rawText.length > 700 || lineCount > 18;
+      const mdHtml =
+        typeof marked !== "undefined" && typeof DOMPurify !== "undefined"
+          ? DOMPurify.sanitize(marked.parse(rawText))
+          : `<pre>${escapeHtml(rawText)}</pre>`;
       const textHtml = collapsible
-        ? `<pre class="msg-text collapsed" data-collapsible="1">${escapeHtml(rawText)}</pre>
+        ? `<div class="msg-text msg-markdown collapsed" data-collapsible="1">${mdHtml}</div>
            <button class="toggle-expand" data-expand-btn="1">展开全文</button>`
-        : `<pre class="msg-text">${escapeHtml(rawText)}</pre>`;
+        : `<div class="msg-text msg-markdown">${mdHtml}</div>`;
       const bubble = document.createElement("div");
       bubble.className = "msg-bubble";
       bubble.innerHTML = `
@@ -1679,10 +1723,184 @@ function catDisplayName(catName) {
   return cat?.display_name || catName || "猫猫";
 }
 
+function mentionInsertName(cat) {
+  return cat?.nickname || cat?.cat_name || "";
+}
+
+function collectMentionCats() {
+  const cats = activeRoleConfig()?.cats || {};
+  return Object.entries(cats).map(([catName, cat]) => ({
+    ...cat,
+    cat_name: catName,
+    display_name: cat?.display_name || catName,
+    nickname: cat?.nickname || "",
+    aliases: Array.isArray(cat?.aliases) ? cat.aliases : [],
+    avatar: cat?.avatar || "🐱",
+  }));
+}
+
+function extractMentionContext(text, cursor) {
+  const safeText = String(text || "");
+  const caret = Number.isFinite(cursor) ? cursor : safeText.length;
+  const before = safeText.slice(0, caret);
+  const at = before.lastIndexOf("@");
+  if (at < 0) return null;
+  if (at > 0 && /[A-Za-z0-9_.-]/.test(safeText[at - 1])) return null;
+  const token = before.slice(at + 1);
+  if (/\s/.test(token)) return null;
+  if (!/^[\u4e00-\u9fff\w-]*$/.test(token)) return null;
+  return { start: at, end: caret, query: token };
+}
+
+function scoreMention(cat, queryLower) {
+  const fields = [
+    String(cat.cat_name || "").toLowerCase(),
+    String(cat.display_name || "").toLowerCase(),
+    String(cat.nickname || "").toLowerCase(),
+    ...cat.aliases.map((a) => String(a || "").toLowerCase()),
+  ].filter(Boolean);
+  if (!queryLower) return 1;
+  if (fields.some((f) => f.startsWith(queryLower))) return 2;
+  if (fields.some((f) => f.includes(queryLower))) return 1;
+  return 0;
+}
+
+function buildMentionCandidates(query) {
+  const queryLower = String(query || "").toLowerCase();
+  return collectMentionCats()
+    .map((cat) => ({ cat, score: scoreMention(cat, queryLower) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const an = String(a.cat.display_name || a.cat.cat_name || "");
+      const bn = String(b.cat.display_name || b.cat.cat_name || "");
+      return an.localeCompare(bn, "zh-Hans-CN");
+    })
+    .slice(0, 8)
+    .map((x) => x.cat);
+}
+
+function hideMentionSuggest() {
+  state.mentionSuggest.open = false;
+  state.mentionSuggest.items = [];
+  state.mentionSuggest.activeIndex = 0;
+  state.mentionSuggest.query = "";
+  if (el.mentionSuggest) {
+    el.mentionSuggest.classList.remove("show");
+    el.mentionSuggest.setAttribute("aria-hidden", "true");
+    el.mentionSuggest.innerHTML = "";
+  }
+}
+
+function renderMentionSuggest() {
+  if (!el.mentionSuggest) return;
+  if (!state.mentionSuggest.open || state.mentionSuggest.items.length === 0) {
+    hideMentionSuggest();
+    return;
+  }
+  const rows = state.mentionSuggest.items
+    .map((cat, idx) => {
+      const name = cat.display_name || cat.cat_name || "猫猫";
+      const nick = cat.nickname ? `昵称：${cat.nickname}` : "未设置昵称";
+      const insert = mentionInsertName(cat);
+      const active = idx === state.mentionSuggest.activeIndex ? " active" : "";
+      return `
+        <button class="mention-item${active}" data-mention-index="${idx}" type="button">
+          <span class="mention-main">
+            <span class="mention-avatar">${escapeHtml(cat.avatar || "🐱")}</span>
+            <span class="mention-name">${escapeHtml(name)}</span>
+            <span class="mention-nick">${escapeHtml(nick)}</span>
+          </span>
+          <span class="mention-insert">@${escapeHtml(insert)}</span>
+        </button>
+      `;
+    })
+    .join("");
+  el.mentionSuggest.innerHTML = rows;
+  el.mentionSuggest.classList.add("show");
+  el.mentionSuggest.setAttribute("aria-hidden", "false");
+}
+
+function updateMentionSuggest() {
+  if (!el.chatCommandInput) {
+    hideMentionSuggest();
+    return;
+  }
+  const cursor = Number.isFinite(el.chatCommandInput.selectionStart)
+    ? el.chatCommandInput.selectionStart
+    : el.chatCommandInput.value.length;
+  const context = extractMentionContext(el.chatCommandInput.value, cursor);
+  if (!context) {
+    hideMentionSuggest();
+    return;
+  }
+
+  const candidates = buildMentionCandidates(context.query);
+  if (candidates.length === 0) {
+    hideMentionSuggest();
+    return;
+  }
+
+  let nextActive = 0;
+  const activeCat = state.mentionSuggest.items[state.mentionSuggest.activeIndex];
+  if (activeCat?.cat_name) {
+    const idx = candidates.findIndex((c) => c.cat_name === activeCat.cat_name);
+    if (idx >= 0) nextActive = idx;
+  }
+  state.mentionSuggest.open = true;
+  state.mentionSuggest.start = context.start;
+  state.mentionSuggest.end = context.end;
+  state.mentionSuggest.query = context.query;
+  state.mentionSuggest.items = candidates;
+  state.mentionSuggest.activeIndex = nextActive;
+  renderMentionSuggest();
+}
+
+function moveMentionActive(delta) {
+  if (!state.mentionSuggest.open || state.mentionSuggest.items.length === 0) return;
+  const total = state.mentionSuggest.items.length;
+  const next = (state.mentionSuggest.activeIndex + delta + total) % total;
+  state.mentionSuggest.activeIndex = next;
+  renderMentionSuggest();
+}
+
+function applyMentionSuggestion(index = state.mentionSuggest.activeIndex) {
+  if (!state.mentionSuggest.open) return false;
+  const pick = state.mentionSuggest.items[index];
+  if (!pick || !el.chatCommandInput) return false;
+  const mentionText = `@${mentionInsertName(pick)} `;
+  const full = String(el.chatCommandInput.value || "");
+  const start = Math.max(0, state.mentionSuggest.start);
+  const end = Math.max(start, state.mentionSuggest.end);
+  el.chatCommandInput.value = `${full.slice(0, start)}${mentionText}${full.slice(end)}`;
+  const caret = start + mentionText.length;
+  el.chatCommandInput.focus();
+  el.chatCommandInput.setSelectionRange(caret, caret);
+  saveDraft(el.chatCommandInput.value);
+  hideMentionSuggest();
+  return true;
+}
+
 async function sendChatMessageUI(message) {
+  const optimisticId = `chat-local-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const optimisticUserMessage = {
+    id: optimisticId,
+    sender: "铲屎官",
+    sender_type: "user",
+    cat_name: null,
+    text: String(message || ""),
+    ts: Date.now(),
+  };
+
   try {
     setBusy(true);
     setRunStatus("猫猫思考中...", true);
+    state.chatMessages.push(optimisticUserMessage);
+    saveChatForCurrentTask();
+    renderChat();
+    el.chatStream.scrollTop = el.chatStream.scrollHeight;
+    el.chatCommandInput.value = "";
+    hideMentionSuggest();
 
     const body = {
       message,
@@ -1696,9 +1914,14 @@ async function sendChatMessageUI(message) {
       state.chatThreadId = res.thread_id;
     }
 
-    // Add user message
+    // Replace optimistic user message with persisted user message
     if (res.user_message) {
-      state.chatMessages.push(res.user_message);
+      const idx = state.chatMessages.findIndex((m) => String(m.id) === optimisticId);
+      if (idx >= 0) {
+        state.chatMessages[idx] = res.user_message;
+      } else {
+        state.chatMessages.push(res.user_message);
+      }
     }
 
     // Add cat responses
@@ -1711,10 +1934,12 @@ async function sendChatMessageUI(message) {
     saveChatForCurrentTask();
     renderChat();
     el.chatStream.scrollTop = el.chatStream.scrollHeight;
-    el.chatCommandInput.value = "";
     setRunStatus("", false);
     showToast("猫猫已回复", "positive");
   } catch (err) {
+    state.chatMessages = state.chatMessages.filter((m) => String(m.id) !== optimisticId);
+    saveChatForCurrentTask();
+    renderChat();
     setRunStatus(`聊天失败：${err.message}`, false);
     showToast(`聊天失败：${err.message}`, "negative");
   } finally {
@@ -1726,12 +1951,14 @@ function enterChatMode() {
   state.chatMode = true;
   // Do NOT reset selectedTaskId — keep the current session context visible
   el.chatCommandInput.placeholder = "@ 猫猫名字发消息，如：@牛奶 帮我看看这段代码";
+  updateMentionSuggest();
   // Re-render the main chat view which now includes inline chat messages
   renderChat();
 }
 
 function exitChatMode() {
   state.chatMode = false;
+  hideMentionSuggest();
   // Keep chatMessages and chatThreadId — they are part of the inline conversation history
   el.chatCommandInput.placeholder = '输入命令，如：/task 实现登录接口；/task --provider codex-cli --rounds 2 修复失败测试；/rerun 继续上个任务';
 }
@@ -2355,7 +2582,34 @@ if (el.newChatBtn) el.newChatBtn.addEventListener("click", () => startNewConvers
 // 草稿自动保存：输入时保存
 el.chatCommandInput.addEventListener("input", () => {
   saveDraft(el.chatCommandInput.value);
+  updateMentionSuggest();
 });
+el.chatCommandInput.addEventListener("click", updateMentionSuggest);
+el.chatCommandInput.addEventListener("keyup", (e) => {
+  const k = e.key;
+  if (k === "ArrowLeft" || k === "ArrowRight" || k === "Home" || k === "End") {
+    updateMentionSuggest();
+  }
+});
+el.chatCommandInput.addEventListener("blur", () => {
+  setTimeout(() => {
+    if (document.activeElement !== el.chatCommandInput) {
+      hideMentionSuggest();
+    }
+  }, 80);
+});
+if (el.mentionSuggest) {
+  el.mentionSuggest.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+  });
+  el.mentionSuggest.addEventListener("click", (e) => {
+    const target = e.target instanceof Element ? e.target.closest("[data-mention-index]") : null;
+    if (!target) return;
+    const idx = Number(target.getAttribute("data-mention-index"));
+    if (!Number.isFinite(idx)) return;
+    applyMentionSuggestion(idx);
+  });
+}
 
 if (el.exportReportBtn) el.exportReportBtn.addEventListener("click", exportCurrentReport);
 if (el.exportChatImageBtn) el.exportChatImageBtn.addEventListener("click", exportCurrentChatImage);
@@ -2415,6 +2669,27 @@ document.addEventListener("click", (e) => {
   setEvidenceDrawerOpen(false);
 });
 el.chatCommandInput.addEventListener("keydown", (e) => {
+  if (state.mentionSuggest.open) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      moveMentionActive(1);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      moveMentionActive(-1);
+      return;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      if (applyMentionSuggestion()) return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      hideMentionSuggest();
+      return;
+    }
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     handleComposerSubmit();
