@@ -118,6 +118,9 @@ async function runTask(taskPrompt, options = {}) {
     ? options.allowedTestCommands
     : DEFAULT_ALLOWED_PREFIXES;
   const abortSignal = options.abortSignal || null;
+  const liveHooks = options.liveHooks && typeof options.liveHooks === "object"
+    ? options.liveHooks
+    : null;
 
   const appendToTask = !!options.appendToTask;
   const requestedMode = options.executionMode === "implementation" ? "implementation" : "proposal";
@@ -216,6 +219,32 @@ async function runTask(taskPrompt, options = {}) {
     }
   }
 
+  function emitLiveAgentState(role, patch = {}) {
+    if (!liveHooks || typeof liveHooks.onAgentState !== "function") return;
+    try {
+      liveHooks.onAgentState({
+        task_id: taskId,
+        role,
+        stage: role,
+        ts: Date.now(),
+        ...patch,
+      });
+    } catch {}
+  }
+
+  function emitLiveAgentEvent(role, event) {
+    if (!liveHooks || typeof liveHooks.onAgentEvent !== "function") return;
+    try {
+      liveHooks.onAgentEvent({
+        task_id: taskId,
+        role,
+        stage: role,
+        ts: Date.now(),
+        event,
+      });
+    } catch {}
+  }
+
   try {
     throwIfAborted();
     transition(FSM_STATES.INTAKE, { reason: appendToTask ? "task_followup_received" : "task_received" });
@@ -226,6 +255,7 @@ async function runTask(taskPrompt, options = {}) {
 
     transition(FSM_STATES.PLAN, { round, reason: "draft_proposal" });
       throwIfAborted();
+      emitLiveAgentState("coder", { state: "thinking", run_mode: "proposal", round });
       const proposal = await runCoder({
       provider: providerFor("coder"),
       model: modelFor("coder"),
@@ -243,6 +273,7 @@ async function runTask(taskPrompt, options = {}) {
         agent_role: "coder",
         attempt: round,
       },
+      onLiveEvent: (evt) => emitLiveAgentEvent("coder", evt),
     });
 
     writeText(path.join(roundPath, "coder_output.md"), proposal.text);
@@ -255,6 +286,7 @@ async function runTask(taskPrompt, options = {}) {
     copyRunArtifacts(proposal.runDir, roundPath, "coder");
 
     if (!isProviderRunOk(proposal) || !String(proposal.text || "").trim()) {
+      emitLiveAgentState("coder", { state: "error", round, error: proposal.error_class || "coder_runtime_error" });
       const reason = proposal.error_class || "coder_runtime_error";
       finalOutcome = reason;
       mustFix = [`Coder failed in proposal phase: ${reason}`];
@@ -273,9 +305,11 @@ async function runTask(taskPrompt, options = {}) {
         reason,
       });
     } else {
+    emitLiveAgentState("coder", { state: "done", round });
 
     transition(FSM_STATES.REVIEW, { round, reason: "roundtable_reviewer" });
       throwIfAborted();
+      emitLiveAgentState("reviewer", { state: "thinking", run_mode: "discussion", round });
       const reviewer = await runReviewer({
       provider: providerFor("reviewer"),
       model: modelFor("reviewer"),
@@ -293,6 +327,7 @@ async function runTask(taskPrompt, options = {}) {
         agent_role: "reviewer",
         attempt: round,
       },
+      onLiveEvent: (evt) => emitLiveAgentEvent("reviewer", evt),
     });
 
     writeText(path.join(roundPath, "reviewer_raw.md"), reviewer.text);
@@ -307,9 +342,16 @@ async function runTask(taskPrompt, options = {}) {
       mode: "discussion",
     });
     copyRunArtifacts(reviewer.runDir, roundPath, "reviewer");
+    emitLiveAgentState(
+      "reviewer",
+      reviewer.ok
+        ? { state: "done", round }
+        : { state: "error", round, error: reviewer.error_class || reviewer.parse_error || "review_invalid" }
+    );
 
     transition(FSM_STATES.TEST, { round, reason: "roundtable_tester" });
       throwIfAborted();
+      emitLiveAgentState("tester", { state: "thinking", run_mode: "discussion", round });
       const tester = await runTester({
       provider: providerFor("tester"),
       model: modelFor("tester"),
@@ -327,6 +369,7 @@ async function runTask(taskPrompt, options = {}) {
         agent_role: "tester",
         attempt: round,
       },
+      onLiveEvent: (evt) => emitLiveAgentEvent("tester", evt),
     });
 
     writeText(path.join(roundPath, "tester_raw.md"), tester.text);
@@ -341,6 +384,12 @@ async function runTask(taskPrompt, options = {}) {
       mode: "discussion",
     });
     copyRunArtifacts(tester.runDir, roundPath, "tester");
+    emitLiveAgentState(
+      "tester",
+      tester.ok
+        ? { state: "done", round }
+        : { state: "error", round, error: tester.error_class || tester.parse_error || "tester_invalid" }
+    );
 
     rounds.push({
       round,
@@ -384,6 +433,7 @@ async function runTask(taskPrompt, options = {}) {
     const roundPath = roundDir(taskDir, round);
     const attempt = round;
 
+      emitLiveAgentState("coder", { state: "thinking", run_mode: "implementation", round });
       const coder = await runCoder({
       provider: providerFor("coder"),
       model: modelFor("coder"),
@@ -401,6 +451,7 @@ async function runTask(taskPrompt, options = {}) {
         agent_role: "coder",
         attempt,
       },
+      onLiveEvent: (evt) => emitLiveAgentEvent("coder", evt),
     });
 
     writeText(path.join(roundPath, "coder_output.md"), coder.text);
@@ -412,6 +463,7 @@ async function runTask(taskPrompt, options = {}) {
     copyRunArtifacts(coder.runDir, roundPath, "coder");
 
     if (!isProviderRunOk(coder) || !String(coder.text || "").trim()) {
+      emitLiveAgentState("coder", { state: "error", round, error: coder.error_class || "coder_runtime_error" });
       finalOutcome = coder.error_class || "coder_runtime_error";
       mustFix = [`Coder failed in implementation phase: ${finalOutcome}`];
       rounds.push({
@@ -429,10 +481,12 @@ async function runTask(taskPrompt, options = {}) {
       });
       break;
     }
+    emitLiveAgentState("coder", { state: "done", round });
 
     transition(FSM_STATES.REVIEW, { round, reason: "start_reviewer" });
 
       throwIfAborted();
+      emitLiveAgentState("reviewer", { state: "thinking", run_mode: "implementation", round });
       const reviewer = await runReviewer({
       provider: providerFor("reviewer"),
       model: modelFor("reviewer"),
@@ -449,6 +503,7 @@ async function runTask(taskPrompt, options = {}) {
         agent_role: "reviewer",
         attempt,
       },
+      onLiveEvent: (evt) => emitLiveAgentEvent("reviewer", evt),
     });
 
     writeText(path.join(roundPath, "reviewer_raw.md"), reviewer.text);
@@ -462,6 +517,12 @@ async function runTask(taskPrompt, options = {}) {
       exit: reviewer.exit,
     });
     copyRunArtifacts(reviewer.runDir, roundPath, "reviewer");
+    emitLiveAgentState(
+      "reviewer",
+      reviewer.ok
+        ? { state: "done", round }
+        : { state: "error", round, error: reviewer.error_class || reviewer.parse_error || "review_invalid" }
+    );
 
     rounds.push({
       round,
@@ -493,6 +554,7 @@ async function runTask(taskPrompt, options = {}) {
       transition(FSM_STATES.TEST, { round, reason: "review_approved" });
 
       throwIfAborted();
+      emitLiveAgentState("tester", { state: "thinking", run_mode: "implementation", round });
       const tester = await runTester({
         provider: providerFor("tester"),
         model: modelFor("tester"),
@@ -509,6 +571,7 @@ async function runTask(taskPrompt, options = {}) {
           agent_role: "tester",
           attempt,
         },
+        onLiveEvent: (evt) => emitLiveAgentEvent("tester", evt),
       });
 
       writeText(path.join(roundPath, "tester_raw.md"), tester.text);
@@ -525,6 +588,7 @@ async function runTask(taskPrompt, options = {}) {
 
       const commands = tester.test_spec.commands || [];
       throwIfAborted();
+      emitLiveAgentState("tester", { state: "tool", round, test_commands: commands.length });
       const testRun = await runTestCommands(commands, {
         timeoutMs: testCommandTimeoutMs,
         cwd: process.cwd(),
@@ -532,6 +596,7 @@ async function runTask(taskPrompt, options = {}) {
         allowedPrefixes: allowedTestCommands,
         stopOnFailure: true,
         abortSignal,
+        streamOutput: true,
       });
 
       writeJson(path.join(roundPath, "test-results.json"), testRun);
@@ -564,6 +629,7 @@ async function runTask(taskPrompt, options = {}) {
       }
 
       if (!tester.ok) {
+        emitLiveAgentState("tester", { state: "error", round, error: tester.error_class || tester.parse_error || "tester_invalid" });
         if (tester.error_class) {
           mustFix = [`Tester provider error: ${tester.error_class}`];
           finalOutcome = tester.error_class;
@@ -583,6 +649,7 @@ async function runTask(taskPrompt, options = {}) {
       }
 
       if (!testRun.allPassed) {
+        emitLiveAgentState("tester", { state: "error", round, error: "test_failed" });
         const blockedResults = testRun.results.filter(
           (r) => !r.ok && r.stderr?.includes("blocked command")
         );
@@ -635,6 +702,7 @@ async function runTask(taskPrompt, options = {}) {
 
       finalOutcome = "approved";
       mustFix = [];
+      emitLiveAgentState("tester", { state: "done", round, tests_passed: true });
       transition(FSM_STATES.FINALIZE, { round, reason: "tests_passed" });
       break;
     }

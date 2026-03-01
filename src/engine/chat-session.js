@@ -27,6 +27,29 @@ function isProviderRunOk(result) {
   return !result?.error_class && !hasExitFailure;
 }
 
+function formatLocalDateTime(ts = Date.now()) {
+  const d = new Date(ts);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+}
+
+function writeRuntimeLog(scope, title, fields = {}) {
+  const lines = [
+    `[${scope}] ${title}`,
+    `  time: ${formatLocalDateTime()}`,
+  ];
+  for (const [k, v] of Object.entries(fields || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    lines.push(`  ${k}: ${v}`);
+  }
+  process.stdout.write(`\n${lines.join("\n")}\n`);
+}
+
 /**
  * Chat Session Engine
  *
@@ -271,6 +294,7 @@ async function sendChatMessage({
   roleConfig,
   timeoutMs = 5 * 60 * 1000,
   abortSignal = null,
+  liveHooks = null,
 }) {
   const cats = roleConfig?.cats || {};
   const models = roleConfig?.models || [];
@@ -280,6 +304,30 @@ async function sendChatMessage({
   const threadMeta = readThreadMeta(logsRoot, threadId) || {};
   const mode = threadMeta.mode || DEFAULT_MODE;
   const modeState = threadMeta.mode_state || {};
+
+  function emitLiveAgentState(payload = {}) {
+    if (!liveHooks || typeof liveHooks.onAgentState !== "function") return;
+    try {
+      liveHooks.onAgentState({
+        thread_id: threadId,
+        mode,
+        ts: Date.now(),
+        ...payload,
+      });
+    } catch {}
+  }
+
+  function emitLiveAgentEvent(payload = {}) {
+    if (!liveHooks || typeof liveHooks.onAgentEvent !== "function") return;
+    try {
+      liveHooks.onAgentEvent({
+        thread_id: threadId,
+        mode,
+        ts: Date.now(),
+        ...payload,
+      });
+    } catch {}
+  }
 
   // Parse @mentions
   const { targets, cleanText } = parseMentions(userText, catLookup);
@@ -331,22 +379,64 @@ async function sendChatMessage({
     const peerCats = allCatEntries.filter((c) => c.cat_name !== cat.cat_name);
     const prompt = buildModePrompt(mode, cat, cleanText || userText, history, peerCats, promptModeState);
     const catLabel = cat.display_name || cat.cat_name;
-    const nodeLabel = extraMeta.workflow_node ? ` node=${extraMeta.workflow_node}` : "";
-    process.stdout.write(`\n[chat] start thread=${threadId} cat=${catLabel}${nodeLabel}\n`);
+    writeRuntimeLog("chat", "start", {
+      thread: threadId,
+      cat: catLabel,
+      node: extraMeta.workflow_node || "-",
+      provider,
+      model: model || "-",
+    });
+    emitLiveAgentState({
+      agent_key: cat.cat_name,
+      role: "chat",
+      stage: extraMeta.workflow_node || "chat",
+      display_name: catLabel,
+      state: "thinking",
+    });
 
     const t0 = Date.now();
-    const result = await executeProviderText({
-      provider,
-      model,
-      settingsFile,
-      prompt,
-      timeoutMs,
-      streamOutput: true,
-      eventMeta: { cat_name: cat.cat_name, mode: "chat", ...extraMeta },
-      abortSignal,
-    });
+    let result;
+    try {
+      result = await executeProviderText({
+        provider,
+        model,
+        settingsFile,
+        prompt,
+        timeoutMs,
+        streamOutput: true,
+        eventMeta: { cat_name: cat.cat_name, mode: "chat", ...extraMeta },
+        abortSignal,
+        onLiveEvent: (event) => {
+          emitLiveAgentEvent({
+            agent_key: cat.cat_name,
+            role: "chat",
+            stage: extraMeta.workflow_node || "chat",
+            display_name: catLabel,
+            event,
+          });
+        },
+      });
+    } catch (err) {
+      emitLiveAgentState({
+        agent_key: cat.cat_name,
+        role: "chat",
+        stage: extraMeta.workflow_node || "chat",
+        display_name: catLabel,
+        state: "error",
+        error: err?.code === "ABORTED" ? "aborted" : String(err?.message || "provider_error"),
+      });
+      throw err;
+    }
     const durationMs = Date.now() - t0;
-    process.stdout.write(`\n[chat] done thread=${threadId} cat=${catLabel}${nodeLabel} duration_ms=${durationMs}\n`);
+    writeRuntimeLog("chat", "done", {
+      thread: threadId,
+      cat: catLabel,
+      node: extraMeta.workflow_node || "-",
+      duration_ms: durationMs,
+      exit_code: Number.isFinite(Number(result?.exit?.code)) ? Number(result.exit.code) : "null",
+      signal: result?.exit?.signal || "-",
+      error: result?.error_class || "-",
+    });
 
     const usageData = result.usage || {};
     const catMsg = createMessage({
@@ -363,6 +453,17 @@ async function sendChatMessage({
     });
     appendMessage(logsRoot, threadId, catMsg);
     history.push(catMsg);
+    emitLiveAgentState({
+      agent_key: cat.cat_name,
+      role: "chat",
+      stage: extraMeta.workflow_node || "chat",
+      display_name: catLabel,
+      state: result?.error_class ? "error" : "done",
+      input_tokens: usageData.usage?.input_tokens ?? null,
+      output_tokens: usageData.usage?.output_tokens ?? null,
+      cost_usd: usageData.total_cost_usd ?? null,
+      error: result?.error_class || null,
+    });
 
     return {
       cat_name: cat.cat_name,
@@ -478,7 +579,19 @@ async function sendChatMessage({
       if (!coderCat || !reviewerCat || !testerCat) break;
 
       workingState.current_node = "coder";
-      process.stdout.write(`\n[workflow] round=${round} node=coder cat=${coderCat.display_name || coderCat.cat_name} start\n`);
+      writeRuntimeLog("workflow", "start", {
+        round,
+        node: "coder",
+        cat: coderCat.display_name || coderCat.cat_name,
+      });
+      emitLiveAgentState({
+        agent_key: "coder",
+        role: "coder",
+        stage: "coder",
+        display_name: coderCat.display_name || coderCat.cat_name,
+        state: "thinking",
+        round,
+      });
       const coderProvider = resolveProviderForCat(coderCat, models);
       const coderStart = Date.now();
       const coder = await runCoder({
@@ -498,9 +611,26 @@ async function sendChatMessage({
           workflow_round: round,
         },
         abortSignal,
+        onLiveEvent: (event) =>
+          emitLiveAgentEvent({
+            agent_key: "coder",
+            role: "coder",
+            stage: "coder",
+            display_name: coderCat.display_name || coderCat.cat_name,
+            round,
+            event,
+          }),
       });
       const coderDuration = Date.now() - coderStart;
-      process.stdout.write(`\n[workflow] round=${round} node=coder done duration_ms=${coderDuration}\n`);
+      writeRuntimeLog("workflow", "done", {
+        round,
+        node: "coder",
+        cat: coderCat.display_name || coderCat.cat_name,
+        duration_ms: coderDuration,
+        exit_code: Number.isFinite(Number(coder?.exit?.code)) ? Number(coder.exit.code) : "null",
+        signal: coder?.exit?.signal || "-",
+        error: coder?.error_class || "-",
+      });
       appendWorkflowMessage(
         coderCat,
         "coder",
@@ -517,13 +647,45 @@ async function sendChatMessage({
         }
       );
       if (!isProviderRunOk(coder) || !String(coder.text || "").trim()) {
+        emitLiveAgentState({
+          agent_key: "coder",
+          role: "coder",
+          stage: "coder",
+          display_name: coderCat.display_name || coderCat.cat_name,
+          state: "error",
+          round,
+          error: coder.error_class || "coder_runtime_error",
+        });
         finalOutcome = coder.error_class || "coder_runtime_error";
         mustFix = [`Coder failed: ${finalOutcome}`];
         break;
       }
+      emitLiveAgentState({
+        agent_key: "coder",
+        role: "coder",
+        stage: "coder",
+        display_name: coderCat.display_name || coderCat.cat_name,
+        state: "done",
+        round,
+        input_tokens: coder.usage?.usage?.input_tokens ?? null,
+        output_tokens: coder.usage?.usage?.output_tokens ?? null,
+        cost_usd: coder.usage?.total_cost_usd ?? null,
+      });
 
       workingState.current_node = "reviewer";
-      process.stdout.write(`\n[workflow] round=${round} node=reviewer cat=${reviewerCat.display_name || reviewerCat.cat_name} start\n`);
+      writeRuntimeLog("workflow", "start", {
+        round,
+        node: "reviewer",
+        cat: reviewerCat.display_name || reviewerCat.cat_name,
+      });
+      emitLiveAgentState({
+        agent_key: "reviewer",
+        role: "reviewer",
+        stage: "reviewer",
+        display_name: reviewerCat.display_name || reviewerCat.cat_name,
+        state: "thinking",
+        round,
+      });
       const reviewerProvider = resolveProviderForCat(reviewerCat, models);
       const reviewerStart = Date.now();
       const reviewer = await runReviewer({
@@ -542,9 +704,26 @@ async function sendChatMessage({
           workflow_round: round,
         },
         abortSignal,
+        onLiveEvent: (event) =>
+          emitLiveAgentEvent({
+            agent_key: "reviewer",
+            role: "reviewer",
+            stage: "reviewer",
+            display_name: reviewerCat.display_name || reviewerCat.cat_name,
+            round,
+            event,
+          }),
       });
       const reviewerDuration = Date.now() - reviewerStart;
-      process.stdout.write(`\n[workflow] round=${round} node=reviewer done duration_ms=${reviewerDuration}\n`);
+      writeRuntimeLog("workflow", "done", {
+        round,
+        node: "reviewer",
+        cat: reviewerCat.display_name || reviewerCat.cat_name,
+        duration_ms: reviewerDuration,
+        exit_code: Number.isFinite(Number(reviewer?.exit?.code)) ? Number(reviewer.exit.code) : "null",
+        signal: reviewer?.exit?.signal || "-",
+        error: reviewer?.error_class || "-",
+      });
       appendWorkflowMessage(
         reviewerCat,
         "reviewer",
@@ -562,12 +741,32 @@ async function sendChatMessage({
       );
 
       if (!reviewer.ok) {
+        emitLiveAgentState({
+          agent_key: "reviewer",
+          role: "reviewer",
+          stage: "reviewer",
+          display_name: reviewerCat.display_name || reviewerCat.cat_name,
+          state: "error",
+          round,
+          error: reviewer.error_class || reviewer.parse_error || "review_schema_invalid",
+        });
         finalOutcome = reviewer.error_class || "review_schema_invalid";
         mustFix = Array.isArray(reviewer.review?.must_fix) && reviewer.review.must_fix.length
           ? reviewer.review.must_fix
           : ["Reviewer output schema invalid"];
         break;
       }
+      emitLiveAgentState({
+        agent_key: "reviewer",
+        role: "reviewer",
+        stage: "reviewer",
+        display_name: reviewerCat.display_name || reviewerCat.cat_name,
+        state: reviewer.review?.decision === "approve" ? "done" : "replying",
+        round,
+        input_tokens: reviewer.usage?.usage?.input_tokens ?? null,
+        output_tokens: reviewer.usage?.usage?.output_tokens ?? null,
+        cost_usd: reviewer.usage?.total_cost_usd ?? null,
+      });
 
       if (reviewer.review?.decision !== "approve") {
         mustFix = Array.isArray(reviewer.review?.must_fix) ? reviewer.review.must_fix : ["Reviewer requested changes"];
@@ -576,7 +775,19 @@ async function sendChatMessage({
       }
 
       workingState.current_node = "tester";
-      process.stdout.write(`\n[workflow] round=${round} node=tester cat=${testerCat.display_name || testerCat.cat_name} start\n`);
+      writeRuntimeLog("workflow", "start", {
+        round,
+        node: "tester",
+        cat: testerCat.display_name || testerCat.cat_name,
+      });
+      emitLiveAgentState({
+        agent_key: "tester",
+        role: "tester",
+        stage: "tester",
+        display_name: testerCat.display_name || testerCat.cat_name,
+        state: "thinking",
+        round,
+      });
       const testerProvider = resolveProviderForCat(testerCat, models);
       const testerStart = Date.now();
       const tester = await runTester({
@@ -595,9 +806,26 @@ async function sendChatMessage({
           workflow_round: round,
         },
         abortSignal,
+        onLiveEvent: (event) =>
+          emitLiveAgentEvent({
+            agent_key: "tester",
+            role: "tester",
+            stage: "tester",
+            display_name: testerCat.display_name || testerCat.cat_name,
+            round,
+            event,
+          }),
       });
       const testerDuration = Date.now() - testerStart;
-      process.stdout.write(`\n[workflow] round=${round} node=tester done duration_ms=${testerDuration}\n`);
+      writeRuntimeLog("workflow", "done", {
+        round,
+        node: "tester",
+        cat: testerCat.display_name || testerCat.cat_name,
+        duration_ms: testerDuration,
+        exit_code: Number.isFinite(Number(tester?.exit?.code)) ? Number(tester.exit.code) : "null",
+        signal: tester?.exit?.signal || "-",
+        error: tester?.error_class || "-",
+      });
       appendWorkflowMessage(
         testerCat,
         "tester",
@@ -615,6 +843,15 @@ async function sendChatMessage({
       );
 
       if (!tester.ok) {
+        emitLiveAgentState({
+          agent_key: "tester",
+          role: "tester",
+          stage: "tester",
+          display_name: testerCat.display_name || testerCat.cat_name,
+          state: "error",
+          round,
+          error: tester.error_class || tester.parse_error || "tester_schema_invalid",
+        });
         if (tester.error_class) {
           finalOutcome = tester.error_class;
           mustFix = [`Tester provider error: ${tester.error_class}`];
@@ -626,7 +863,20 @@ async function sendChatMessage({
       }
 
       const commands = Array.isArray(tester.test_spec?.commands) ? tester.test_spec.commands : [];
-      process.stdout.write(`\n[workflow] round=${round} run_tests commands=${commands.length}\n`);
+      writeRuntimeLog("workflow", "run_tests", {
+        round,
+        node: "tester",
+        commands: commands.length,
+      });
+      emitLiveAgentState({
+        agent_key: "tester",
+        role: "tester",
+        stage: "tester",
+        display_name: testerCat.display_name || testerCat.cat_name,
+        state: "tool",
+        round,
+        test_commands: commands.length,
+      });
       const testRunStart = Date.now();
       const testRun = await runTestCommands(commands, {
         timeoutMs: 2 * 60 * 1000,
@@ -635,6 +885,7 @@ async function sendChatMessage({
         allowedPrefixes: DEFAULT_ALLOWED_PREFIXES,
         stopOnFailure: true,
         abortSignal,
+        streamOutput: true,
       });
       const testRunDuration = Date.now() - testRunStart;
       const testSummary = [
@@ -656,6 +907,15 @@ async function sendChatMessage({
       );
 
       if (!testRun.allPassed) {
+        emitLiveAgentState({
+          agent_key: "tester",
+          role: "tester",
+          stage: "tester",
+          display_name: testerCat.display_name || testerCat.cat_name,
+          state: "error",
+          round,
+          error: "test_failed",
+        });
         const failed = testRun.results.find((r) => !r.ok);
         const stderrSnippet = String(failed?.stderr || "").trim().slice(0, 500);
         mustFix = [
@@ -669,6 +929,15 @@ async function sendChatMessage({
 
       finalOutcome = "approved";
       mustFix = [];
+      emitLiveAgentState({
+        agent_key: "tester",
+        role: "tester",
+        stage: "tester",
+        display_name: testerCat.display_name || testerCat.cat_name,
+        state: "done",
+        round,
+        tests_passed: true,
+      });
       break;
     }
 

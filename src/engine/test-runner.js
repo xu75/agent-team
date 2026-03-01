@@ -16,13 +16,25 @@ function isAllowedCommand(command, allowedPrefixes = DEFAULT_ALLOWED_PREFIXES) {
   return allowedPrefixes.some((prefix) => c === prefix || c.startsWith(prefix + " "));
 }
 
-function nowIso() {
-  return new Date().toISOString();
+function formatLocalDateTime(ts = Date.now()) {
+  const d = new Date(ts);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
-function logTestDebug(message, streamOutput = true) {
+function logTestDebug(title, details = [], streamOutput = true) {
   if (!streamOutput) return;
-  process.stdout.write(`[test][${nowIso()}] ${message}\n`);
+  const lines = [
+    `[test] ${title}`,
+    `  time: ${formatLocalDateTime()}`,
+    ...details.map((x) => `  ${x}`),
+  ];
+  process.stdout.write(lines.join("\n") + "\n");
 }
 
 function runSingleCommand(command, options = {}) {
@@ -34,7 +46,15 @@ function runSingleCommand(command, options = {}) {
 
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    logTestDebug(`start cmd=${JSON.stringify(command)} cwd=${cwd} timeout_ms=${timeoutMs}`, streamOutput);
+    logTestDebug(
+      "start",
+      [
+        `cmd: ${JSON.stringify(command)}`,
+        `cwd: ${cwd}`,
+        `timeout_ms: ${timeoutMs}`,
+      ],
+      streamOutput
+    );
 
     const child = spawn("sh", ["-lc", command], {
       cwd,
@@ -100,7 +120,14 @@ function runSingleCommand(command, options = {}) {
       });
       const durationMs = Date.now() - startedAt;
       logTestDebug(
-        `done cmd=${JSON.stringify(command)} ok=${code === 0 && !signal && !aborted} code=${code ?? 1} signal=${signal || (aborted ? "SIGTERM" : "-")} duration_ms=${durationMs}`,
+        "done",
+        [
+          `cmd: ${JSON.stringify(command)}`,
+          `ok: ${code === 0 && !signal && !aborted}`,
+          `code: ${code ?? 1}`,
+          `signal: ${signal || (aborted ? "SIGTERM" : "-")}`,
+          `duration_ms: ${durationMs}`,
+        ],
         streamOutput
       );
     });
@@ -121,7 +148,15 @@ function runSingleCommand(command, options = {}) {
       });
       const durationMs = Date.now() - startedAt;
       logTestDebug(
-        `done cmd=${JSON.stringify(command)} ok=false code=1 signal=- duration_ms=${durationMs} error=${JSON.stringify(err.message)}`,
+        "done",
+        [
+          `cmd: ${JSON.stringify(command)}`,
+          "ok: false",
+          "code: 1",
+          "signal: -",
+          `duration_ms: ${durationMs}`,
+          `error: ${JSON.stringify(err.message)}`,
+        ],
         streamOutput
       );
     });
@@ -136,7 +171,7 @@ async function runTestCommands(commands, options = {}) {
 
   for (const command of commands) {
     if (options.abortSignal?.aborted) {
-      logTestDebug(`abort before cmd=${JSON.stringify(command)}`, streamOutput);
+      logTestDebug("abort", [`cmd: ${JSON.stringify(command)}`], streamOutput);
       results.push({
         command,
         code: 1,
@@ -149,7 +184,12 @@ async function runTestCommands(commands, options = {}) {
     }
     if (!isAllowedCommand(command, allowedPrefixes)) {
       logTestDebug(
-        `blocked cmd=${JSON.stringify(command)} reason=allowlist allowed=${JSON.stringify(allowedPrefixes)}`,
+        "blocked",
+        [
+          `cmd: ${JSON.stringify(command)}`,
+          "reason: allowlist",
+          `allowed: ${JSON.stringify(allowedPrefixes)}`,
+        ],
         streamOutput
       );
       results.push({
@@ -170,7 +210,14 @@ async function runTestCommands(commands, options = {}) {
   }
 
   const allPassed = results.every((r) => r.ok);
-  logTestDebug(`summary total=${results.length} all_passed=${allPassed}`, streamOutput);
+  logTestDebug(
+    "summary",
+    [
+      `total: ${results.length}`,
+      `all_passed: ${allPassed}`,
+    ],
+    streamOutput
+  );
   return { allPassed, results };
 }
 

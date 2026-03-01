@@ -71,6 +71,288 @@ const DEFAULT_ROLE_CONFIG = Object.freeze({
   },
 });
 
+const LIVE_SESSIONS = new Map(); // key = task_id/thread_id
+const LIVE_STREAM_SUBSCRIBERS = new Map(); // key = task_id/thread_id -> Set<ServerResponse>
+
+function nowTs() {
+  return Date.now();
+}
+
+function initialLiveAgent({ agentKey, role, stage, displayName }) {
+  return {
+    agent_key: String(agentKey || role || "agent"),
+    role: String(role || "agent"),
+    stage: String(stage || role || "agent"),
+    display_name: String(displayName || agentKey || role || "agent"),
+    state: "idle",
+    input_tokens: 0,
+    output_tokens: 0,
+    cost_usd: 0,
+    tool_calls: 0,
+    run_id: null,
+    error: null,
+    last_preview: "",
+    updated_at: nowTs(),
+  };
+}
+
+function ensureLiveSession(taskId, opts = {}) {
+  const key = String(taskId || "").trim();
+  if (!key) return null;
+  const roleConfig = opts.roleConfig ? normalizeRoleConfig(opts.roleConfig) : null;
+  let session = LIVE_SESSIONS.get(key);
+  if (!session) {
+    session = {
+      task_id: key,
+      mode: opts.mode || null,
+      running: !!opts.running,
+      current_stage: opts.current_stage || null,
+      final_outcome: null,
+      updated_at: nowTs(),
+      agents: {},
+    };
+    if (roleConfig) {
+      const profiles = stageRoleProfiles(roleConfig);
+      for (const stage of STAGES) {
+        const p = profiles[stage] || {};
+        session.agents[stage] = initialLiveAgent({
+          agentKey: stage,
+          role: stage,
+          stage,
+          displayName: p.display_name || stage,
+        });
+      }
+    }
+    LIVE_SESSIONS.set(key, session);
+  }
+  if (opts.mode) session.mode = opts.mode;
+  if (opts.current_stage) session.current_stage = opts.current_stage;
+  if (opts.running !== undefined) session.running = !!opts.running;
+  session.updated_at = nowTs();
+  publishLiveSnapshot(key);
+  return session;
+}
+
+function ensureLiveAgent(session, agentKey, defaults = {}) {
+  if (!session) return null;
+  const key = String(agentKey || defaults.role || "agent");
+  if (!session.agents[key]) {
+    session.agents[key] = initialLiveAgent({
+      agentKey: key,
+      role: defaults.role || key,
+      stage: defaults.stage || defaults.role || key,
+      displayName: defaults.display_name || key,
+    });
+  }
+  const agent = session.agents[key];
+  if (defaults.role) agent.role = String(defaults.role);
+  if (defaults.stage) agent.stage = String(defaults.stage);
+  if (defaults.display_name) agent.display_name = String(defaults.display_name);
+  agent.updated_at = nowTs();
+  return agent;
+}
+
+function applyUsageToLiveAgent(agent, usage = {}) {
+  const inTokens = Number(usage?.usage?.input_tokens);
+  const outTokens = Number(usage?.usage?.output_tokens);
+  const cost = Number(usage?.total_cost_usd);
+  if (Number.isFinite(inTokens)) agent.input_tokens = inTokens;
+  if (Number.isFinite(outTokens)) agent.output_tokens = outTokens;
+  if (Number.isFinite(cost)) agent.cost_usd = cost;
+}
+
+function patchLiveAgent(taskId, agentKey, patch = {}, defaults = {}) {
+  const session = ensureLiveSession(taskId, { running: true });
+  if (!session) return;
+  const agent = ensureLiveAgent(session, agentKey, defaults);
+  if (!agent) return;
+  if (patch.state) agent.state = String(patch.state);
+  if (patch.stage) {
+    agent.stage = String(patch.stage);
+    session.current_stage = String(patch.stage);
+  }
+  if (patch.run_id !== undefined) agent.run_id = patch.run_id || null;
+  if (patch.error !== undefined) agent.error = patch.error || null;
+  if (patch.last_preview !== undefined) {
+    agent.last_preview = String(patch.last_preview || "").slice(0, 200);
+  }
+  if (Number.isFinite(Number(patch.input_tokens))) agent.input_tokens = Number(patch.input_tokens);
+  if (Number.isFinite(Number(patch.output_tokens))) agent.output_tokens = Number(patch.output_tokens);
+  if (Number.isFinite(Number(patch.cost_usd))) agent.cost_usd = Number(patch.cost_usd);
+  if (Number.isFinite(Number(patch.tool_calls))) agent.tool_calls = Number(patch.tool_calls);
+  agent.updated_at = nowTs();
+  session.updated_at = nowTs();
+  publishLiveSnapshot(taskId);
+}
+
+function looksLikeToolSignal(event) {
+  if (!event || typeof event !== "object") return false;
+  if (event.type === "provider.ndjson") {
+    const obj = event.data?.obj;
+    if (obj?.type === "tool_use" || obj?.type === "tool_result") return true;
+    if (obj?.type === "assistant" && Array.isArray(obj?.message?.content)) {
+      return obj.message.content.some((p) => p?.type === "tool_use" || p?.type === "tool_result");
+    }
+  }
+  const raw =
+    event.type === "run.stderr.chunk"
+      ? String(event.data?.text || "")
+      : event.type === "run.stderr.line"
+        ? String(event.data?.line || "")
+        : event.type === "run.stdout.line"
+          ? String(event.data?.line || "")
+          : "";
+  if (!raw) return false;
+  return /(tool|command|bash|shell|apply_patch|editing|running tests|npm test|pnpm test|yarn test)/i.test(raw);
+}
+
+function applyLiveEvent(taskId, agentKey, event, defaults = {}) {
+  const session = ensureLiveSession(taskId, { running: true, current_stage: defaults.stage || null });
+  if (!session) return;
+  const agent = ensureLiveAgent(session, agentKey, defaults);
+  if (!agent) return;
+  if (event?.type === "run.started") {
+    agent.state = "thinking";
+    agent.error = null;
+  } else if (event?.type === "assistant.text") {
+    agent.state = "replying";
+    const txt = String(event?.data?.text || "").trim();
+    if (txt) agent.last_preview = txt.slice(0, 200);
+  } else if (event?.type === "run.usage") {
+    applyUsageToLiveAgent(agent, event?.data || {});
+  } else if (event?.type === "run.failed") {
+    agent.state = "error";
+    agent.error = String(event?.data?.message || "run_failed");
+  } else if (event?.type === "run.completed") {
+    const code = Number(event?.data?.code);
+    agent.state = Number.isFinite(code) && code !== 0 ? "error" : "done";
+  } else if (looksLikeToolSignal(event)) {
+    agent.state = "tool";
+    agent.tool_calls = Number(agent.tool_calls || 0) + 1;
+  }
+  if (defaults.stage) {
+    agent.stage = String(defaults.stage);
+    session.current_stage = String(defaults.stage);
+  }
+  if (defaults.display_name) agent.display_name = String(defaults.display_name);
+  agent.updated_at = nowTs();
+  session.updated_at = nowTs();
+  publishLiveSnapshot(taskId);
+}
+
+function finalizeLiveSession(taskId, outcome = "idle") {
+  const key = String(taskId || "").trim();
+  if (!key) return;
+  const session = LIVE_SESSIONS.get(key);
+  if (!session) return;
+  session.running = false;
+  session.final_outcome = String(outcome || "idle");
+  session.updated_at = nowTs();
+  for (const agent of Object.values(session.agents || {})) {
+    if (!agent || typeof agent !== "object") continue;
+    if (agent.state !== "error") {
+      agent.state = "idle";
+    }
+    agent.updated_at = nowTs();
+  }
+  publishLiveSnapshot(key);
+}
+
+function buildFallbackLiveFromMessages(taskId, bundle) {
+  const messages = Array.isArray(bundle?.messages) ? bundle.messages : [];
+  const agents = {};
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    if (m.role === "task") continue;
+    const isChat = m.role === "chat";
+    const agentKey = isChat
+      ? `chat:${String(m.cat_name || m.role_label || "chat")}`
+      : String(m.role || "agent");
+    if (!agents[agentKey]) {
+      agents[agentKey] = initialLiveAgent({
+        agentKey,
+        role: isChat ? "chat" : (m.role || "agent"),
+        stage: isChat ? "chat" : (m.role || "agent"),
+        displayName: isChat
+          ? String(m.role_label || m.cat_name || "猫猫")
+          : String(m.role_display_name || m.role_label || m.role || agentKey),
+      });
+    }
+    const agent = agents[agentKey];
+    if (Number.isFinite(m.ts) && m.ts > Number(agent.updated_at || 0)) {
+      agent.updated_at = Number(m.ts);
+      agent.last_preview = String(m.text || "").trim().slice(0, 200);
+    }
+    if (Number.isFinite(m.input_tokens)) agent.input_tokens += Number(m.input_tokens);
+    if (Number.isFinite(m.output_tokens)) agent.output_tokens += Number(m.output_tokens);
+    if (Number.isFinite(m.cost_usd)) agent.cost_usd += Number(m.cost_usd);
+    if (m.ok === false) {
+      agent.state = "error";
+      agent.error = "last_message_failed";
+    }
+  }
+  return {
+    task_id: String(taskId || ""),
+    mode: bundle?._thread_mode || null,
+    running: false,
+    current_stage: bundle?.current_stage || bundle?._thread_mode || null,
+    final_outcome: bundle?.final_outcome || null,
+    updated_at: nowTs(),
+    agents,
+  };
+}
+
+function liveSessionSnapshot(taskId, fallbackBundle = null) {
+  const key = String(taskId || "").trim();
+  if (!key) return null;
+  const live = LIVE_SESSIONS.get(key);
+  if (live) return JSON.parse(JSON.stringify(live));
+  if (fallbackBundle) return buildFallbackLiveFromMessages(key, fallbackBundle);
+  return {
+    task_id: key,
+    mode: null,
+    running: false,
+    current_stage: null,
+    final_outcome: null,
+    updated_at: nowTs(),
+    agents: {},
+  };
+}
+
+function addLiveSubscriber(taskId, res) {
+  const key = String(taskId || "").trim();
+  if (!key || !res) return;
+  if (!LIVE_STREAM_SUBSCRIBERS.has(key)) {
+    LIVE_STREAM_SUBSCRIBERS.set(key, new Set());
+  }
+  LIVE_STREAM_SUBSCRIBERS.get(key).add(res);
+}
+
+function removeLiveSubscriber(taskId, res) {
+  const key = String(taskId || "").trim();
+  if (!key || !res) return;
+  const set = LIVE_STREAM_SUBSCRIBERS.get(key);
+  if (!set) return;
+  set.delete(res);
+  if (set.size === 0) LIVE_STREAM_SUBSCRIBERS.delete(key);
+}
+
+function publishLiveSnapshot(taskId) {
+  const key = String(taskId || "").trim();
+  if (!key) return;
+  const subs = LIVE_STREAM_SUBSCRIBERS.get(key);
+  if (!subs || subs.size === 0) return;
+  const payload = liveSessionSnapshot(key);
+  const data = `event: live\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const res of [...subs]) {
+    try {
+      res.write(data);
+    } catch {
+      removeLiveSubscriber(key, res);
+    }
+  }
+}
+
 function sendJson(res, code, data) {
   res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data));
@@ -278,6 +560,42 @@ function stageRoleProfiles(roleConfig) {
     };
   }
   return out;
+}
+
+function createLiveHooks(taskId, opts = {}) {
+  const key = String(taskId || "").trim();
+  if (!key) return null;
+  const mode = opts.mode || null;
+  const roleConfig = opts.roleConfig || null;
+  ensureLiveSession(key, { mode, roleConfig, running: true, current_stage: opts.current_stage || null });
+  return {
+    onAgentState(payload = {}) {
+      const agentKey = String(payload.agent_key || payload.role || "agent");
+      patchLiveAgent(
+        key,
+        agentKey,
+        payload,
+        {
+          role: payload.role || agentKey,
+          stage: payload.stage || payload.role || agentKey,
+          display_name: payload.display_name || payload.role || agentKey,
+        }
+      );
+    },
+    onAgentEvent(payload = {}) {
+      const agentKey = String(payload.agent_key || payload.role || "agent");
+      applyLiveEvent(
+        key,
+        agentKey,
+        payload.event || null,
+        {
+          role: payload.role || agentKey,
+          stage: payload.stage || payload.role || agentKey,
+          display_name: payload.display_name || payload.role || agentKey,
+        }
+      );
+    },
+  };
 }
 
 function readRequestJson(req) {
@@ -1149,6 +1467,7 @@ const server = http.createServer(async (req, res) => {
       if (!message) return sendJson(res, 400, { error: "message is required" });
 
       let threadId = body.thread_id ? String(body.thread_id).trim() : null;
+      let threadMode = body.mode || null;
       if (!threadId) {
         const preview = message.length > 20 ? message.slice(0, 20) + "..." : message;
         const mode = body.mode || undefined;
@@ -1157,15 +1476,30 @@ const server = http.createServer(async (req, res) => {
           : readRoleConfig();
         const meta = createThread(LOGS_ROOT, preview, mode, roleConfig);
         threadId = meta.thread_id;
+        threadMode = meta.mode || threadMode;
+      } else if (!threadMode) {
+        threadMode = readThreadMeta(LOGS_ROOT, threadId)?.mode || null;
       }
 
       const roleConfig = body.role_config
         ? normalizeRoleConfig(body.role_config)
         : readRoleConfig();
+      const liveHooks = createLiveHooks(threadId, {
+        mode: threadMode || "free_chat",
+        roleConfig,
+        current_stage: threadMode || "chat",
+      });
+      ensureLiveSession(threadId, {
+        mode: threadMode || "free_chat",
+        roleConfig,
+        running: true,
+        current_stage: threadMode || "chat",
+      });
 
       const controller = new AbortController();
       ACTIVE_CHAT_RUNS.set(threadId, { controller, started_at: Date.now() });
       let result;
+      let runFailed = null;
       try {
         result = await sendChatMessage({
           logsRoot: LOGS_ROOT,
@@ -1173,12 +1507,22 @@ const server = http.createServer(async (req, res) => {
           userText: message,
           roleConfig,
           abortSignal: controller.signal,
+          liveHooks,
         });
+      } catch (err) {
+        runFailed = err;
+        throw err;
       } finally {
         const current = ACTIVE_CHAT_RUNS.get(threadId);
         if (current && current.controller === controller) {
           ACTIVE_CHAT_RUNS.delete(threadId);
         }
+        finalizeLiveSession(
+          threadId,
+          runFailed
+            ? (runFailed.code === "ABORTED" ? "canceled" : "error")
+            : "idle"
+        );
       }
 
       return sendJson(res, 200, {
@@ -1405,9 +1749,15 @@ const server = http.createServer(async (req, res) => {
           const checked = validateNicknameUniqueness(roleConfig);
           if (!checked.ok) return sendJson(res, 400, { error: checked.error });
           const effectiveRoleConfig = checked.roleConfig;
+          const liveHooks = createLiveHooks(taskId, {
+            mode: threadMeta.mode || "free_chat",
+            roleConfig: effectiveRoleConfig,
+            current_stage: threadMeta.mode || "chat",
+          });
           const controller = new AbortController();
           ACTIVE_CHAT_RUNS.set(taskId, { controller, started_at: Date.now() });
           let result;
+          let runFailed = null;
           try {
             result = await sendChatMessage({
               logsRoot: LOGS_ROOT,
@@ -1415,12 +1765,22 @@ const server = http.createServer(async (req, res) => {
               userText: message,
               roleConfig: effectiveRoleConfig,
               abortSignal: controller.signal,
+              liveHooks,
             });
+          } catch (err) {
+            runFailed = err;
+            throw err;
           } finally {
             const current = ACTIVE_CHAT_RUNS.get(taskId);
             if (current && current.controller === controller) {
               ACTIVE_CHAT_RUNS.delete(taskId);
             }
+            finalizeLiveSession(
+              taskId,
+              runFailed
+                ? (runFailed.code === "ABORTED" ? "canceled" : "error")
+                : "idle"
+            );
           }
           return sendJson(res, 200, {
             ok: true,
@@ -1455,7 +1815,14 @@ const server = http.createServer(async (req, res) => {
         }
         const controller = new AbortController();
         ACTIVE_TASK_RUNS.set(taskId, { controller, started_at: Date.now(), kind: "followup" });
+        const liveHooks = createLiveHooks(taskId, {
+          mode: "workflow",
+          roleConfig: effectiveRoleConfig,
+          current_stage: "intake",
+        });
+        ensureLiveSession(taskId, { mode: "workflow", roleConfig: effectiveRoleConfig, running: true, current_stage: "intake" });
         let updated;
+        let runFailed = null;
         try {
           updated = await runTask(prompt, {
           provider,
@@ -1470,12 +1837,22 @@ const server = http.createServer(async (req, res) => {
           executionMode: confirmRequested ? "implementation" : "proposal",
           operatorConfirmed: confirmRequested,
           abortSignal: controller.signal,
+          liveHooks,
         });
+        } catch (err) {
+          runFailed = err;
+          throw err;
         } finally {
           const current = ACTIVE_TASK_RUNS.get(taskId);
           if (current && current.controller === controller) {
             ACTIVE_TASK_RUNS.delete(taskId);
           }
+          finalizeLiveSession(
+            taskId,
+            runFailed
+              ? (runFailed.code === "ABORTED" ? "canceled" : "error")
+              : (updated?.final_outcome || "idle")
+          );
         }
 
         return sendJson(res, 200, {
@@ -1504,9 +1881,15 @@ const server = http.createServer(async (req, res) => {
           const checked = validateNicknameUniqueness(roleConfig);
           if (!checked.ok) return sendJson(res, 400, { error: checked.error });
           const effectiveRoleConfig = checked.roleConfig;
+          const liveHooks = createLiveHooks(taskId, {
+            mode: threadMeta.mode || "free_chat",
+            roleConfig: effectiveRoleConfig,
+            current_stage: threadMeta.mode || "chat",
+          });
           const controller = new AbortController();
           ACTIVE_CHAT_RUNS.set(taskId, { controller, started_at: Date.now() });
           let result;
+          let runFailed = null;
           try {
             result = await sendChatMessage({
               logsRoot: LOGS_ROOT,
@@ -1514,12 +1897,22 @@ const server = http.createServer(async (req, res) => {
               userText: prompt,
               roleConfig: effectiveRoleConfig,
               abortSignal: controller.signal,
+              liveHooks,
             });
+          } catch (err) {
+            runFailed = err;
+            throw err;
           } finally {
             const current = ACTIVE_CHAT_RUNS.get(taskId);
             if (current && current.controller === controller) {
               ACTIVE_CHAT_RUNS.delete(taskId);
             }
+            finalizeLiveSession(
+              taskId,
+              runFailed
+                ? (runFailed.code === "ABORTED" ? "canceled" : "error")
+                : "idle"
+            );
           }
           return sendJson(res, 200, {
             ok: true,
@@ -1549,7 +1942,14 @@ const server = http.createServer(async (req, res) => {
 
         const controller = new AbortController();
         ACTIVE_TASK_RUNS.set(taskId, { controller, started_at: Date.now(), kind: "rerun" });
+        const liveHooks = createLiveHooks(taskId, {
+          mode: "workflow",
+          roleConfig: effectiveRoleConfig,
+          current_stage: "intake",
+        });
+        ensureLiveSession(taskId, { mode: "workflow", roleConfig: effectiveRoleConfig, running: true, current_stage: "intake" });
         let rerun;
+        let runFailed = null;
         try {
           rerun = await runTask(prompt, {
           provider: String(body.provider || summary.provider || "claude-cli"),
@@ -1561,12 +1961,22 @@ const server = http.createServer(async (req, res) => {
           roleProfiles,
           roleConfig: effectiveRoleConfig,
           abortSignal: controller.signal,
+          liveHooks,
         });
+        } catch (err) {
+          runFailed = err;
+          throw err;
         } finally {
           const current = ACTIVE_TASK_RUNS.get(taskId);
           if (current && current.controller === controller) {
             ACTIVE_TASK_RUNS.delete(taskId);
           }
+          finalizeLiveSession(
+            taskId,
+            runFailed
+              ? (runFailed.code === "ABORTED" ? "canceled" : "error")
+              : (rerun?.final_outcome || "idle")
+          );
         }
 
         return sendJson(res, 200, {
@@ -1607,6 +2017,7 @@ const server = http.createServer(async (req, res) => {
               return sendJson(res, 403, { error: "禁止删除任务根目录外的文件" });
             }
             fs.rmSync(threadPath, { recursive: true, force: true });
+            LIVE_SESSIONS.delete(taskId);
             return sendJson(res, 200, { ok: true, task_id: taskId, message: "会话已删除" });
           }
           return sendJson(res, 404, { error: "task not found" });
@@ -1625,6 +2036,7 @@ const server = http.createServer(async (req, res) => {
 
         // 递归删除任务目录
         fs.rmSync(taskDir, { recursive: true, force: true });
+        LIVE_SESSIONS.delete(taskId);
         return sendJson(res, 200, { ok: true, task_id: taskId, message: "会话已删除" });
       }
     }
@@ -1634,6 +2046,39 @@ const server = http.createServer(async (req, res) => {
       if (seg.length >= 3) {
         const taskId = seg[2];
         const task = getTaskDetail(taskId);
+
+        if (seg.length === 5 && seg[3] === "live" && seg[4] === "stream") {
+          const threadMetaForStream = task ? null : readThreadMeta(LOGS_ROOT, taskId);
+          if (!task && !threadMetaForStream) {
+            return sendJson(res, 404, { error: "task not found" });
+          }
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
+            Connection: "keep-alive",
+          });
+          if (typeof res.flushHeaders === "function") res.flushHeaders();
+          res.write("retry: 1500\n\n");
+
+          const initial = task
+            ? liveSessionSnapshot(taskId, buildTaskMessages(taskId, task.task_dir))
+            : liveSessionSnapshot(taskId, buildThreadMessagesBundle(taskId));
+          res.write(`event: live\ndata: ${JSON.stringify(initial)}\n\n`);
+          addLiveSubscriber(taskId, res);
+
+          const heartbeat = setInterval(() => {
+            try {
+              res.write(": ping\n\n");
+            } catch {}
+          }, 15000);
+          const cleanup = () => {
+            clearInterval(heartbeat);
+            removeLiveSubscriber(taskId, res);
+          };
+          req.on("close", cleanup);
+          req.on("end", cleanup);
+          return;
+        }
 
         // Fallback: if not a task, check if it's a chat thread
         if (!task) {
@@ -1658,6 +2103,14 @@ const server = http.createServer(async (req, res) => {
             return sendMarkdown(res, 200, md, `task-${taskId}.md`);
           }
 
+          if (seg.length === 4 && seg[3] === "live") {
+            if (LIVE_SESSIONS.has(taskId)) {
+              return sendJson(res, 200, liveSessionSnapshot(taskId));
+            }
+            const bundle = buildThreadMessagesBundle(taskId);
+            return sendJson(res, 200, liveSessionSnapshot(taskId, bundle));
+          }
+
           if (seg.length === 4 && seg[3] === "messages") {
             return sendJson(res, 200, buildThreadMessagesBundle(taskId));
           }
@@ -1676,6 +2129,14 @@ const server = http.createServer(async (req, res) => {
 
         if (seg.length === 4 && seg[3] === "messages") {
           return sendJson(res, 200, buildTaskMessages(taskId, task.task_dir));
+        }
+
+        if (seg.length === 4 && seg[3] === "live") {
+          if (LIVE_SESSIONS.has(taskId)) {
+            return sendJson(res, 200, liveSessionSnapshot(taskId));
+          }
+          const bundle = buildTaskMessages(taskId, task.task_dir);
+          return sendJson(res, 200, liveSessionSnapshot(taskId, bundle));
         }
 
         if (seg.length === 4 && seg[3] === "evidence") {

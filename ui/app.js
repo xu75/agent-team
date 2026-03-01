@@ -5,12 +5,15 @@ const state = {
   selectedRound: null,
   detail: null,
   messagesData: null,
+  liveData: null,
   roleConfig: null,
   busy: false,
   optimisticMessages: [],
   livePollTimer: null,
   livePollBusy: false,
   liveDigest: "",
+  liveStream: null,
+  liveStreamTaskId: null,
   runningTaskId: null,
   evidenceDrawer: {
     open: false,
@@ -723,13 +726,25 @@ function updateJumpBottomVisibility() {
   el.jumpBottomBtn.classList.toggle("show", shouldShow);
 }
 
-function buildLiveDigest(detail, messagesData) {
+function buildLiveDigest(detail, messagesData, liveData = null) {
   const summary = detail?.summary || {};
   const messages = messagesData?.messages || [];
   const last = messages[messages.length - 1] || {};
   const unresolved = Array.isArray(messagesData?.unresolved_must_fix)
     ? messagesData.unresolved_must_fix.length
     : 0;
+  const live = liveData || {};
+  const liveAgents = live?.agents && typeof live.agents === "object"
+    ? Object.entries(live.agents)
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+        .map(([k, v]) => {
+          const statePart = String(v?.state || "");
+          const tokenPart = `${Number(v?.input_tokens || 0)}/${Number(v?.output_tokens || 0)}`;
+          const tsPart = Number(v?.updated_at || 0);
+          return `${k}:${statePart}:${tokenPart}:${tsPart}`;
+        })
+        .join(",")
+    : "";
   return [
     summary.final_status || "",
     summary.final_outcome || "",
@@ -741,6 +756,9 @@ function buildLiveDigest(detail, messagesData) {
     messagesData?.current_stage || "",
     messagesData?.final_outcome || "",
     unresolved,
+    live?.running ? 1 : 0,
+    live?.current_stage || "",
+    liveAgents,
   ].join("|");
 }
 
@@ -939,19 +957,101 @@ function removeOptimisticMessage(msgId) {
   state.optimisticMessages = state.optimisticMessages.filter((m) => String(m.id || "") !== String(msgId || ""));
 }
 
-async function refreshTaskLive(taskId) {
+function applyLiveSnapshot(taskId, live) {
+  if (!taskId || state.selectedTaskId !== taskId) return false;
+  if (!live || typeof live !== "object") return false;
+  const prevLive = state.liveData;
+  state.liveData = live;
+  const nextDigest = buildLiveDigest(state.detail, state.messagesData, live);
+  if (nextDigest === state.liveDigest) return false;
+  state.liveDigest = nextDigest;
+  renderLiveStage();
+  renderAgentStatus();
+  if (el.rightRuntimeHint && !state.isNewConversationDraft) {
+    const summary = state.detail?.summary || {};
+    const current = live.current_stage || state.messagesData?.current_stage || summary.final_status || "-";
+    const runningTag = live.running ? "运行中" : "空闲";
+    el.rightRuntimeHint.textContent = `${summary.provider || "-"} · ${current} · ${runningTag}`;
+  }
+
+  // When any agent reaches done/error, fetch messages immediately so chat stream
+  // updates one-by-one instead of waiting for periodic polling.
+  const prevAgents = prevLive?.agents && typeof prevLive.agents === "object" ? prevLive.agents : {};
+  const currAgents = live?.agents && typeof live.agents === "object" ? live.agents : {};
+  let hasTerminalTransition = false;
+  for (const key of Object.keys(currAgents)) {
+    const prevState = String(prevAgents?.[key]?.state || "");
+    const currState = String(currAgents?.[key]?.state || "");
+    if (currState !== prevState && (currState === "done" || currState === "error")) {
+      hasTerminalTransition = true;
+      break;
+    }
+  }
+  if (hasTerminalTransition) {
+    refreshTaskLive(taskId, { includeLive: false }).catch(() => {});
+  }
+
+  if (!live.running && state.liveStreamTaskId && String(state.liveStreamTaskId) === String(taskId)) {
+    stopLivePolling();
+  }
+  return true;
+}
+
+function stopLiveStream() {
+  if (state.liveStream) {
+    try {
+      state.liveStream.close();
+    } catch {}
+    state.liveStream = null;
+    state.liveStreamTaskId = null;
+  }
+}
+
+function startLiveStream(taskId) {
+  if (!taskId) return false;
+  if (typeof EventSource === "undefined") return false;
+  stopLiveStream();
+  const es = new EventSource(`/api/tasks/${encodeURIComponent(taskId)}/live/stream`);
+  state.liveStream = es;
+  state.liveStreamTaskId = taskId;
+  es.addEventListener("live", (ev) => {
+    if (state.liveStream !== es) return;
+    let data = null;
+    try {
+      data = JSON.parse(String(ev.data || ""));
+    } catch {
+      data = null;
+    }
+    if (!data) return;
+    applyLiveSnapshot(taskId, data);
+  });
+  es.onerror = () => {
+    if (state.liveStream !== es) return;
+    // EventSource will auto-reconnect; fallback polling keeps snapshot fresh.
+  };
+  return true;
+}
+
+async function refreshTaskLive(taskId, opts = {}) {
   if (!taskId || state.livePollBusy) return;
+  const includeLive = opts.includeLive !== false;
   state.livePollBusy = true;
   try {
-    const [detail, messages] = await Promise.all([
+    const reqs = [
       getJson(`/api/tasks/${taskId}`),
       getJson(`/api/tasks/${taskId}/messages`),
-    ]);
+    ];
+    if (includeLive) {
+      reqs.push(getJson(`/api/tasks/${taskId}/live`).catch(() => null));
+    }
+    const [detail, messages, liveMaybe] = await Promise.all(reqs);
     if (state.selectedTaskId !== taskId) return;
-    const nextDigest = buildLiveDigest(detail, messages);
+    const live = includeLive ? (liveMaybe || null) : state.liveData;
+    const nextDigest = buildLiveDigest(detail, messages, live);
     const changed = nextDigest !== state.liveDigest;
     state.detail = detail;
     state.messagesData = messages;
+    if (includeLive) state.liveData = live;
     if (!changed) return;
     state.liveDigest = nextDigest;
     renderTaskPage({ preserveEvidence: true });
@@ -963,6 +1063,7 @@ async function refreshTaskLive(taskId) {
 }
 
 function stopLivePolling() {
+  stopLiveStream();
   if (state.livePollTimer) {
     clearInterval(state.livePollTimer);
     state.livePollTimer = null;
@@ -971,10 +1072,11 @@ function stopLivePolling() {
 
 function startLivePolling(taskId) {
   stopLivePolling();
-  refreshTaskLive(taskId).catch(() => {});
+  const hasSse = startLiveStream(taskId);
+  refreshTaskLive(taskId, { includeLive: !hasSse }).catch(() => {});
   state.livePollTimer = setInterval(() => {
-    refreshTaskLive(taskId).catch(() => {});
-  }, 1000);
+    refreshTaskLive(taskId, { includeLive: !hasSse }).catch(() => {});
+  }, hasSse ? 3000 : 1000);
 }
 
 function evidenceKindsForRole(role) {
@@ -1241,6 +1343,33 @@ function renderRoundTag() {
 }
 
 function renderLiveStage() {
+  const live = state.liveData;
+  if (live && live.agents && typeof live.agents === "object") {
+    const agents = Object.values(live.agents);
+    const runningStates = new Set(["thinking", "tool", "replying", "running"]);
+    const activeCount = agents.filter((a) => runningStates.has(String(a?.state || ""))).length;
+    const totalIn = agents.reduce((sum, a) => sum + (Number(a?.input_tokens) || 0), 0);
+    const totalOut = agents.reduce((sum, a) => sum + (Number(a?.output_tokens) || 0), 0);
+    const totalCost = agents.reduce((sum, a) => sum + (Number(a?.cost_usd) || 0), 0);
+    const runtime = live.running ? "运行中" : "空闲";
+    const tone = live.running ? "warning" : toneFromOutcome(live.final_outcome);
+    el.liveStage.innerHTML = `
+      <div class="stage-card ${tone}">
+        <div class="k">Current Stage</div>
+        <div class="v">${live.current_stage || "-"}</div>
+        <div class="k">Runtime</div>
+        <div class="v">${runtime}</div>
+        <div class="k">Active Agents</div>
+        <div class="v">${activeCount} / ${agents.length}</div>
+        <div class="k">Tokens</div>
+        <div class="v">in ${totalIn} · out ${totalOut}</div>
+        <div class="k">Cost</div>
+        <div class="v">${fmtCost(totalCost) || "$0.0000"}</div>
+      </div>
+    `;
+    return;
+  }
+
   const current = state.messagesData?.current_stage || state.detail?.summary?.final_status || "-";
   const threadStatus = state.detail?.summary?.final_status || current || "-";
   const outcome = state.messagesData?.final_outcome || state.detail?.summary?.final_outcome || "-";
@@ -1265,6 +1394,50 @@ function renderLiveStage() {
 }
 
 function renderAgentStatus() {
+  const live = state.liveData;
+  if (live && live.agents && typeof live.agents === "object" && Object.keys(live.agents).length > 0) {
+    const stateText = (s) => {
+      const v = String(s || "idle");
+      if (v === "thinking") return "思考中";
+      if (v === "tool") return "工具调用";
+      if (v === "replying") return "回复中";
+      if (v === "running") return "运行中";
+      if (v === "done") return "完成";
+      if (v === "error") return "异常";
+      return "空闲";
+    };
+    const stateClass = (s) => {
+      const v = String(s || "idle");
+      if (v === "error") return "error";
+      if (v === "done") return "ok";
+      if (v === "thinking" || v === "tool" || v === "replying" || v === "running") return "running";
+      return "idle";
+    };
+
+    const keys = Object.keys(live.agents);
+    const ordered = [
+      ...STAGES.filter((k) => keys.includes(k)),
+      ...keys.filter((k) => !STAGES.includes(k)).sort((a, b) => a.localeCompare(b)),
+    ];
+    const rows = ordered.map((k) => {
+      const a = live.agents[k] || {};
+      const role = String(a.role || k);
+      const name = String(a.display_name || displayRoleLabel(role, role) || k);
+      const inTokens = Number(a.input_tokens || 0);
+      const outTokens = Number(a.output_tokens || 0);
+      const cost = fmtCost(Number(a.cost_usd || 0)) || "$0.0000";
+      return `
+        <div class="agent-row">
+          <span class="name">${STAGES.includes(role) ? roleAvatar(role) : "🐱"} ${escapeHtml(name)}</span>
+          <span class="state ${stateClass(a.state)}">${stateText(a.state)}</span>
+          <span class="meta">in ${inTokens} · out ${outTokens} · ${cost}</span>
+        </div>
+      `;
+    });
+    el.agentStatus.innerHTML = rows.join("");
+    return;
+  }
+
   const messages = state.messagesData?.messages || [];
   const latest = { coder: null, reviewer: null, tester: null };
   for (const m of messages) {
@@ -1391,8 +1564,9 @@ function renderTaskPage(opts = {}) {
     el.taskMeta.className = `meta-pill ${toneFromOutcome(summary.final_outcome)}`.trim();
     if (el.flowTaskIdHint) el.flowTaskIdHint.textContent = `Task: ${state.selectedTaskId || "-"}`;
     if (el.rightRuntimeHint) {
-      const current = state.messagesData?.current_stage || summary.final_status || "-";
-      el.rightRuntimeHint.textContent = `${summary.provider || "-"} · ${current}`;
+      const current = state.liveData?.current_stage || state.messagesData?.current_stage || summary.final_status || "-";
+      const runningTag = state.liveData?.running ? "运行中" : "空闲";
+      el.rightRuntimeHint.textContent = `${summary.provider || "-"} · ${current} · ${runningTag}`;
     }
   }
   renderRoundTag();
@@ -1413,6 +1587,7 @@ function renderTaskPage(opts = {}) {
 }
 
 async function selectTask(taskId) {
+  stopLivePolling();
   // 保存当前对话的草稿
   const currentInput = el.chatCommandInput.value.trim();
   if (currentInput) {
@@ -1444,14 +1619,21 @@ async function selectTask(taskId) {
   renderModeSelector();
   renderTasks();
 
-  const [detail, messages] = await Promise.all([
+  const [detail, messages, live] = await Promise.all([
     getJson(`/api/tasks/${taskId}`),
     getJson(`/api/tasks/${taskId}/messages`),
+    getJson(`/api/tasks/${taskId}/live`).catch(() => null),
   ]);
 
   state.detail = detail;
   state.messagesData = messages;
-  state.liveDigest = buildLiveDigest(detail, messages);
+  state.liveData = live;
+  state.liveDigest = buildLiveDigest(detail, messages, live);
+  if (live?.running) {
+    startLivePolling(taskId);
+  } else if (state.liveStreamTaskId && String(state.liveStreamTaskId) !== String(taskId)) {
+    stopLivePolling();
+  }
   if (detail?._is_thread) {
     state.chatThreadId = detail._thread_id || taskId;
     state.chatMode = true;
@@ -1466,6 +1648,7 @@ async function selectTask(taskId) {
 }
 
 function renderEmptyScreen() {
+  stopLivePolling();
   el.taskTitle.textContent = "对话";
   el.taskMeta.className = "meta-pill";
   el.taskMeta.textContent = "暂无任务";
@@ -1481,6 +1664,7 @@ function renderEmptyScreen() {
   el.testResults.className = "plain-block warning";
   el.testResults.textContent = "暂无测试结果。";
   el.mustFixList.innerHTML = "<li>无</li>";
+  state.liveData = null;
   setMoreActionsMenu(false);
   if (el.rightRuntimeHint) el.rightRuntimeHint.textContent = "空闲";
   renderEvidencePlaceholder();
@@ -1504,6 +1688,7 @@ async function loadTasks() {
     state.selectedTaskId = null;
     state.detail = null;
     state.messagesData = null;
+    state.liveData = null;
     state.liveDigest = "";
     renderEmptyScreen();
   }
@@ -1632,13 +1817,18 @@ function isSelectedThreadConversation() {
 async function refreshSelectedSessionData(opts = {}) {
   const preserveEvidence = opts.preserveEvidence !== false;
   if (!state.selectedTaskId) return;
-  const [detail, messages] = await Promise.all([
+  const [detail, messages, live] = await Promise.all([
     getJson(`/api/tasks/${state.selectedTaskId}`),
     getJson(`/api/tasks/${state.selectedTaskId}/messages`),
+    getJson(`/api/tasks/${state.selectedTaskId}/live`).catch(() => null),
   ]);
   state.detail = detail;
   state.messagesData = messages;
-  state.liveDigest = buildLiveDigest(detail, messages);
+  state.liveData = live;
+  state.liveDigest = buildLiveDigest(detail, messages, live);
+  if (live?.running) {
+    startLivePolling(state.selectedTaskId);
+  }
   if (detail?._is_thread) {
     state.chatThreadId = detail._thread_id || state.selectedTaskId;
     state.chatMode = true;
@@ -2129,6 +2319,9 @@ async function sendChatMessageUI(message) {
     updateActionAvailability();
     setRunStatus("猫猫思考中...", true);
     await ensureChatSession(message, state.currentMode);
+    if (state.selectedTaskId) {
+      startLivePolling(state.selectedTaskId);
+    }
     state.chatMessages.push(optimisticUserMessage);
     saveChatForCurrentTask();
     renderChat();
@@ -2165,6 +2358,7 @@ async function sendChatMessageUI(message) {
     setRunStatus(`聊天失败：${err.message}`, false);
     showToast(`聊天失败：${err.message}`, "negative");
   } finally {
+    stopLivePolling();
     state.chatBusy = false;
     setBusy(false);
   }

@@ -146,6 +146,7 @@ async function runReviewer({
   timeoutMs,
   eventMeta,
   abortSignal,
+  onLiveEvent,
 }) {
   const prompt =
     mode === "discussion"
@@ -160,6 +161,7 @@ async function runReviewer({
     streamOutput: true,
     eventMeta,
     abortSignal,
+    onLiveEvent,
   });
 
   if (mode === "discussion") {

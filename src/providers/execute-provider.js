@@ -5,8 +5,15 @@ const { buildClaudeCommand } = require("./claude-cli");
 const { buildCodexCommand } = require("./codex-cli");
 const { buildGeminiCommand } = require("./gemini-cli");
 
-function nowIso() {
-  return new Date().toISOString();
+function formatLocalDateTime(ts = Date.now()) {
+  const d = new Date(ts);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
 function formatArgs(args) {
@@ -72,6 +79,7 @@ async function executeProviderText({
   streamOutput = false,
   eventMeta = {},
   abortSignal = null,
+  onLiveEvent = null,
 }) {
   const { cmd, args, stdoutParseMode } = resolveProvider(provider, prompt, model, settingsFile);
   const startedAt = Date.now();
@@ -82,8 +90,14 @@ async function executeProviderText({
   const permissionDeniedPattern = /requested permissions to write .*haven't granted it yet/i;
 
   if (streamOutput) {
+    const cmdLine = `${cmd}${args?.length ? ` ${formatArgs(args)}` : ""}`;
     process.stdout.write(
-      `\n[provider][${nowIso()}] start provider=${provider} model=${model || "-"} parse=${stdoutParseMode} cmd=${cmd} ${formatArgs(args)}\n`
+      `\n[provider] start\n` +
+      `  time: ${formatLocalDateTime()}\n` +
+      `  provider: ${provider}\n` +
+      `  model: ${model || "-"}\n` +
+      `  parse: ${stdoutParseMode}\n` +
+      `  cmd: ${cmdLine}\n`
     );
   }
 
@@ -118,6 +132,11 @@ async function executeProviderText({
       return false;
     },
     onEvent: (evt) => {
+      if (typeof onLiveEvent === "function") {
+        try {
+          onLiveEvent(evt);
+        } catch {}
+      }
       if (evt.type === "assistant.text") {
         text += evt.data.text;
         if (streamOutput) process.stdout.write(evt.data.text);
@@ -187,7 +206,14 @@ async function executeProviderText({
       : "null";
     const exitSignal = result?.exit?.signal || "-";
     process.stdout.write(
-      `\n[provider][${nowIso()}] done provider=${provider} run_id=${result.runId} exit_code=${exitCode} signal=${exitSignal} duration_ms=${durationMs}${errorClass ? ` error=${errorClass}` : ""}\n`
+      `\n[provider] done\n` +
+      `  time: ${formatLocalDateTime()}\n` +
+      `  provider: ${provider}\n` +
+      `  run_id: ${result.runId}\n` +
+      `  exit_code: ${exitCode}\n` +
+      `  signal: ${exitSignal}\n` +
+      `  duration_ms: ${durationMs}\n` +
+      `  error: ${errorClass || "-"}\n`
     );
   }
 

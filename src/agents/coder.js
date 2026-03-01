@@ -61,6 +61,7 @@ async function runCoder({
   timeoutMs,
   eventMeta,
   abortSignal,
+  onLiveEvent,
 }) {
   const prompt = buildCoderPrompt({ taskPrompt, mustFix, roleProfile, peerProfiles, mode });
   return executeProviderText({
@@ -72,6 +73,7 @@ async function runCoder({
     streamOutput: true,
     eventMeta,
     abortSignal,
+    onLiveEvent,
     // In proposal mode, use plan permission to prevent file edits
     permissionMode: mode === "proposal" ? "plan" : undefined,
   });

@@ -1460,12 +1460,19 @@ h3 {
   justify-content: space-between;
   align-items: center;
   font-size: 13px;
+  gap: 8px;
+}
+
+.agent-row .name {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .agent-row .state {
   font-size: 11px;
   border-radius: 99px;
   padding: 2px 8px;
+  flex: 0 0 auto;
 }
 
 .agent-row .state.ok {
@@ -1482,6 +1489,13 @@ h3 {
 .agent-row .state.running {
   background: #f3efea;
   color: #7c726b;
+}
+
+.agent-row .meta {
+  font-size: 11px;
+  color: #8a8179;
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .composer {
