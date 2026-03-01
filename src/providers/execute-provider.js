@@ -5,6 +5,20 @@ const { buildClaudeCommand } = require("./claude-cli");
 const { buildCodexCommand } = require("./codex-cli");
 const { buildGeminiCommand } = require("./gemini-cli");
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function formatArgs(args) {
+  if (!Array.isArray(args) || args.length === 0) return "";
+  return args
+    .map((a) => {
+      const s = String(a);
+      return /\s/.test(s) ? JSON.stringify(s) : s;
+    })
+    .join(" ");
+}
+
 function resolveProvider(provider, prompt, model, settingsFile) {
   if (provider === "claude-cli") {
     const built = buildClaudeCommand({ prompt, model, settingsFile });
@@ -60,10 +74,18 @@ async function executeProviderText({
   abortSignal = null,
 }) {
   const { cmd, args, stdoutParseMode } = resolveProvider(provider, prompt, model, settingsFile);
+  const startedAt = Date.now();
   let text = "";
   const stderrLines = [];
   let permissionDeniedCount = 0;
+  let usageData = null;
   const permissionDeniedPattern = /requested permissions to write .*haven't granted it yet/i;
+
+  if (streamOutput) {
+    process.stdout.write(
+      `\n[provider][${nowIso()}] start provider=${provider} model=${model || "-"} parse=${stdoutParseMode} cmd=${cmd} ${formatArgs(args)}\n`
+    );
+  }
 
   function maybePermissionDenied(evt) {
     if (provider !== "claude-cli" || !evt) return false;
@@ -101,8 +123,24 @@ async function executeProviderText({
         if (streamOutput) process.stdout.write(evt.data.text);
         return;
       }
+      if (evt.type === "run.stderr.chunk") {
+        const chunk = String(evt.data?.text || "");
+        if (!chunk) return;
+        if (streamOutput) process.stderr.write(chunk);
+        const lines = chunk
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (lines.length) stderrLines.push(...lines);
+        return;
+      }
+      if (evt.type === "run.usage") {
+        usageData = evt.data || null;
+        return;
+      }
       if (evt.type === "run.stderr.line") {
         const line = String(evt.data?.line || "").trim();
+        if (stdoutParseMode === "text") return;
         if (line) stderrLines.push(line);
       }
     },
@@ -142,12 +180,24 @@ async function executeProviderText({
     permissionDeniedCount,
   });
 
+  if (streamOutput) {
+    const durationMs = Date.now() - startedAt;
+    const exitCode = Number.isFinite(Number(result?.exit?.code))
+      ? Number(result.exit.code)
+      : "null";
+    const exitSignal = result?.exit?.signal || "-";
+    process.stdout.write(
+      `\n[provider][${nowIso()}] done provider=${provider} run_id=${result.runId} exit_code=${exitCode} signal=${exitSignal} duration_ms=${durationMs}${errorClass ? ` error=${errorClass}` : ""}\n`
+    );
+  }
+
   return {
     text,
     runId: result.runId,
     runDir: result.dir,
     exit: result.exit,
     error_class: errorClass,
+    usage: usageData,
   };
 }
 

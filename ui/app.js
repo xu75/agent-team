@@ -204,6 +204,29 @@ function fmtCost(v) {
   return `$${v.toFixed(4)}`;
 }
 
+function fmtDuration(ms) {
+  if (!Number.isFinite(ms)) return null;
+  const totalMs = Math.max(0, Math.round(Number(ms)));
+  if (totalMs < 1000) return `${totalMs}ms`;
+
+  if (totalMs < 60 * 1000) {
+    const sec = (totalMs / 1000).toFixed(1).replace(/\.0$/, "");
+    return `${sec}s`;
+  }
+
+  if (totalMs < 60 * 60 * 1000) {
+    const totalSec = Math.floor(totalMs / 1000);
+    const minutes = Math.floor(totalSec / 60);
+    const seconds = totalSec % 60;
+    return `${minutes}m${seconds}s`;
+  }
+
+  const totalMin = Math.floor(totalMs / (60 * 1000));
+  const hours = Math.floor(totalMin / 60);
+  const minutes = totalMin % 60;
+  return `${hours}h${minutes}m`;
+}
+
 function previewLine(t) {
   let raw = String(t?.last_preview || "").trim();
   if (!raw) return "暂无预览";
@@ -324,7 +347,7 @@ function metaLine(m) {
     parts.push(`in ${m.input_tokens ?? 0} · out ${m.output_tokens ?? 0}`);
   }
   if (fmtCost(m.cost_usd)) parts.push(fmtCost(m.cost_usd));
-  if (Number.isFinite(m.duration_ms)) parts.push(`${m.duration_ms}ms`);
+  if (Number.isFinite(m.duration_ms)) parts.push(fmtDuration(m.duration_ms));
   return parts.join(" · ");
 }
 
@@ -879,6 +902,9 @@ function chatMessageToPipelineFormat(m) {
   };
   if (m.provider) msg.provider = m.provider;
   if (m.model) msg.model = m.model;
+  if (Number.isFinite(m.input_tokens)) msg.input_tokens = m.input_tokens;
+  if (Number.isFinite(m.output_tokens)) msg.output_tokens = m.output_tokens;
+  if (Number.isFinite(m.cost_usd)) msg.cost_usd = m.cost_usd;
   if (Number.isFinite(m.duration_ms)) msg.duration_ms = m.duration_ms;
   return msg;
 }
@@ -2128,6 +2154,7 @@ async function sendChatMessageUI(message) {
     saveChatForCurrentTask();
     await refreshTasksList();
     await refreshSelectedSessionData({ preserveEvidence: true });
+    if (state.chatThreadId) await fetchThreadMode(state.chatThreadId);
     el.chatStream.scrollTop = el.chatStream.scrollHeight;
     setRunStatus("", false);
     showToast("猫猫已回复", "positive");

@@ -157,7 +157,7 @@ async function runReviewer({
     settingsFile,
     prompt,
     timeoutMs,
-    streamOutput: false,
+    streamOutput: true,
     eventMeta,
     abortSignal,
   });

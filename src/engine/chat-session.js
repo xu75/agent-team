@@ -3,7 +3,29 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { executeProviderText } = require("../providers/execute-provider");
-const { DEFAULT_MODE, isValidMode, buildModePrompt, WORKFLOW_NODES, buildWorkflowModeState } = require("../modes/mode-registry");
+const { runCoder } = require("../agents/coder");
+const { runReviewer } = require("../agents/reviewer");
+const { runTester } = require("../agents/tester");
+const { runTestCommands, DEFAULT_ALLOWED_PREFIXES } = require("./test-runner");
+const {
+  DEFAULT_MODE,
+  isValidMode,
+  buildModePrompt,
+  WORKFLOW_NODES,
+  buildWorkflowModeState,
+} = require("../modes/mode-registry");
+
+const WORKFLOW_ROLE_TO_STAGE = Object.freeze({
+  CoreDev: "coder",
+  Reviewer: "reviewer",
+  Tester: "tester",
+});
+
+function isProviderRunOk(result) {
+  const code = Number(result?.exit?.code);
+  const hasExitFailure = Number.isFinite(code) && code !== 0;
+  return !result?.error_class && !hasExitFailure;
+}
 
 /**
  * Chat Session Engine
@@ -133,7 +155,7 @@ function buildChatPrompt(cat, userMessage, history, peerCats) {
 // Chat message model
 // ---------------------------------------------------------------------------
 
-function createMessage({ sender, sender_type, cat_name, text, ts, provider, model, duration_ms }) {
+function createMessage({ sender, sender_type, cat_name, text, ts, provider, model, duration_ms, input_tokens, output_tokens, cost_usd }) {
   const msg = {
     id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
     sender: sender || "铲屎官",
@@ -145,6 +167,9 @@ function createMessage({ sender, sender_type, cat_name, text, ts, provider, mode
   if (provider) msg.provider = provider;
   if (model) msg.model = model;
   if (Number.isFinite(duration_ms)) msg.duration_ms = duration_ms;
+  if (Number.isFinite(input_tokens)) msg.input_tokens = input_tokens;
+  if (Number.isFinite(output_tokens)) msg.output_tokens = output_tokens;
+  if (Number.isFinite(cost_usd)) msg.cost_usd = cost_usd;
   return msg;
 }
 
@@ -301,51 +326,374 @@ async function sendChatMessage({
   // Build peer list (all cats except current target)
   const allCatEntries = Object.entries(cats).map(([name, c]) => ({ ...c, cat_name: name }));
 
-  // Send to each target cat (parallel if multiple)
-  const responses = await Promise.all(
-    effectiveTargets.map(async (cat) => {
-      const { provider, model, settingsFile } = resolveProviderForCat(cat, models);
-      const peerCats = allCatEntries.filter((c) => c.cat_name !== cat.cat_name);
-      const prompt = buildModePrompt(mode, cat, cleanText || userText, history, peerCats, modeState);
+  async function runSingleCat(cat, promptModeState, extraMeta = {}) {
+    const { provider, model, settingsFile } = resolveProviderForCat(cat, models);
+    const peerCats = allCatEntries.filter((c) => c.cat_name !== cat.cat_name);
+    const prompt = buildModePrompt(mode, cat, cleanText || userText, history, peerCats, promptModeState);
+    const catLabel = cat.display_name || cat.cat_name;
+    const nodeLabel = extraMeta.workflow_node ? ` node=${extraMeta.workflow_node}` : "";
+    process.stdout.write(`\n[chat] start thread=${threadId} cat=${catLabel}${nodeLabel}\n`);
 
-      const t0 = Date.now();
-      const result = await executeProviderText({
-        provider,
-        model,
-        settingsFile,
-        prompt,
-        timeoutMs,
-        streamOutput: false,
-        eventMeta: { cat_name: cat.cat_name, mode: "chat" },
-        abortSignal,
-      });
-      const durationMs = Date.now() - t0;
+    const t0 = Date.now();
+    const result = await executeProviderText({
+      provider,
+      model,
+      settingsFile,
+      prompt,
+      timeoutMs,
+      streamOutput: true,
+      eventMeta: { cat_name: cat.cat_name, mode: "chat", ...extraMeta },
+      abortSignal,
+    });
+    const durationMs = Date.now() - t0;
+    process.stdout.write(`\n[chat] done thread=${threadId} cat=${catLabel}${nodeLabel} duration_ms=${durationMs}\n`);
 
+    const usageData = result.usage || {};
+    const catMsg = createMessage({
+      sender: cat.display_name || cat.cat_name,
+      sender_type: "cat",
+      cat_name: cat.cat_name,
+      text: result.text || "(无回复)",
+      provider,
+      model,
+      duration_ms: usageData.duration_ms ?? durationMs,
+      input_tokens: usageData.usage?.input_tokens ?? null,
+      output_tokens: usageData.usage?.output_tokens ?? null,
+      cost_usd: usageData.total_cost_usd ?? null,
+    });
+    appendMessage(logsRoot, threadId, catMsg);
+    history.push(catMsg);
+
+    return {
+      cat_name: cat.cat_name,
+      display_name: cat.display_name,
+      avatar: cat.avatar,
+      color: cat.color,
+      message: catMsg,
+      run_id: result.runId,
+      run_dir: result.runDir,
+      exit: result.exit,
+      error_class: result.error_class || null,
+    };
+  }
+
+  if (mode === "workflow") {
+    let workingState = modeState && typeof modeState === "object" ? { ...modeState } : {};
+    if (!workingState.role_map || typeof workingState.role_map !== "object") {
+      workingState = buildWorkflowModeState(roleConfig);
+    }
+    const maxRounds = Number.isFinite(workingState.max_rounds)
+      ? Math.max(1, Math.floor(workingState.max_rounds))
+      : 3;
+    let mustFix = Array.isArray(workingState.must_fix) ? [...workingState.must_fix] : [];
+    let finalOutcome = "max_rounds_reached";
+    let executedRounds = 0;
+    const catNames = Object.keys(cats);
+    const responses = [];
+    const stageToRole = {
+      coder: "CoreDev",
+      reviewer: "Reviewer",
+      tester: "Tester",
+    };
+
+    function pickCatForRole(roleTitle) {
+      const roleMap = workingState.role_map || {};
+      const catName = catNames.find((n) => roleMap[n] === roleTitle);
+      if (catName && cats[catName]) return { ...cats[catName], cat_name: catName };
+      if (catNames[0] && cats[catNames[0]]) return { ...cats[catNames[0]], cat_name: catNames[0] };
+      return null;
+    }
+
+    function roleProfileForStage(stage, cat) {
+      const p = roleConfig?.role_profiles?.[stage] || {};
+      const displayName = p.display_name || cat?.display_name || cat?.cat_name || stage;
+      const roleTitle = p.role_title || stageToRole[stage] || stage;
+      const nickname = p.nickname || cat?.nickname || displayName;
+      return {
+        display_name: String(displayName),
+        role_title: String(roleTitle),
+        nickname: String(nickname),
+      };
+    }
+
+    function peerProfilesForStage(stage) {
+      const out = {};
+      for (const key of ["coder", "reviewer", "tester"]) {
+        if (key === stage) continue;
+        const cat = pickCatForRole(stageToRole[key]);
+        out[key] = roleProfileForStage(key, cat);
+      }
+      return out;
+    }
+
+    function appendWorkflowMessage(cat, roleStage, text, provider, model, durationMs, meta = {}) {
+      const usageData = meta.usage || {};
       const catMsg = createMessage({
         sender: cat.display_name || cat.cat_name,
         sender_type: "cat",
         cat_name: cat.cat_name,
-        text: result.text || "(无回复)",
+        text: text || "(无回复)",
         provider,
         model,
-        duration_ms: durationMs,
+        duration_ms: usageData.duration_ms ?? durationMs,
+        input_tokens: usageData.usage?.input_tokens ?? null,
+        output_tokens: usageData.usage?.output_tokens ?? null,
+        cost_usd: usageData.total_cost_usd ?? null,
       });
       appendMessage(logsRoot, threadId, catMsg);
-
-      return {
+      history.push(catMsg);
+      const payload = {
         cat_name: cat.cat_name,
         display_name: cat.display_name,
         avatar: cat.avatar,
         color: cat.color,
         message: catMsg,
-        run_id: result.runId,
-        run_dir: result.runDir,
-        exit: result.exit,
-        error_class: result.error_class || null,
+        role_stage: roleStage,
       };
-    })
-  );
+      Object.assign(payload, meta);
+      responses.push(payload);
+      return catMsg;
+    }
 
+    const userMessages = history
+      .filter((m) => m && m.sender_type === "user")
+      .map((m) => String(m.text || "").trim())
+      .filter(Boolean);
+    const taskPrompt = (() => {
+      if (!userMessages.length) return cleanText || userText;
+      const first = userMessages[0];
+      if (userMessages.length === 1) return first;
+      const lines = [first, "", "Follow-up messages from operator (chronological):"];
+      userMessages.slice(1).forEach((m, idx) => {
+        lines.push(`${idx + 1}. ${m}`);
+      });
+      return lines.join("\n");
+    })();
+
+    for (let round = 1; round <= maxRounds; round += 1) {
+      executedRounds = round;
+      const coderCat = pickCatForRole("CoreDev");
+      const reviewerCat = pickCatForRole("Reviewer");
+      const testerCat = pickCatForRole("Tester");
+      if (!coderCat || !reviewerCat || !testerCat) break;
+
+      workingState.current_node = "coder";
+      process.stdout.write(`\n[workflow] round=${round} node=coder cat=${coderCat.display_name || coderCat.cat_name} start\n`);
+      const coderProvider = resolveProviderForCat(coderCat, models);
+      const coderStart = Date.now();
+      const coder = await runCoder({
+        provider: coderProvider.provider,
+        model: coderProvider.model,
+        settingsFile: coderProvider.settingsFile,
+        roleProfile: roleProfileForStage("coder", coderCat),
+        peerProfiles: peerProfilesForStage("coder"),
+        taskPrompt,
+        mustFix,
+        mode: "implementation",
+        timeoutMs,
+        eventMeta: {
+          cat_name: coderCat.cat_name,
+          mode: "chat",
+          workflow_node: "coder",
+          workflow_round: round,
+        },
+        abortSignal,
+      });
+      const coderDuration = Date.now() - coderStart;
+      process.stdout.write(`\n[workflow] round=${round} node=coder done duration_ms=${coderDuration}\n`);
+      appendWorkflowMessage(
+        coderCat,
+        "coder",
+        coder.text,
+        coderProvider.provider,
+        coderProvider.model,
+        coderDuration,
+        {
+          run_id: coder.runId,
+          run_dir: coder.runDir,
+          exit: coder.exit,
+          error_class: coder.error_class || null,
+          usage: coder.usage,
+        }
+      );
+      if (!isProviderRunOk(coder) || !String(coder.text || "").trim()) {
+        finalOutcome = coder.error_class || "coder_runtime_error";
+        mustFix = [`Coder failed: ${finalOutcome}`];
+        break;
+      }
+
+      workingState.current_node = "reviewer";
+      process.stdout.write(`\n[workflow] round=${round} node=reviewer cat=${reviewerCat.display_name || reviewerCat.cat_name} start\n`);
+      const reviewerProvider = resolveProviderForCat(reviewerCat, models);
+      const reviewerStart = Date.now();
+      const reviewer = await runReviewer({
+        provider: reviewerProvider.provider,
+        model: reviewerProvider.model,
+        settingsFile: reviewerProvider.settingsFile,
+        roleProfile: roleProfileForStage("reviewer", reviewerCat),
+        peerProfiles: peerProfilesForStage("reviewer"),
+        taskPrompt,
+        coderOutput: coder.text,
+        timeoutMs,
+        eventMeta: {
+          cat_name: reviewerCat.cat_name,
+          mode: "chat",
+          workflow_node: "reviewer",
+          workflow_round: round,
+        },
+        abortSignal,
+      });
+      const reviewerDuration = Date.now() - reviewerStart;
+      process.stdout.write(`\n[workflow] round=${round} node=reviewer done duration_ms=${reviewerDuration}\n`);
+      appendWorkflowMessage(
+        reviewerCat,
+        "reviewer",
+        reviewer.text,
+        reviewerProvider.provider,
+        reviewerProvider.model,
+        reviewerDuration,
+        {
+          run_id: reviewer.runId,
+          run_dir: reviewer.runDir,
+          exit: reviewer.exit,
+          error_class: reviewer.error_class || null,
+          usage: reviewer.usage,
+        }
+      );
+
+      if (!reviewer.ok) {
+        finalOutcome = reviewer.error_class || "review_schema_invalid";
+        mustFix = Array.isArray(reviewer.review?.must_fix) && reviewer.review.must_fix.length
+          ? reviewer.review.must_fix
+          : ["Reviewer output schema invalid"];
+        break;
+      }
+
+      if (reviewer.review?.decision !== "approve") {
+        mustFix = Array.isArray(reviewer.review?.must_fix) ? reviewer.review.must_fix : ["Reviewer requested changes"];
+        finalOutcome = "review_changes_requested";
+        continue;
+      }
+
+      workingState.current_node = "tester";
+      process.stdout.write(`\n[workflow] round=${round} node=tester cat=${testerCat.display_name || testerCat.cat_name} start\n`);
+      const testerProvider = resolveProviderForCat(testerCat, models);
+      const testerStart = Date.now();
+      const tester = await runTester({
+        provider: testerProvider.provider,
+        model: testerProvider.model,
+        settingsFile: testerProvider.settingsFile,
+        roleProfile: roleProfileForStage("tester", testerCat),
+        peerProfiles: peerProfilesForStage("tester"),
+        taskPrompt,
+        coderOutput: coder.text,
+        timeoutMs,
+        eventMeta: {
+          cat_name: testerCat.cat_name,
+          mode: "chat",
+          workflow_node: "tester",
+          workflow_round: round,
+        },
+        abortSignal,
+      });
+      const testerDuration = Date.now() - testerStart;
+      process.stdout.write(`\n[workflow] round=${round} node=tester done duration_ms=${testerDuration}\n`);
+      appendWorkflowMessage(
+        testerCat,
+        "tester",
+        tester.text,
+        testerProvider.provider,
+        testerProvider.model,
+        testerDuration,
+        {
+          run_id: tester.runId,
+          run_dir: tester.runDir,
+          exit: tester.exit,
+          error_class: tester.error_class || null,
+          usage: tester.usage,
+        }
+      );
+
+      if (!tester.ok) {
+        if (tester.error_class) {
+          finalOutcome = tester.error_class;
+          mustFix = [`Tester provider error: ${tester.error_class}`];
+          break;
+        }
+        finalOutcome = "tester_schema_invalid";
+        mustFix = ["Tester output schema invalid"];
+        continue;
+      }
+
+      const commands = Array.isArray(tester.test_spec?.commands) ? tester.test_spec.commands : [];
+      process.stdout.write(`\n[workflow] round=${round} run_tests commands=${commands.length}\n`);
+      const testRunStart = Date.now();
+      const testRun = await runTestCommands(commands, {
+        timeoutMs: 2 * 60 * 1000,
+        cwd: process.cwd(),
+        env: process.env,
+        allowedPrefixes: DEFAULT_ALLOWED_PREFIXES,
+        stopOnFailure: true,
+        abortSignal,
+      });
+      const testRunDuration = Date.now() - testRunStart;
+      const testSummary = [
+        "Test Runner:",
+        ...testRun.results.map((r) => {
+          const suffix = r.ok ? "PASS" : "FAIL";
+          return `- ${r.command}: ${suffix} (code=${r.code})`;
+        }),
+        `all_passed: ${testRun.allPassed}`,
+      ].join("\n");
+      appendWorkflowMessage(
+        testerCat,
+        "tester",
+        testSummary,
+        "local-test-runner",
+        null,
+        testRunDuration,
+        { test_results: testRun }
+      );
+
+      if (!testRun.allPassed) {
+        const failed = testRun.results.find((r) => !r.ok);
+        const stderrSnippet = String(failed?.stderr || "").trim().slice(0, 500);
+        mustFix = [
+          "Tests failed in tester stage",
+          failed ? `Failed command: ${failed.command}` : "Unknown test failure",
+          stderrSnippet ? `Error output: ${stderrSnippet}` : "",
+        ].filter(Boolean);
+        finalOutcome = "test_failed";
+        continue;
+      }
+
+      finalOutcome = "approved";
+      mustFix = [];
+      break;
+    }
+
+    workingState = {
+      ...workingState,
+      current_node: "coder",
+      completed_nodes: finalOutcome === "approved" ? WORKFLOW_NODES.map((n) => n.id) : [],
+      finished: finalOutcome === "approved",
+      max_rounds: maxRounds,
+      last_outcome: finalOutcome,
+      must_fix: mustFix,
+      last_run_rounds: executedRounds,
+      updated_at: Date.now(),
+    };
+
+    const persisted = updateThreadMode(logsRoot, threadId, "workflow", workingState, roleConfig);
+    return {
+      user_message: userMsg,
+      responses,
+      workflow_state: persisted?.mode_state || workingState,
+    };
+  }
+
+  // Send to selected cat targets in parallel for non-workflow modes.
+  const responses = await Promise.all(effectiveTargets.map((cat) => runSingleCat(cat, modeState)));
   return { user_message: userMsg, responses };
 }
 

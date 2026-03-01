@@ -929,6 +929,9 @@ function convertThreadMessage(m) {
   };
   if (m?.provider) out.provider = m.provider;
   if (m?.model) out.model = m.model;
+  if (Number.isFinite(m?.input_tokens)) out.input_tokens = m.input_tokens;
+  if (Number.isFinite(m?.output_tokens)) out.output_tokens = m.output_tokens;
+  if (Number.isFinite(m?.cost_usd)) out.cost_usd = m.cost_usd;
   if (Number.isFinite(m?.duration_ms)) out.duration_ms = m.duration_ms;
   return out;
 }

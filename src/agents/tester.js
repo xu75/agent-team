@@ -137,7 +137,7 @@ async function runTester({
     settingsFile,
     prompt,
     timeoutMs,
-    streamOutput: false,
+    streamOutput: true,
     eventMeta,
     abortSignal,
   });

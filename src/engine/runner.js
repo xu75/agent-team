@@ -122,6 +122,25 @@ async function runCommandStreaming({
     crlfDelay: Infinity,
   });
 
+  if (stdoutParseMode === "text") {
+    // Some text providers (e.g. codex/gemini) stream chunks without newline.
+    // Emit assistant.text directly on stdout chunks for real-time output.
+    child.stdout.on("data", (buf) => {
+      markActivity();
+      const chunk = buf.toString("utf8");
+      if (!chunk) return;
+      emit("assistant.text", { text: chunk });
+    });
+    // Text providers often print progress and warnings to stderr (including \r updates).
+    // Emit raw chunks so caller can mirror terminal activity in real-time.
+    child.stderr.on("data", (buf) => {
+      markActivity();
+      const chunk = buf.toString("utf8");
+      if (!chunk) return;
+      emit("run.stderr.chunk", { text: chunk });
+    });
+  }
+
   rlOut.on("line", (line) => {
     markActivity();
 
@@ -129,7 +148,7 @@ async function runCommandStreaming({
     emit("run.stdout.line", { line });
 
     if (stdoutParseMode === "text") {
-      emit("assistant.text", { text: line + "\n" });
+      // In text mode we stream from raw stdout chunks above.
       return;
     }
 

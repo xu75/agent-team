@@ -16,13 +16,26 @@ function isAllowedCommand(command, allowedPrefixes = DEFAULT_ALLOWED_PREFIXES) {
   return allowedPrefixes.some((prefix) => c === prefix || c.startsWith(prefix + " "));
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function logTestDebug(message, streamOutput = true) {
+  if (!streamOutput) return;
+  process.stdout.write(`[test][${nowIso()}] ${message}\n`);
+}
+
 function runSingleCommand(command, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 5 * 60 * 1000;
   const cwd = options.cwd || process.cwd();
   const env = options.env || process.env;
   const abortSignal = options.abortSignal || null;
+  const streamOutput = options.streamOutput !== false;
 
   return new Promise((resolve) => {
+    const startedAt = Date.now();
+    logTestDebug(`start cmd=${JSON.stringify(command)} cwd=${cwd} timeout_ms=${timeoutMs}`, streamOutput);
+
     const child = spawn("sh", ["-lc", command], {
       cwd,
       env,
@@ -64,9 +77,11 @@ function runSingleCommand(command, options = {}) {
 
     child.stdout.on("data", (buf) => {
       stdout += buf.toString("utf8");
+      if (streamOutput) process.stdout.write(buf);
     });
     child.stderr.on("data", (buf) => {
       stderr += buf.toString("utf8");
+      if (streamOutput) process.stderr.write(buf);
     });
 
     child.on("close", (code, signal) => {
@@ -83,6 +98,11 @@ function runSingleCommand(command, options = {}) {
         stdout,
         stderr,
       });
+      const durationMs = Date.now() - startedAt;
+      logTestDebug(
+        `done cmd=${JSON.stringify(command)} ok=${code === 0 && !signal && !aborted} code=${code ?? 1} signal=${signal || (aborted ? "SIGTERM" : "-")} duration_ms=${durationMs}`,
+        streamOutput
+      );
     });
 
     child.on("error", (err) => {
@@ -99,6 +119,11 @@ function runSingleCommand(command, options = {}) {
         stdout,
         stderr: stderr + `\nspawn error: ${err.message}\n`,
       });
+      const durationMs = Date.now() - startedAt;
+      logTestDebug(
+        `done cmd=${JSON.stringify(command)} ok=false code=1 signal=- duration_ms=${durationMs} error=${JSON.stringify(err.message)}`,
+        streamOutput
+      );
     });
   });
 }
@@ -106,10 +131,12 @@ function runSingleCommand(command, options = {}) {
 async function runTestCommands(commands, options = {}) {
   const allowedPrefixes = options.allowedPrefixes || DEFAULT_ALLOWED_PREFIXES;
   const stopOnFailure = options.stopOnFailure !== false;
+  const streamOutput = options.streamOutput !== false;
   const results = [];
 
   for (const command of commands) {
     if (options.abortSignal?.aborted) {
+      logTestDebug(`abort before cmd=${JSON.stringify(command)}`, streamOutput);
       results.push({
         command,
         code: 1,
@@ -121,6 +148,10 @@ async function runTestCommands(commands, options = {}) {
       break;
     }
     if (!isAllowedCommand(command, allowedPrefixes)) {
+      logTestDebug(
+        `blocked cmd=${JSON.stringify(command)} reason=allowlist allowed=${JSON.stringify(allowedPrefixes)}`,
+        streamOutput
+      );
       results.push({
         command,
         code: 1,
@@ -133,12 +164,13 @@ async function runTestCommands(commands, options = {}) {
       continue;
     }
 
-    const r = await runSingleCommand(command, options);
+    const r = await runSingleCommand(command, { ...options, streamOutput });
     results.push(r);
     if (stopOnFailure && !r.ok) break;
   }
 
   const allPassed = results.every((r) => r.ok);
+  logTestDebug(`summary total=${results.length} all_passed=${allPassed}`, streamOutput);
   return { allPassed, results };
 }
 
