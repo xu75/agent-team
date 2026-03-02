@@ -8,6 +8,7 @@
     "run:claude": "node scripts/run-claude.js",
     "run:codex": "node scripts/run-codex.js",
     "ui": "node scripts/ui-server.js",
+    "rebuild:thread-index": "node scripts/rebuild-thread-index.js",
     "test": "node tests/delete-task.test.js"
   }
 }

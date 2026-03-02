@@ -48,6 +48,11 @@ const state = {
     items: [],
     activeIndex: 0,
   },
+  // ---- Project management ----
+  projects: [],
+  currentProjectId: null,    // null = 全部, string = 过滤到指定项目
+  defaultProjectId: null,
+  projectDropdownOpen: false,
 };
 
 const el = {
@@ -88,6 +93,12 @@ const el = {
   evidenceViewer: document.getElementById("evidenceViewer"),
   mustFixList: document.getElementById("mustFixList"),
   mentionSuggest: document.getElementById("mentionSuggest"),
+  projectSelectorBtn: document.getElementById("projectSelectorBtn"),
+  projectSelectorName: document.getElementById("projectSelectorName"),
+  projectDropdown: document.getElementById("projectDropdown"),
+  newProjectBtn: document.getElementById("newProjectBtn"),
+  archiveProjectBtn: document.getElementById("archiveProjectBtn"),
+  deleteProjectBtn: document.getElementById("deleteProjectBtn"),
   modeSelectorWrap: document.getElementById("modeSelectorWrap"),
   modeSelectorBtn: document.getElementById("modeSelectorBtn"),
   modeSelectorIcon: document.getElementById("modeSelectorIcon"),
@@ -147,27 +158,54 @@ const DEFAULT_STAGE_DUTY = {
 
 const ROLE_DUTY_OPTIONS = ["CoreDev", "Reviewer", "Tester"];
 
+async function requestJson(url, options = {}) {
+  const init = { ...options };
+  const headers = { ...(options.headers || {}) };
+  if (init.body !== undefined && init.body !== null) {
+    if (!headers["Content-Type"]) headers["Content-Type"] = "application/json";
+    if (typeof init.body !== "string") init.body = JSON.stringify(init.body);
+  }
+  init.headers = headers;
+
+  const res = await fetch(url, init);
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch {}
+
+  if (!res.ok) {
+    const err = new Error(payload?.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    err.code = payload?.code || null;
+    err.payload = payload || null;
+    throw err;
+  }
+  return payload || {};
+}
+
 async function getJson(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  return requestJson(url);
 }
 
 async function postJson(url, body) {
-  const res = await fetch(url, {
+  return requestJson(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
+    body: body || {},
   });
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const j = await res.json();
-      if (j?.error) msg = j.error;
-    } catch {}
-    throw new Error(msg);
-  }
-  return res.json();
+}
+
+async function patchJson(url, body) {
+  return requestJson(url, {
+    method: "PATCH",
+    body: body || {},
+  });
+}
+
+async function deleteJson(url, body) {
+  return requestJson(url, {
+    method: "DELETE",
+    body: body || {},
+  });
 }
 
 function toneFromOutcome(v) {
@@ -694,6 +732,7 @@ function setRunStatus(text = "", running = false) {
 function updateActionAvailability() {
   const hasTask = !!state.selectedTaskId;
   const busy = !!state.busy;
+  const currentThread = state.projects.find((p) => p.project_id === state.currentProjectId) || null;
   const canCancelTask = !!state.selectedTaskId && state.runningTaskId === state.selectedTaskId;
   const canCancelChat = busy && state.chatBusy;
   const canCancel = canCancelTask || canCancelChat;
@@ -708,6 +747,8 @@ function updateActionAvailability() {
   setDisabled(el.cancelRunBtn, !canCancel);
   setDisabled(el.moreActionsBtn, busy || !hasTask);
   setDisabled(el.saveRolesBtn, busy);
+  setDisabled(el.archiveProjectBtn, busy || !currentThread || !!currentThread.archived);
+  setDisabled(el.deleteProjectBtn, busy || !currentThread);
 }
 
 function setBusy(v) {
@@ -989,6 +1030,21 @@ function applyLiveSnapshot(taskId, live) {
   }
   if (hasTerminalTransition) {
     refreshTaskLive(taskId, { includeLive: false }).catch(() => {});
+  }
+
+  if (!live.running && String(state.runningTaskId || "") === String(taskId)) {
+    const finishedTitle = taskTitleLine(state.tasks.find((t) => t.task_id === taskId)) || taskId;
+    const outcome = String(state.detail?.summary?.final_outcome || live?.status || "").toLowerCase();
+    state.runningTaskId = null;
+    if (outcome === "canceled") {
+      setRunStatus(`已终止：${finishedTitle}`, false);
+    } else if (outcome && outcome !== "idle") {
+      setRunStatus(`已完成：${finishedTitle} (${outcome})`, false);
+    } else {
+      setRunStatus(`已完成：${finishedTitle}`, false);
+    }
+    updateActionAvailability();
+    loadTasks().catch(() => {});
   }
 
   if (!live.running && state.liveStreamTaskId && String(state.liveStreamTaskId) === String(taskId)) {
@@ -1675,7 +1731,10 @@ function renderEmptyScreen() {
 }
 
 async function loadTasks() {
-  const data = await getJson("/api/tasks");
+  const url = state.currentProjectId
+    ? `/api/tasks?thread_id=${encodeURIComponent(state.currentProjectId)}`
+    : "/api/tasks";
+  const data = await getJson(url);
   state.tasks = data.tasks || [];
   applyFilter();
   if (state.filtered.length) {
@@ -1691,6 +1750,191 @@ async function loadTasks() {
     state.liveData = null;
     state.liveDigest = "";
     renderEmptyScreen();
+  }
+}
+
+/* ---- Thread management (was: Project management) ---- */
+
+async function loadProjects() {
+  const data = await getJson("/api/threads");
+  // Map thread fields to project fields for UI compatibility
+  state.projects = (data.threads || []).map((t) => ({
+    project_id: t.thread_id,
+    project_name: t.name,
+    description: t.description,
+    created_at: t.created_at,
+    updated_at: t.updated_at,
+    archived: t.archived,
+    session_count: t.session_count || 0,
+  }));
+  state.defaultProjectId = data.default_thread_id || null;
+  if (!state.currentProjectId && state.defaultProjectId) {
+    state.currentProjectId = state.defaultProjectId;
+  }
+  renderProjectSelector();
+}
+
+function renderProjectSelector() {
+  const current = state.projects.find((p) => p.project_id === state.currentProjectId);
+  el.projectSelectorName.textContent = current ? current.project_name : "全部 Thread";
+  updateActionAvailability();
+}
+
+function renderProjectDropdown() {
+  const dd = el.projectDropdown;
+  dd.innerHTML = "";
+
+  // "全部" option
+  const allItem = document.createElement("button");
+  allItem.className = `project-dropdown-item${!state.currentProjectId ? " active" : ""}`;
+  allItem.textContent = "📁 全部 Thread";
+  allItem.addEventListener("click", () => switchProject(null));
+  dd.appendChild(allItem);
+
+  // Separator
+  const sep = document.createElement("div");
+  sep.className = "project-dropdown-sep";
+  dd.appendChild(sep);
+
+  // Thread items
+  for (const p of state.projects) {
+    const item = document.createElement("button");
+    const isActive = state.currentProjectId === p.project_id;
+    const isDefault = p.project_id === state.defaultProjectId;
+    item.className = `project-dropdown-item${isActive ? " active" : ""}`;
+    const sessionInfo = p.session_count ? ` <small>(${p.session_count})</small>` : "";
+    item.innerHTML = `
+      <span class="project-item-name">${escapeHtml(p.project_name)}${isDefault ? " <small>(默认)</small>" : ""}${sessionInfo}</span>
+      ${p.archived ? '<span class="project-archived-tag">已归档</span>' : ""}
+    `;
+    item.addEventListener("click", () => switchProject(p.project_id));
+    dd.appendChild(item);
+  }
+}
+
+function toggleProjectDropdown() {
+  state.projectDropdownOpen = !state.projectDropdownOpen;
+  el.projectDropdown.setAttribute("aria-hidden", String(!state.projectDropdownOpen));
+  if (state.projectDropdownOpen) renderProjectDropdown();
+}
+
+async function switchProject(projectId) {
+  state.currentProjectId = projectId;
+  state.projectDropdownOpen = false;
+  el.projectDropdown.setAttribute("aria-hidden", "true");
+  renderProjectSelector();
+  await loadTasks();
+}
+
+async function createNewProject() {
+  const name = prompt("输入新 Thread 名称:");
+  if (!name || !name.trim()) return;
+  const slug = name.trim().toLowerCase().replace(/\s+/g, "-");
+  try {
+    const res = await postJson("/api/threads", {
+      slug,
+      name: name.trim(),
+    });
+    showToast(`Thread "${name.trim()}" 已创建`, "positive");
+    await loadProjects();
+    await switchProject(res.thread.thread_id);
+  } catch (err) {
+    showToast(`创建失败：${err.message}`, "negative");
+  }
+}
+
+function collectThreadAudit(actionLabel, threadName) {
+  const operator = prompt(`${actionLabel}操作人(operator):`, "银渐层");
+  if (operator === null) return null;
+  const reason = prompt(`${actionLabel}原因(reason):`, `operate:${threadName}`);
+  if (reason === null) return null;
+  return {
+    operator: String(operator).trim(),
+    reason: String(reason).trim(),
+  };
+}
+
+function formatThreadActionError(actionLabel, err) {
+  if (err?.status === 422) return `${actionLabel}失败：缺少审计字段（operator/reason）。`;
+  if (err?.status === 409) {
+    return actionLabel.includes("硬删除")
+      ? `${actionLabel}失败：请先归档再执行硬删除。`
+      : `${actionLabel}失败：资源状态冲突。`;
+  }
+  if (err?.status === 404) return `${actionLabel}失败：Thread 不存在或已被删除。`;
+  return `${actionLabel}失败：${err?.message || "未知错误"}`;
+}
+
+async function archiveCurrentProject() {
+  const threadId = String(state.currentProjectId || "").trim();
+  if (!threadId) {
+    showToast("请先选择一个 Thread", "warning");
+    return;
+  }
+  const thread = state.projects.find((p) => p.project_id === threadId);
+  if (!thread) {
+    showToast("当前 Thread 不存在", "negative");
+    return;
+  }
+  if (thread.archived) {
+    showToast("当前 Thread 已归档", "warning");
+    return;
+  }
+  const audit = collectThreadAudit("归档", thread.project_name || threadId);
+  if (!audit) return;
+  try {
+    setBusy(true);
+    await patchJson(`/api/threads/${encodeURIComponent(threadId)}`, {
+      archived: true,
+      operator: audit.operator,
+      reason: audit.reason,
+    });
+    showToast(`Thread "${thread.project_name || threadId}" 已归档`, "positive");
+    await loadProjects();
+    await loadTasks();
+  } catch (err) {
+    showToast(formatThreadActionError("归档", err), "negative");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function hardDeleteCurrentProject() {
+  const threadId = String(state.currentProjectId || "").trim();
+  if (!threadId) {
+    showToast("请先选择一个 Thread", "warning");
+    return;
+  }
+  const thread = state.projects.find((p) => p.project_id === threadId);
+  const threadName = thread?.project_name || threadId;
+  if (!thread) {
+    showToast("当前 Thread 不存在", "negative");
+    return;
+  }
+  if (threadId === state.defaultProjectId) {
+    showToast("默认 Thread 不支持硬删除", "warning");
+    return;
+  }
+  const confirmed = confirm(`确定硬删除 Thread "${threadName}" 吗？\n\n该操作不可撤销。`);
+  if (!confirmed) return;
+  const audit = collectThreadAudit("硬删除", threadName);
+  if (!audit) return;
+  try {
+    setBusy(true);
+    await deleteJson(`/api/threads/${encodeURIComponent(threadId)}`, {
+      operator: audit.operator,
+      reason: audit.reason,
+    });
+    if (state.currentProjectId === threadId) {
+      state.currentProjectId = state.defaultProjectId || null;
+    }
+    showToast(`Thread "${threadName}" 已硬删除`, "positive");
+    await loadProjects();
+    await loadTasks();
+  } catch (err) {
+    showToast(formatThreadActionError("硬删除", err), "negative");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -1839,7 +2083,7 @@ async function refreshSelectedSessionData(opts = {}) {
 async function runNewTaskFromCommand({ prompt, provider, rounds }) {
   try {
     setBusy(true);
-    setRunStatus("正在运行任务...", true);
+    setRunStatus("正在启动任务...", true);
     const effectiveProvider = resolvedProvider(provider);
     const maxIterations = resolvedRounds(rounds);
     const res = await postJson("/api/tasks/run", {
@@ -1847,13 +2091,26 @@ async function runNewTaskFromCommand({ prompt, provider, rounds }) {
       provider: effectiveProvider,
       maxIterations,
       role_config: state.roleConfig || DEFAULT_ROLE_CONFIG,
+      thread_slug: state.currentProjectId || undefined,
+      project_id: state.currentProjectId || undefined,
     });
+    const taskId = String(res?.task_id || "").trim();
     el.chatCommandInput.value = "";
     await loadTasks();
-    const newTitle = taskTitleLine(state.tasks.find((t) => t.task_id === res.task_id));
-    showToast(`任务已完成：${newTitle}`, "positive");
-    setRunStatus(`完成：${newTitle}`, false);
-    if (res.task_id) await selectTask(res.task_id);
+    if (taskId) {
+      state.runningTaskId = taskId;
+      try {
+        await selectTask(taskId);
+      } catch {}
+      startLivePolling(taskId);
+      const newTitle = taskTitleLine(state.tasks.find((t) => t.task_id === taskId)) || taskId;
+      const startText = String(res?.message || `任务已启动：${newTitle}`);
+      showToast(startText, "positive");
+      setRunStatus(startText, true);
+    } else {
+      showToast("任务已启动", "positive");
+      setRunStatus("任务已启动", true);
+    }
   } catch (err) {
     setRunStatus(`运行失败：${err.message}`, false);
     showToast(`运行失败：${err.message}`, "negative");
@@ -2076,11 +2333,13 @@ function adoptThreadSession(threadId) {
 
 async function ensureChatSession(initialMessage = "", preferredMode = state.currentMode) {
   if (state.chatThreadId) return { threadId: state.chatThreadId, created: false };
-  const created = await postJson("/api/threads", {
+  const threadSlug = state.currentProjectId || undefined;
+  const apiUrl = threadSlug ? `/api/threads/${encodeURIComponent(threadSlug)}/sessions` : "/api/chat";
+  const created = await postJson(apiUrl, {
     title: buildThreadTitleFromMessage(initialMessage),
     mode: preferredMode,
   });
-  const threadId = created?.thread?.thread_id;
+  const threadId = created?.session?.thread_id || created?.thread?.thread_id;
   if (!threadId) throw new Error("创建对话失败：未返回 thread_id");
   adoptThreadSession(threadId);
   safeSetCurrentMode(created?.thread?.mode || preferredMode || state.currentMode);
@@ -2334,6 +2593,8 @@ async function sendChatMessageUI(message) {
       thread_id: state.chatThreadId || undefined,
       role_config: state.roleConfig || undefined,
       mode: state.currentMode || undefined,
+      thread_slug: state.currentProjectId || undefined,
+      project_id: state.currentProjectId || undefined,
     };
 
     const res = await postJson("/api/chat", body);
@@ -3216,6 +3477,20 @@ async function deleteConversation(taskId) {
 el.taskSearch.addEventListener("input", applyFilter);
 if (el.newChatBtn) el.newChatBtn.addEventListener("click", () => startNewConversation());
 
+// Project selector events
+if (el.projectSelectorBtn) el.projectSelectorBtn.addEventListener("click", toggleProjectDropdown);
+if (el.newProjectBtn) el.newProjectBtn.addEventListener("click", createNewProject);
+if (el.archiveProjectBtn) el.archiveProjectBtn.addEventListener("click", archiveCurrentProject);
+if (el.deleteProjectBtn) el.deleteProjectBtn.addEventListener("click", hardDeleteCurrentProject);
+document.addEventListener("click", (e) => {
+  if (state.projectDropdownOpen &&
+      !el.projectSelectorBtn?.contains(e.target) &&
+      !el.projectDropdown?.contains(e.target)) {
+    state.projectDropdownOpen = false;
+    el.projectDropdown?.setAttribute("aria-hidden", "true");
+  }
+});
+
 // 草稿自动保存：输入时保存
 el.chatCommandInput.addEventListener("input", () => {
   saveDraft(el.chatCommandInput.value);
@@ -3341,9 +3616,8 @@ try {
 } catch {
   setRightPanelCollapsed(false);
 }
-// 先加载角色配置和可用模式，再加载任务列表（任务加载会触发 selectTask → renderModeSelector，
-// 此时 availableModes 必须已就绪，否则下拉菜单为空）
-Promise.all([loadRoleConfig(), fetchAvailableModes()])
+// 先加载项目列表、角色配置和可用模式，再加载任务列表
+Promise.all([loadProjects(), loadRoleConfig(), fetchAvailableModes()])
   .then(() => loadTasks())
   .then(() => {
     renderModeSelector();

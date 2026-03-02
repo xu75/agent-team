@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const { runCoder } = require("./agents/coder");
 const { runReviewer } = require("./agents/reviewer");
@@ -97,6 +98,160 @@ function isProviderRunOk(result) {
   return !result?.error_class && !hasExitFailure;
 }
 
+function clipText(text, maxLen = 1200) {
+  const s = String(text || "").trim();
+  if (!s) return "";
+  if (s.length <= maxLen) return s;
+  return `${s.slice(0, Math.max(0, maxLen - 3))}...`;
+}
+
+function compactStringArray(list, maxItems = 8, maxItemLen = 220) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((x) => clipText(x, maxItemLen))
+    .filter(Boolean)
+    .slice(0, Math.max(1, maxItems));
+}
+
+function formatLocalDateTime(ts = Date.now()) {
+  const d = new Date(ts);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+}
+
+function writeWorkflowLog(title, fields = {}) {
+  const lines = [`[workflow] ${title}`, `  time: ${formatLocalDateTime()}`];
+  for (const [k, v] of Object.entries(fields || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    lines.push(`  ${k}: ${v}`);
+  }
+  process.stdout.write(`\n${lines.join("\n")}\n`);
+}
+
+function createDiscussionContractHash(contract) {
+  const base = JSON.stringify({
+    version: contract?.version || 1,
+    source_round: contract?.source_round || null,
+    goal: contract?.goal || "",
+    core_plan: contract?.core_plan || "",
+    reviewer_notes: contract?.reviewer_notes || "",
+    tester_notes: contract?.tester_notes || "",
+    acceptance_criteria: contract?.acceptance_criteria || [],
+    constraints: contract?.constraints || [],
+    must_fix: contract?.must_fix || [],
+    open_risks: contract?.open_risks || [],
+  });
+  return crypto.createHash("sha1").update(base).digest("hex").slice(0, 12);
+}
+
+function normalizeDiscussionContract(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const normalized = {
+    version: Number.isFinite(raw.version) ? Number(raw.version) : 1,
+    source_round: Number.isFinite(raw.source_round) ? Number(raw.source_round) : null,
+    goal: clipText(raw.goal, 1200),
+    core_plan: clipText(raw.core_plan, 2200),
+    reviewer_notes: clipText(raw.reviewer_notes, 1200),
+    tester_notes: clipText(raw.tester_notes, 1200),
+    acceptance_criteria: compactStringArray(raw.acceptance_criteria, 10, 220),
+    constraints: compactStringArray(raw.constraints, 10, 220),
+    must_fix: compactStringArray(raw.must_fix, 10, 240),
+    open_risks: compactStringArray(raw.open_risks, 10, 240),
+    updated_at: Number.isFinite(raw.updated_at) ? Number(raw.updated_at) : Date.now(),
+  };
+  if (
+    !normalized.goal &&
+    !normalized.core_plan &&
+    !normalized.reviewer_notes &&
+    !normalized.tester_notes &&
+    !normalized.must_fix.length
+  ) {
+    return null;
+  }
+  normalized.hash = raw.hash || createDiscussionContractHash(normalized);
+  return normalized;
+}
+
+function extractAcceptanceCriteria(text) {
+  const out = [];
+  for (const line of String(text || "").split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    if (/^(acceptance|criteria|验收|通过条件)/i.test(s) || /^[\-\*\d]+[.)]?\s+/.test(s)) {
+      out.push(s.replace(/^[\-\*\d]+[.)]?\s+/, ""));
+    }
+    if (out.length >= 10) break;
+  }
+  return compactStringArray(out, 10, 220);
+}
+
+function extractConstraints(taskPrompt) {
+  const out = [];
+  for (const line of String(taskPrompt || "").split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    if (/^(must|should|do not|don't|不能|不要|必须|禁止)/i.test(s)) out.push(s);
+    if (out.length >= 10) break;
+  }
+  return compactStringArray(out, 10, 220);
+}
+
+function buildDiscussionContract({
+  taskPrompt,
+  proposalText,
+  reviewerText,
+  testerText,
+  mustFix = [],
+  sourceRound = null,
+}) {
+  const normalized = normalizeDiscussionContract({
+    version: 1,
+    source_round: Number.isFinite(sourceRound) ? Number(sourceRound) : null,
+    goal: clipText(taskPrompt, 1200),
+    core_plan: clipText(proposalText, 2200),
+    reviewer_notes: clipText(reviewerText, 1200),
+    tester_notes: clipText(testerText, 1200),
+    acceptance_criteria: extractAcceptanceCriteria(`${reviewerText || ""}\n${testerText || ""}`),
+    constraints: extractConstraints(taskPrompt),
+    must_fix: compactStringArray(mustFix, 10, 240),
+    open_risks: compactStringArray([], 10, 240),
+    updated_at: Date.now(),
+  });
+  if (!normalized) return null;
+  normalized.hash = createDiscussionContractHash(normalized);
+  return normalized;
+}
+
+function buildFallbackDiscussionContract(taskDir, rounds, taskPrompt) {
+  const proposalRounds = Array.isArray(rounds)
+    ? rounds
+      .filter((r) => r && r.phase === "proposal" && Number.isFinite(r.round))
+      .map((r) => Number(r.round))
+      .sort((a, b) => a - b)
+    : [];
+  if (!proposalRounds.length) return null;
+  const sourceRound = proposalRounds[proposalRounds.length - 1];
+  const proposalDir = path.join(taskDir, "rounds", String(sourceRound).padStart(2, "0"));
+  if (!fs.existsSync(proposalDir)) return null;
+  const readText = (name) => {
+    const p = path.join(proposalDir, name);
+    if (!fs.existsSync(p)) return "";
+    return fs.readFileSync(p, "utf8");
+  };
+  return buildDiscussionContract({
+    taskPrompt,
+    proposalText: readText("coder_output.md"),
+    reviewerText: readText("reviewer_raw.md"),
+    testerText: readText("tester_raw.md"),
+    sourceRound,
+  });
+}
+
 async function runTask(taskPrompt, options = {}) {
   if (typeof taskPrompt !== "string" || !taskPrompt.trim()) {
     throw new Error("taskPrompt must be a non-empty string");
@@ -118,6 +273,9 @@ async function runTask(taskPrompt, options = {}) {
     ? options.allowedTestCommands
     : DEFAULT_ALLOWED_PREFIXES;
   const abortSignal = options.abortSignal || null;
+  const projectId = options.projectId || null;
+  const threadSlug = options.threadSlug || null;
+  const logsRoot = String(options.logsRoot || "logs");
   const liveHooks = options.liveHooks && typeof options.liveHooks === "object"
     ? options.liveHooks
     : null;
@@ -128,7 +286,7 @@ async function runTask(taskPrompt, options = {}) {
   const existingTaskDir = options.taskDir ? String(options.taskDir) : null;
   const created = appendToTask
     ? { taskId: existingTaskId, dir: existingTaskDir }
-    : createTaskLogDir("logs", options.taskId);
+    : createTaskLogDir(logsRoot, options.taskId, threadSlug);
   const { taskId, dir: taskDir } = created;
   if (!taskId || !taskDir) {
     throw new Error("appendToTask requires both taskId and taskDir");
@@ -148,10 +306,26 @@ async function runTask(taskPrompt, options = {}) {
 
   const rounds = priorSummary?.rounds ? [...priorSummary.rounds] : [];
   let mustFix = Array.isArray(priorSummary?.unresolved_must_fix) ? [...priorSummary.unresolved_must_fix] : [];
+  let discussionContract = normalizeDiscussionContract(priorSummary?.discussion_contract);
   let finalOutcome = priorSummary?.final_outcome || "max_iterations_reached";
   if (executionMode === "implementation") {
     // Never inherit proposal outcomes into implementation runs.
     finalOutcome = "max_iterations_reached";
+    if (!discussionContract) {
+      discussionContract = buildFallbackDiscussionContract(taskDir, rounds, taskPrompt);
+    }
+    writeWorkflowLog(
+      discussionContract ? "inherit_contract" : "inherit_contract_missing",
+      discussionContract
+        ? {
+          task_id: taskId,
+          source_round: discussionContract.source_round ?? "-",
+          contract_version: discussionContract.version,
+          contract_hash: discussionContract.hash,
+          must_fix_count: discussionContract.must_fix.length,
+        }
+        : { task_id: taskId }
+    );
   }
   let currentState = priorSummary?.final_status || null;
   const stateEvents = Array.isArray(priorSummary?.state_events) ? [...priorSummary.state_events] : [];
@@ -219,6 +393,16 @@ async function runTask(taskPrompt, options = {}) {
     }
   }
 
+  function classifyUnhandledError(err) {
+    const haystack = [err?.error_class, err?.code, err?.message]
+      .map((x) => String(x || "").toLowerCase())
+      .join(" ");
+    if (haystack.includes("provider_unsupported") || haystack.includes("unsupported provider")) {
+      return "provider_unsupported";
+    }
+    return "internal_error";
+  }
+
   function emitLiveAgentState(role, patch = {}) {
     if (!liveHooks || typeof liveHooks.onAgentState !== "function") return;
     try {
@@ -264,6 +448,7 @@ async function runTask(taskPrompt, options = {}) {
       peerProfiles: peersFor("coder"),
       taskPrompt,
       mustFix,
+      discussionContract,
       mode: "proposal",
       timeoutMs,
       abortSignal,
@@ -318,6 +503,7 @@ async function runTask(taskPrompt, options = {}) {
       peerProfiles: peersFor("reviewer"),
       taskPrompt,
       coderOutput: proposal.text,
+      discussionContract,
       mode: "discussion",
       timeoutMs,
       abortSignal,
@@ -360,6 +546,7 @@ async function runTask(taskPrompt, options = {}) {
       peerProfiles: peersFor("tester"),
       taskPrompt,
       coderOutput: proposal.text,
+      discussionContract,
       mode: "discussion",
       timeoutMs,
       abortSignal,
@@ -396,7 +583,7 @@ async function runTask(taskPrompt, options = {}) {
       phase: "proposal",
       coder: {
         run_id: proposal.runId,
-        exit_code: proposal.exit.code,
+        exit_code: proposal.exit?.code ?? null,
       },
       reviewer: {
         run_id: reviewer.runId,
@@ -413,6 +600,21 @@ async function runTask(taskPrompt, options = {}) {
         tests_passed: null,
       },
     });
+
+    discussionContract = buildDiscussionContract({
+      taskPrompt,
+      proposalText: proposal.text,
+      reviewerText: reviewer.text,
+      testerText: tester.text,
+      sourceRound: round,
+    }) || discussionContract;
+    if (discussionContract) {
+      writeWorkflowLog("proposal_contract_updated", {
+        task_id: taskId,
+        source_round: discussionContract.source_round ?? round,
+        contract_hash: discussionContract.hash,
+      });
+    }
 
     finalOutcome = "awaiting_operator_confirm";
     mustFix = [];
@@ -442,6 +644,7 @@ async function runTask(taskPrompt, options = {}) {
       peerProfiles: peersFor("coder"),
       taskPrompt,
       mustFix,
+      discussionContract,
       mode: "implementation",
       timeoutMs,
       abortSignal,
@@ -495,6 +698,7 @@ async function runTask(taskPrompt, options = {}) {
       peerProfiles: peersFor("reviewer"),
       taskPrompt,
       coderOutput: coder.text,
+      discussionContract,
       timeoutMs,
       abortSignal,
       eventMeta: {
@@ -523,26 +727,28 @@ async function runTask(taskPrompt, options = {}) {
         ? { state: "done", round }
         : { state: "error", round, error: reviewer.error_class || reviewer.parse_error || "review_invalid" }
     );
+    const reviewerDecision = reviewer.review?.decision || "changes_requested";
+    const reviewerMustFix = Array.isArray(reviewer.review?.must_fix) ? reviewer.review.must_fix : [];
 
     rounds.push({
       round,
       phase: "implementation",
       coder: {
         run_id: coder.runId,
-        exit_code: coder.exit.code,
+        exit_code: coder.exit?.code ?? null,
       },
       reviewer: {
         run_id: reviewer.runId,
         ok: reviewer.ok,
         parse_error: reviewer.parse_error,
-        decision: reviewer.review.decision,
-        must_fix_count: reviewer.review.must_fix.length,
+        decision: reviewerDecision,
+        must_fix_count: reviewerMustFix.length,
       },
     });
 
     if (!reviewer.ok) {
       finalOutcome = reviewer.error_class || "review_schema_invalid";
-      mustFix = reviewer.review.must_fix;
+      mustFix = reviewerMustFix;
       transition(FSM_STATES.FINALIZE, {
         round,
         reason: finalOutcome,
@@ -550,7 +756,7 @@ async function runTask(taskPrompt, options = {}) {
       break;
     }
 
-    if (reviewer.review.decision === "approve") {
+    if (reviewerDecision === "approve") {
       transition(FSM_STATES.TEST, { round, reason: "review_approved" });
 
       throwIfAborted();
@@ -563,6 +769,7 @@ async function runTask(taskPrompt, options = {}) {
         peerProfiles: peersFor("tester"),
         taskPrompt,
         coderOutput: coder.text,
+        discussionContract,
         timeoutMs,
         abortSignal,
         eventMeta: {
@@ -586,7 +793,7 @@ async function runTask(taskPrompt, options = {}) {
       });
       copyRunArtifacts(tester.runDir, roundPath, "tester");
 
-      const commands = tester.test_spec.commands || [];
+      const commands = Array.isArray(tester.test_spec?.commands) ? tester.test_spec.commands : [];
       throwIfAborted();
       emitLiveAgentState("tester", { state: "tool", round, test_commands: commands.length });
       const testRun = await runTestCommands(commands, {
@@ -707,7 +914,7 @@ async function runTask(taskPrompt, options = {}) {
       break;
     }
 
-    mustFix = reviewer.review.must_fix;
+    mustFix = reviewerMustFix;
     finalOutcome = "review_changes_requested";
     transition(FSM_STATES.ITERATE, {
       round,
@@ -724,7 +931,23 @@ async function runTask(taskPrompt, options = {}) {
         transition(FSM_STATES.FINALIZE, { reason: "aborted_by_operator" });
       }
     } else {
-      throw err;
+      const errorMessage = clipText(err?.message || String(err), 600);
+      finalOutcome = classifyUnhandledError(err);
+      mustFix = [`Unhandled workflow error: ${errorMessage}`];
+      writeWorkflowLog("unhandled_error", {
+        task_id: taskId,
+        outcome: finalOutcome,
+        message: errorMessage,
+      });
+      if (err?.stack) {
+        process.stderr.write(`[workflow] stack task=${taskId}\n${String(err.stack)}\n`);
+      }
+      if (currentState !== FSM_STATES.FINALIZE) {
+        transition(FSM_STATES.FINALIZE, {
+          reason: finalOutcome,
+          error_message: errorMessage,
+        });
+      }
     }
   }
 
@@ -740,6 +963,8 @@ async function runTask(taskPrompt, options = {}) {
   const summary = {
     task_id: taskId,
     task_dir: taskDir,
+    project_id: projectId || undefined,
+    thread_id: threadSlug || projectId || undefined,
     timeline_file: path.join(taskDir, "task-timeline.json"),
     provider,
     model: model || null,
@@ -775,6 +1000,9 @@ async function runTask(taskPrompt, options = {}) {
     state_events: stateEvents,
     rounds,
     unresolved_must_fix: mustFix,
+    discussion_contract: discussionContract || null,
+    discussion_contract_hash: discussionContract?.hash || null,
+    discussion_contract_source_round: discussionContract?.source_round ?? null,
   };
   const timeline = buildTimeline(taskId, stateEvents);
 

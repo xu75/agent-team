@@ -2,7 +2,34 @@
 
 const { executeProviderText } = require("../providers/execute-provider");
 
-function buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+function renderDiscussionContractLines(discussionContract) {
+  if (!discussionContract || typeof discussionContract !== "object") return [];
+  const lines = [];
+  lines.push("Confirmed roundtable contract (inherit this context):");
+  if (discussionContract.source_round !== null && discussionContract.source_round !== undefined) {
+    lines.push(`- Source round: ${discussionContract.source_round}`);
+  }
+  if (discussionContract.hash) lines.push(`- Contract hash: ${discussionContract.hash}`);
+  if (discussionContract.goal) lines.push(`- Goal: ${discussionContract.goal}`);
+  if (discussionContract.core_plan) lines.push(`- Core plan: ${discussionContract.core_plan}`);
+  if (Array.isArray(discussionContract.must_fix) && discussionContract.must_fix.length) {
+    lines.push("- Existing must-fix baseline:");
+    discussionContract.must_fix.forEach((item, idx) => lines.push(`  ${idx + 1}. ${item}`));
+  }
+  if (Array.isArray(discussionContract.acceptance_criteria) && discussionContract.acceptance_criteria.length) {
+    lines.push("- Acceptance criteria:");
+    discussionContract.acceptance_criteria.forEach((item, idx) => lines.push(`  ${idx + 1}. ${item}`));
+  }
+  return lines;
+}
+
+function buildReviewerPrompt({
+  taskPrompt,
+  coderOutput,
+  discussionContract = null,
+  roleProfile = {},
+  peerProfiles = {},
+}) {
   const meName = roleProfile.display_name || "Reviewer";
   const meTitle = roleProfile.role_title || "Reviewer";
   const coder = peerProfiles.coder || {};
@@ -10,7 +37,7 @@ function buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerPr
   const coderNick = coder.nickname || coder.display_name || "Coder";
   const testerNick = tester.nickname || tester.display_name || "Tester";
 
-  return [
+  const lines = [
     `You are ${meName}, the ${meTitle} agent in a multi-agent coding workflow.`,
     `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), tester is ${tester.display_name || "Tester"} (${tester.role_title || "Tester"}).`,
     `Nickname rules: call coder as "${coderNick}", tester as "${testerNick}".`,
@@ -30,15 +57,28 @@ function buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerPr
     "- If any must-fix item exists, decision must be changes_requested.",
     "- If no must-fix item exists, decision must be approve.",
     "",
+  ];
+  const contractLines = renderDiscussionContractLines(discussionContract);
+  if (contractLines.length) {
+    lines.push(...contractLines, "");
+  }
+  lines.push(
     "Task:",
     taskPrompt,
     "",
     "Coder output:",
-    coderOutput,
-  ].join("\n");
+    coderOutput
+  );
+  return lines.join("\n");
 }
 
-function buildReviewerDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+function buildReviewerDiscussionPrompt({
+  taskPrompt,
+  coderOutput,
+  discussionContract = null,
+  roleProfile = {},
+  peerProfiles = {},
+}) {
   const meName = roleProfile.display_name || "Reviewer";
   const meTitle = roleProfile.role_title || "Reviewer";
   const coder = peerProfiles.coder || {};
@@ -46,7 +86,7 @@ function buildReviewerDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = 
   const coderNick = coder.nickname || coder.display_name || "Coder";
   const testerNick = tester.nickname || tester.display_name || "Tester";
 
-  return [
+  const lines = [
     `You are ${meName}, the ${meTitle} agent in a multi-agent coding roundtable.`,
     `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), tester is ${tester.display_name || "Tester"} (${tester.role_title || "Tester"}).`,
     `Nickname rules: call coder as "${coderNick}", tester as "${testerNick}".`,
@@ -58,36 +98,96 @@ function buildReviewerDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = 
     "- Point out top risks and assumptions.",
     "- Suggest concrete refinements and acceptance criteria.",
     "",
+  ];
+  const contractLines = renderDiscussionContractLines(discussionContract);
+  if (contractLines.length) {
+    lines.push(...contractLines, "");
+  }
+  lines.push(
     "Task:",
     taskPrompt,
     "",
     "Coder proposal / latest implementation notes:",
-    coderOutput,
-  ].join("\n");
+    coderOutput
+  );
+  return lines.join("\n");
+}
+
+function tryParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {}
+  return null;
+}
+
+function repairUnescapedQuotes(candidate) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < candidate.length; i += 1) {
+    const ch = candidate[i];
+    if (!inString) {
+      if (ch === "\"") inString = true;
+      out += ch;
+      continue;
+    }
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") {
+      let j = i + 1;
+      while (j < candidate.length && /\s/.test(candidate[j])) j += 1;
+      const next = candidate[j] || "";
+      const closesString = next === ":" || next === "," || next === "}" || next === "]";
+      if (closesString) {
+        inString = false;
+        out += ch;
+      } else {
+        out += "\\\"";
+      }
+      continue;
+    }
+    out += ch;
+  }
+
+  return out;
+}
+
+function tryParseWithRepair(candidate) {
+  const parsed = tryParseJson(candidate);
+  if (parsed) return parsed;
+  const repaired = repairUnescapedQuotes(candidate);
+  if (repaired !== candidate) return tryParseJson(repaired);
+  return null;
 }
 
 function extractJsonObject(text) {
   const trimmed = text.trim();
   if (!trimmed) return null;
 
-  try {
-    return JSON.parse(trimmed);
-  } catch {}
+  const direct = tryParseWithRepair(trimmed);
+  if (direct) return direct;
 
   const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   if (fenceMatch) {
-    try {
-      return JSON.parse(fenceMatch[1]);
-    } catch {}
+    const fenced = tryParseWithRepair(fenceMatch[1]);
+    if (fenced) return fenced;
   }
 
   const start = trimmed.indexOf("{");
   const end = trimmed.lastIndexOf("}");
   if (start >= 0 && end > start) {
     const candidate = trimmed.slice(start, end + 1);
-    try {
-      return JSON.parse(candidate);
-    } catch {}
+    const extracted = tryParseWithRepair(candidate);
+    if (extracted) return extracted;
   }
 
   return null;
@@ -142,6 +242,7 @@ async function runReviewer({
   peerProfiles,
   taskPrompt,
   coderOutput,
+  discussionContract,
   mode = "strict_json",
   timeoutMs,
   eventMeta,
@@ -150,8 +251,20 @@ async function runReviewer({
 }) {
   const prompt =
     mode === "discussion"
-      ? buildReviewerDiscussionPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles })
-      : buildReviewerPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
+      ? buildReviewerDiscussionPrompt({
+        taskPrompt,
+        coderOutput,
+        discussionContract,
+        roleProfile,
+        peerProfiles,
+      })
+      : buildReviewerPrompt({
+        taskPrompt,
+        coderOutput,
+        discussionContract,
+        roleProfile,
+        peerProfiles,
+      });
   const result = await executeProviderText({
     provider,
     model,

@@ -197,64 +197,235 @@ function createMessage({ sender, sender_type, cat_name, text, ts, provider, mode
 }
 
 // ---------------------------------------------------------------------------
-// Thread persistence
+// Session persistence (formerly "Thread persistence")
+//
+// Terminology: Thread = project container, Session = conversation within thread
+// Sessions are stored at:
+//   New: logs/threads/{threadSlug}/sessions/{sessionId}/meta.json
+//   Legacy: logs/threads/{sessionId}/meta.json
 // ---------------------------------------------------------------------------
 
-function threadDir(logsRoot, threadId) {
-  return path.join(logsRoot, "threads", threadId);
+/**
+ * Resolve the directory for a chat session, checking new path then legacy.
+ */
+function resolveSessionDir(logsRoot, sessionId, threadSlug = null) {
+  // Try new thread-scoped path first
+  if (threadSlug) {
+    const newPath = path.join(logsRoot, "threads", threadSlug, "sessions", sessionId);
+    if (fs.existsSync(newPath)) return newPath;
+  }
+  // Try legacy path
+  const legacyPath = path.join(logsRoot, "threads", sessionId);
+  if (fs.existsSync(legacyPath)) return legacyPath;
+  // Best-effort lookup when caller only has session id.
+  if (!threadSlug) {
+    const threadsRoot = path.join(logsRoot, "threads");
+    if (fs.existsSync(threadsRoot)) {
+      const entries = fs.readdirSync(threadsRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith("_")) continue;
+        const scoped = path.join(threadsRoot, entry.name, "sessions", sessionId);
+        if (fs.existsSync(scoped)) return scoped;
+      }
+    }
+  }
+  // For creation: prefer new path if threadSlug given
+  if (threadSlug) {
+    return path.join(logsRoot, "threads", threadSlug, "sessions", sessionId);
+  }
+  return legacyPath;
 }
 
-function ensureThreadDir(logsRoot, threadId) {
-  const dir = threadDir(logsRoot, threadId);
+// Keep old name as alias for internal compatibility
+function threadDir(logsRoot, threadId) {
+  return resolveSessionDir(logsRoot, threadId);
+}
+
+function ensureSessionDir(logsRoot, sessionId, threadSlug = null) {
+  const dir = resolveSessionDir(logsRoot, sessionId, threadSlug);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
-function createThread(logsRoot, title, mode, roleConfig) {
-  const threadId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  const dir = ensureThreadDir(logsRoot, threadId);
+// Legacy alias
+function ensureThreadDir(logsRoot, threadId) {
+  return ensureSessionDir(logsRoot, threadId);
+}
+
+function sessionLockPath(sessionDir) {
+  return path.join(sessionDir, "._session.lock");
+}
+
+function acquireSessionLock(lockFile) {
+  try {
+    const fd = fs.openSync(lockFile, "wx");
+    fs.writeFileSync(fd, String(process.pid), "utf8");
+    return fd;
+  } catch (err) {
+    if (err && err.code === "EEXIST") return null;
+    throw err;
+  }
+}
+
+function releaseSessionLock(lockFile, fd) {
+  try {
+    if (Number.isInteger(fd)) fs.closeSync(fd);
+  } catch {}
+  try {
+    fs.rmSync(lockFile, { force: true });
+  } catch {}
+}
+
+function sleepMs(ms) {
+  const waitMs = Math.max(1, Number(ms) || 0);
+  const end = Date.now() + waitMs;
+  while (Date.now() < end) {
+    // busy wait for short lock retries
+  }
+}
+
+function withSessionLock(sessionDir, fn, opts = {}) {
+  const lockFile = sessionLockPath(sessionDir);
+  const timeoutMs = Math.max(1, Number(opts.timeout_ms) || 2000);
+  const retryMs = Math.max(1, Number(opts.retry_ms) || 10);
+  const staleMs = Math.max(1000, Number(opts.stale_ms) || 30000);
+  const start = Date.now();
+
+  while (true) {
+    const fd = acquireSessionLock(lockFile);
+    if (fd !== null) {
+      try {
+        return fn();
+      } finally {
+        releaseSessionLock(lockFile, fd);
+      }
+    }
+
+    try {
+      const stat = fs.statSync(lockFile);
+      if (Date.now() - stat.mtimeMs > staleMs) {
+        fs.rmSync(lockFile, { force: true });
+      }
+    } catch {}
+
+    if (Date.now() - start >= timeoutMs) {
+      const err = new Error(`session lock timeout: ${lockFile}`);
+      err.code = "SESSION_LOCK_TIMEOUT";
+      throw err;
+    }
+    sleepMs(retryMs);
+  }
+}
+
+/**
+ * Create a new chat session under a Thread.
+ * @param {string} threadSlug - Thread slug (required for new sessions)
+ */
+function createThread(logsRoot, title, mode, roleConfig, threadSlug) {
+  const sessionId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const dir = ensureSessionDir(logsRoot, sessionId, threadSlug || null);
   const effectiveMode = (mode && isValidMode(mode)) ? mode : DEFAULT_MODE;
-  // Auto-initialize mode_state for workflow mode
   let modeStateInit = {};
   if (effectiveMode === "workflow" && roleConfig) {
     modeStateInit = buildWorkflowModeState(roleConfig);
   }
   const meta = {
-    thread_id: threadId,
+    thread_id: sessionId,
     title: title || "新对话",
     mode: effectiveMode,
     mode_state: modeStateInit,
     created_at: Date.now(),
+    updated_at: Date.now(),
   };
+  if (threadSlug) meta.parent_thread = String(threadSlug).trim();
   fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n", "utf8");
   return meta;
 }
 
-function updateThreadMode(logsRoot, threadId, mode, modeState, roleConfig) {
-  const meta = readThreadMeta(logsRoot, threadId);
+function updateThreadMode(logsRoot, threadId, mode, modeState, roleConfig, threadSlug = null) {
+  const meta = readThreadMeta(logsRoot, threadId, threadSlug);
   if (!meta) return null;
   if (mode && isValidMode(mode)) meta.mode = mode;
   if (modeState !== undefined) {
     meta.mode_state = modeState;
   } else if (mode === "workflow" && roleConfig) {
-    // Auto-init workflow state when switching to workflow without explicit state
     meta.mode_state = buildWorkflowModeState(roleConfig);
   } else if (mode && mode !== "workflow") {
     meta.mode_state = {};
   }
-  const dir = threadDir(logsRoot, threadId);
+  meta.updated_at = Date.now();
+  const dir = resolveSessionDir(logsRoot, threadId, meta.parent_thread || threadSlug || null);
   fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n", "utf8");
   return meta;
 }
 
-function appendMessage(logsRoot, threadId, message) {
-  const dir = ensureThreadDir(logsRoot, threadId);
-  fs.appendFileSync(path.join(dir, "messages.jsonl"), JSON.stringify(message) + "\n", "utf8");
-  return message;
+function updateThreadMeta(logsRoot, threadId, patch, threadSlug = null) {
+  const meta = readThreadMeta(logsRoot, threadId, threadSlug);
+  if (!meta) return null;
+  const allowed = ["title", "parent_thread"];
+  for (const key of allowed) {
+    if (patch[key] !== undefined) meta[key] = patch[key];
+  }
+  meta.updated_at = Date.now();
+  const dir = resolveSessionDir(logsRoot, threadId, meta.parent_thread || threadSlug || null);
+  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n", "utf8");
+  return meta;
 }
 
-function readMessages(logsRoot, threadId) {
-  const file = path.join(threadDir(logsRoot, threadId), "messages.jsonl");
+function touchSessionMeta(logsRoot, threadId, threadSlug = null, updatedAt = Date.now(), resolvedDir = null) {
+  const dir = resolvedDir || resolveSessionDir(logsRoot, threadId, threadSlug);
+  const file = path.join(dir, "meta.json");
+  if (!fs.existsSync(file)) {
+    const err = new Error(`session meta missing: ${threadId}`);
+    err.code = "SESSION_META_MISSING";
+    throw err;
+  }
+  let meta;
+  try {
+    meta = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    const parseErr = new Error(`invalid session meta: ${threadId}`);
+    parseErr.code = "SESSION_META_INVALID";
+    parseErr.cause = err;
+    throw parseErr;
+  }
+  const prev = Number(meta.updated_at) || 0;
+  const candidate = Number.isFinite(Number(updatedAt)) ? Number(updatedAt) : Date.now();
+  meta.updated_at = Math.max(prev + 1, candidate);
+  fs.writeFileSync(file, JSON.stringify(meta, null, 2) + "\n", "utf8");
+  return meta;
+}
+
+function appendMessage(logsRoot, threadId, message, threadSlug = null) {
+  const dir = ensureSessionDir(logsRoot, threadId, threadSlug);
+  return withSessionLock(dir, () => {
+    const file = path.join(dir, "messages.jsonl");
+    const line = JSON.stringify(message) + "\n";
+    const existed = fs.existsSync(file);
+    const beforeSize = existed ? fs.statSync(file).size : 0;
+    let wroteMessage = false;
+
+    try {
+      fs.appendFileSync(file, line, "utf8");
+      wroteMessage = true;
+      const ts = Number.isFinite(Number(message?.ts)) ? Number(message.ts) : Date.now();
+      touchSessionMeta(logsRoot, threadId, threadSlug, ts, dir);
+      return message;
+    } catch (err) {
+      if (wroteMessage) {
+        try {
+          fs.truncateSync(file, beforeSize);
+          if (!existed && beforeSize === 0) fs.rmSync(file, { force: true });
+        } catch {}
+      }
+      throw err;
+    }
+  });
+}
+
+function readMessages(logsRoot, threadId, threadSlug = null) {
+  const dir = resolveSessionDir(logsRoot, threadId, threadSlug);
+  const file = path.join(dir, "messages.jsonl");
   if (!fs.existsSync(file)) return [];
   return fs
     .readFileSync(file, "utf8")
@@ -266,19 +437,44 @@ function readMessages(logsRoot, threadId) {
     .filter(Boolean);
 }
 
-function readThreadMeta(logsRoot, threadId) {
-  const file = path.join(threadDir(logsRoot, threadId), "meta.json");
+function readThreadMeta(logsRoot, threadId, threadSlug = null) {
+  const dir = resolveSessionDir(logsRoot, threadId, threadSlug);
+  const file = path.join(dir, "meta.json");
   if (!fs.existsSync(file)) return null;
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
 }
 
-function listThreads(logsRoot) {
+/**
+ * List chat sessions. When threadSlug is given, lists only sessions under that thread.
+ * Otherwise lists all legacy chat sessions (backward compat).
+ */
+function listThreads(logsRoot, threadSlug = null) {
+  if (threadSlug) {
+    // List sessions under specific thread
+    const sessDir = path.join(logsRoot, "threads", threadSlug, "sessions");
+    if (!fs.existsSync(sessDir)) return [];
+    return fs
+      .readdirSync(sessDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => {
+        const meta = readThreadMeta(logsRoot, d.name, threadSlug);
+        return meta;
+      })
+      .filter(Boolean)
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  }
+  // Legacy: list all chat sessions at logs/threads/{id}/meta.json
   const root = path.join(logsRoot, "threads");
   if (!fs.existsSync(root)) return [];
   return fs
     .readdirSync(root, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => readThreadMeta(logsRoot, d.name))
+    .filter((d) => d.isDirectory() && !d.name.startsWith("_"))
+    .map((d) => {
+      // Skip thread container dirs (they have thread.json, not meta.json)
+      const hasThreadJson = fs.existsSync(path.join(root, d.name, "thread.json"));
+      if (hasThreadJson) return null;
+      return readThreadMeta(logsRoot, d.name);
+    })
     .filter(Boolean)
     .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
 }
@@ -290,6 +486,7 @@ function listThreads(logsRoot) {
 async function sendChatMessage({
   logsRoot,
   threadId,
+  threadSlug = null,
   userText,
   roleConfig,
   timeoutMs = 5 * 60 * 1000,
@@ -301,7 +498,11 @@ async function sendChatMessage({
   const catLookup = buildCatLookup(cats);
 
   // Read thread meta for mode info
-  const threadMeta = readThreadMeta(logsRoot, threadId) || {};
+  const threadMeta =
+    readThreadMeta(logsRoot, threadId, threadSlug) ||
+    readThreadMeta(logsRoot, threadId) ||
+    {};
+  const effectiveThreadSlug = String(threadSlug || threadMeta.parent_thread || "").trim() || null;
   const mode = threadMeta.mode || DEFAULT_MODE;
   const modeState = threadMeta.mode_state || {};
 
@@ -366,10 +567,10 @@ async function sendChatMessage({
     sender_type: "user",
     text: userText,
   });
-  appendMessage(logsRoot, threadId, userMsg);
+  appendMessage(logsRoot, threadId, userMsg, effectiveThreadSlug);
 
   // Read history for context
-  const history = readMessages(logsRoot, threadId);
+  const history = readMessages(logsRoot, threadId, effectiveThreadSlug);
 
   // Build peer list (all cats except current target)
   const allCatEntries = Object.entries(cats).map(([name, c]) => ({ ...c, cat_name: name }));
@@ -451,7 +652,7 @@ async function sendChatMessage({
       output_tokens: usageData.usage?.output_tokens ?? null,
       cost_usd: usageData.total_cost_usd ?? null,
     });
-    appendMessage(logsRoot, threadId, catMsg);
+    appendMessage(logsRoot, threadId, catMsg, effectiveThreadSlug);
     history.push(catMsg);
     emitLiveAgentState({
       agent_key: cat.cat_name,
@@ -541,7 +742,7 @@ async function sendChatMessage({
         output_tokens: usageData.usage?.output_tokens ?? null,
         cost_usd: usageData.total_cost_usd ?? null,
       });
-      appendMessage(logsRoot, threadId, catMsg);
+      appendMessage(logsRoot, threadId, catMsg, effectiveThreadSlug);
       history.push(catMsg);
       const payload = {
         cat_name: cat.cat_name,
@@ -953,7 +1154,14 @@ async function sendChatMessage({
       updated_at: Date.now(),
     };
 
-    const persisted = updateThreadMode(logsRoot, threadId, "workflow", workingState, roleConfig);
+    const persisted = updateThreadMode(
+      logsRoot,
+      threadId,
+      "workflow",
+      workingState,
+      roleConfig,
+      effectiveThreadSlug
+    );
     return {
       user_message: userMsg,
       responses,
@@ -972,6 +1180,8 @@ module.exports = {
   resolveProviderForCat,
   createThread,
   updateThreadMode,
+  updateThreadMeta,
+  touchSessionMeta,
   appendMessage,
   readMessages,
   readThreadMeta,

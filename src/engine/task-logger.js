@@ -18,8 +18,15 @@ function makeTaskId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
-function createTaskLogDir(root = "logs", taskId = makeTaskId()) {
-  const dir = path.join(root, datePart(), `task-${taskId}`);
+function createTaskLogDir(root = "logs", taskId = makeTaskId(), threadSlug = null) {
+  let dir;
+  if (threadSlug) {
+    // Thread-based path: logs/threads/{slug}/sessions/task-{taskId}/
+    dir = path.join(root, "threads", threadSlug, "sessions", `task-${taskId}`);
+  } else {
+    // Legacy date-based path: logs/{date}/task-{taskId}/
+    dir = path.join(root, datePart(), `task-${taskId}`);
+  }
   ensureDir(path.join(dir, "rounds"));
   return { taskId, dir };
 }

@@ -4,15 +4,20 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
+const { spawn } = require("node:child_process");
 
 const ROOT = path.resolve(__dirname, "..");
 const LOGS_ROOT = path.join(ROOT, "logs");
 
-function request(method, urlPath, body = null) {
+function randomTaskId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function request(port, method, urlPath, body = null) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: "127.0.0.1",
-      port: 4173,
+      port,
       path: urlPath,
       method,
       headers: { "Content-Type": "application/json" },
@@ -34,8 +39,65 @@ function request(method, urlPath, body = null) {
   });
 }
 
+async function startServer(port) {
+  const child = spawn(process.execPath, ["scripts/ui-server.js"], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      UI_HOST: "127.0.0.1",
+      UI_PORT: String(port),
+      TASK_RESOLVE_CACHE_TTL_MS: "3000",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString("utf8");
+  });
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("ui-server start timeout"));
+    }, 12000);
+
+    function onData(chunk) {
+      const text = chunk.toString("utf8");
+      if (text.includes("UI server running:")) {
+        clearTimeout(timer);
+        child.stdout.off("data", onData);
+        resolve();
+      }
+    }
+
+    child.stdout.on("data", onData);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      const detail = stderr.trim() ? `\n${stderr.trim()}` : "";
+      reject(new Error(`ui-server exited early: ${code}${detail}`));
+    });
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+
+  return child;
+}
+
+async function stopServer(child) {
+  if (!child || child.killed) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 4000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
 function createMockTask(taskId) {
-  // taskId 格式: {timestamp}-{hash}，如 1771382424778-1568fc9e
   const today = new Date().toISOString().slice(0, 10);
   const taskDir = path.join(LOGS_ROOT, today, `task-${taskId}`);
   fs.mkdirSync(taskDir, { recursive: true });
@@ -47,57 +109,96 @@ function createMockTask(taskId) {
   return { taskDir, date: today };
 }
 
+function createMockThreadTask(taskId) {
+  const threadSlug = `delete-test-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
+  const taskDir = path.join(LOGS_ROOT, "threads", threadSlug, "sessions", `task-${taskId}`);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(taskDir, "summary.json"),
+    JSON.stringify({
+      task_id: taskId,
+      thread_id: threadSlug,
+      final_status: "completed",
+      state_events: [{ ts: Date.now() }],
+    })
+  );
+  fs.writeFileSync(path.join(taskDir, "task.md"), "Thread task");
+  return { taskDir, threadRoot: path.join(LOGS_ROOT, "threads", threadSlug) };
+}
+
 async function runTests() {
   console.log("Running delete task API tests...\n");
+  const port = 4700 + Math.floor(Math.random() * 200);
+  const server = await startServer(port);
+  let cleanupDateDir = null;
+  let cleanupThreadRoot = null;
 
-  // Test 1: Delete success - 使用真实的 taskId 格式
-  console.log("Test 1: Delete existing task - should return 200");
-  const testTaskId1 = "2099123456789-abcd1234";
-  const { taskDir: taskDir1, date: date1 } = createMockTask(testTaskId1);
-  assert(fs.existsSync(taskDir1), "Mock task should exist before delete");
+  try {
+    // Test 1: Delete success
+    console.log("Test 1: Delete existing task - should return 200");
+    const testTaskId1 = randomTaskId();
+    const { taskDir: taskDir1, date: date1 } = createMockTask(testTaskId1);
+    cleanupDateDir = path.join(LOGS_ROOT, date1);
+    assert(fs.existsSync(taskDir1), "Mock task should exist before delete");
 
-  const res1 = await request("DELETE", `/api/tasks/${testTaskId1}`);
-  assert.strictEqual(res1.status, 200, `Expected 200, got ${res1.status}`);
-  assert.strictEqual(res1.body.ok, true);
-  assert.strictEqual(res1.body.task_id, testTaskId1);
-  assert(!fs.existsSync(taskDir1), "Task directory should be deleted");
-  console.log("  PASS\n");
+    const res1 = await request(port, "DELETE", `/api/tasks/${testTaskId1}`);
+    assert.strictEqual(res1.status, 200, `Expected 200, got ${res1.status}`);
+    assert.strictEqual(res1.body.ok, true);
+    assert.strictEqual(res1.body.task_id, testTaskId1);
+    assert(!fs.existsSync(taskDir1), "Task directory should be deleted");
+    console.log("  PASS\n");
 
-  // Test 2: Task not found (404) - 使用合法格式但不存在的 taskId
-  console.log("Test 2: Delete non-existent task - should return 404");
-  const res2 = await request("DELETE", "/api/tasks/9999999999999-deadbeef");
-  assert.strictEqual(res2.status, 404, `Expected 404, got ${res2.status}`);
-  assert(res2.body.error, "Should have error message");
-  console.log("  PASS\n");
+    // Test 2: Task not found (404)
+    console.log("Test 2: Delete non-existent task - should return 404");
+    const res2 = await request(port, "DELETE", "/api/tasks/9999999999999-deadbeef");
+    assert.strictEqual(res2.status, 404, `Expected 404, got ${res2.status}`);
+    assert(res2.body.error, "Should have error message");
+    console.log("  PASS\n");
 
-  // Test 3: Invalid task ID format (400) - 不符合 {timestamp}-{hash} 格式
-  console.log("Test 3: Delete with invalid task ID format - should return 400");
-  const res3 = await request("DELETE", "/api/tasks/invalid-id");
-  assert.strictEqual(res3.status, 400, `Expected 400, got ${res3.status}`);
-  assert(res3.body.error, "Should have error message");
-  console.log("  PASS\n");
+    // Test 3: Delete thread-scoped task success (200)
+    console.log("Test 3: Delete thread-scoped task - should return 200");
+    const testTaskId3 = randomTaskId();
+    const { taskDir: threadTaskDir, threadRoot } = createMockThreadTask(testTaskId3);
+    cleanupThreadRoot = threadRoot;
+    assert(fs.existsSync(threadTaskDir), "Thread-scoped task should exist before delete");
+    const res3 = await request(port, "DELETE", `/api/tasks/${testTaskId3}`);
+    assert.strictEqual(res3.status, 200, `Expected 200, got ${res3.status}`);
+    assert(!fs.existsSync(threadTaskDir), "Thread-scoped task directory should be deleted");
+    console.log("  PASS\n");
 
-  // Test 4: Path traversal attempt (400)
-  console.log("Test 4: Path traversal attempt - should return 400");
-  const res4 = await request("DELETE", "/api/tasks/..%2F..%2Fetc");
-  assert.strictEqual(res4.status, 400, `Expected 400, got ${res4.status}`);
-  console.log("  PASS\n");
+    // Test 4: Invalid task ID format (400)
+    console.log("Test 4: Delete with invalid task ID format - should return 400");
+    const res4 = await request(port, "DELETE", "/api/tasks/invalid-id");
+    assert.strictEqual(res4.status, 400, `Expected 400, got ${res4.status}`);
+    assert(res4.body.error, "Should have error message");
+    console.log("  PASS\n");
 
-  // Test 5: Path with slashes (400)
-  console.log("Test 5: Task ID with slashes - should return 400");
-  const res5 = await request("DELETE", "/api/tasks/2099-01-01/task");
-  assert(res5.status === 400 || res5.status === 404, `Expected 400 or 404, got ${res5.status}`);
-  console.log("  PASS\n");
+    // Test 5: Path traversal attempt (400)
+    console.log("Test 5: Path traversal attempt - should return 400");
+    const res5 = await request(port, "DELETE", "/api/tasks/..%2F..%2Fetc");
+    assert.strictEqual(res5.status, 400, `Expected 400, got ${res5.status}`);
+    console.log("  PASS\n");
 
-  // Cleanup test date directory if empty
-  const testDateDir = path.join(LOGS_ROOT, date1);
-  if (fs.existsSync(testDateDir)) {
-    try {
-      fs.rmdirSync(testDateDir);
-    } catch {}
+    // Test 6: Path with slashes (400)
+    console.log("Test 6: Task ID with slashes - should return 400");
+    const res6 = await request(port, "DELETE", "/api/tasks/2099-01-01/task");
+    assert(res6.status === 400 || res6.status === 404, `Expected 400 or 404, got ${res6.status}`);
+    console.log("  PASS\n");
+
+    console.log("All tests passed!");
+  } finally {
+    await stopServer(server);
+    if (cleanupDateDir && fs.existsSync(cleanupDateDir)) {
+      try {
+        fs.rmdirSync(cleanupDateDir);
+      } catch {}
+    }
+    if (cleanupThreadRoot && fs.existsSync(cleanupThreadRoot)) {
+      try {
+        fs.rmSync(cleanupThreadRoot, { recursive: true, force: true });
+      } catch {}
+    }
   }
-
-  console.log("All tests passed!");
 }
 
 runTests().catch((err) => {

@@ -235,6 +235,27 @@ function buildWorkflowModeState(roleConfig) {
   const roleMap = {};
   const profiles = roleConfig?.role_profiles || {};
   const cats = roleConfig?.cats || {};
+  const workflowAssignment = roleConfig?.workflow_assignment || {};
+
+  // Preferred: explicit stage -> cat_name mapping, avoids collisions when
+  // multiple stages share the same model_id.
+  for (const [stage, catName] of Object.entries(workflowAssignment)) {
+    if (!catName || !profiles[stage] || !cats[catName]) continue;
+    roleMap[catName] = profiles[stage].role_title || DEFAULT_STAGE_DUTY[stage];
+  }
+
+  // If explicit mapping exists for all known stages, skip fallback inference.
+  const hasAllStageAssignments = Object.keys(DEFAULT_STAGE_DUTY).every((stage) => {
+    const catName = workflowAssignment[stage];
+    return Boolean(catName && cats[catName] && profiles[stage]);
+  });
+  if (hasAllStageAssignments) {
+    return {
+      current_node: WORKFLOW_NODES[0].id,
+      role_map: roleMap,
+      completed_nodes: [],
+    };
+  }
 
   // Map cat_name → role_title via stage_assignment + role_profiles
   const stageAssignment = roleConfig?.stage_assignment || {};
@@ -245,9 +266,10 @@ function buildWorkflowModeState(roleConfig) {
   }
 
   for (const [catName, catCfg] of Object.entries(cats)) {
+    if (roleMap[catName]) continue;
     const modelId = catCfg?.model_id;
     const stage = modelToStage[modelId];
-    if (stage && profiles[stage]) {
+    if (stage && profiles[stage] && !workflowAssignment[stage]) {
       roleMap[catName] = profiles[stage].role_title || DEFAULT_STAGE_DUTY[stage];
     }
   }

@@ -2,7 +2,31 @@
 
 const { executeProviderText } = require("../providers/execute-provider");
 
-function buildTesterPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+function renderDiscussionContractLines(discussionContract) {
+  if (!discussionContract || typeof discussionContract !== "object") return [];
+  const lines = [];
+  lines.push("Confirmed roundtable contract (inherit this context):");
+  if (discussionContract.source_round !== null && discussionContract.source_round !== undefined) {
+    lines.push(`- Source round: ${discussionContract.source_round}`);
+  }
+  if (discussionContract.hash) lines.push(`- Contract hash: ${discussionContract.hash}`);
+  if (discussionContract.goal) lines.push(`- Goal: ${discussionContract.goal}`);
+  if (discussionContract.core_plan) lines.push(`- Core plan: ${discussionContract.core_plan}`);
+  if (discussionContract.tester_notes) lines.push(`- Tester baseline: ${discussionContract.tester_notes}`);
+  if (Array.isArray(discussionContract.acceptance_criteria) && discussionContract.acceptance_criteria.length) {
+    lines.push("- Acceptance criteria:");
+    discussionContract.acceptance_criteria.forEach((item, idx) => lines.push(`  ${idx + 1}. ${item}`));
+  }
+  return lines;
+}
+
+function buildTesterPrompt({
+  taskPrompt,
+  coderOutput,
+  discussionContract = null,
+  roleProfile = {},
+  peerProfiles = {},
+}) {
   const meName = roleProfile.display_name || "Tester";
   const meTitle = roleProfile.role_title || "Tester";
   const coder = peerProfiles.coder || {};
@@ -10,7 +34,7 @@ function buildTesterPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProf
   const coderNick = coder.nickname || coder.display_name || "Coder";
   const reviewerNick = reviewer.nickname || reviewer.display_name || "Reviewer";
 
-  return [
+  const lines = [
     `You are ${meName}, the ${meTitle} agent in a multi-agent coding workflow.`,
     `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), reviewer is ${reviewer.display_name || "Reviewer"} (${reviewer.role_title || "Reviewer"}).`,
     `Nickname rules: call coder as "${coderNick}", reviewer as "${reviewerNick}".`,
@@ -31,15 +55,28 @@ function buildTesterPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProf
     "- You may append flags to allowed commands (e.g. \"npm test -- --grep foo\").",
     "- If the task cannot be verified with allowed commands, return commands as an empty array and explain in test_plan.",
     "",
+  ];
+  const contractLines = renderDiscussionContractLines(discussionContract);
+  if (contractLines.length) {
+    lines.push(...contractLines, "");
+  }
+  lines.push(
     "Task:",
     taskPrompt,
     "",
     "Coder output:",
-    coderOutput,
-  ].join("\n");
+    coderOutput
+  );
+  return lines.join("\n");
 }
 
-function buildTesterDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = {}, peerProfiles = {} }) {
+function buildTesterDiscussionPrompt({
+  taskPrompt,
+  coderOutput,
+  discussionContract = null,
+  roleProfile = {},
+  peerProfiles = {},
+}) {
   const meName = roleProfile.display_name || "Tester";
   const meTitle = roleProfile.role_title || "Tester";
   const coder = peerProfiles.coder || {};
@@ -47,7 +84,7 @@ function buildTesterDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = {}
   const coderNick = coder.nickname || coder.display_name || "Coder";
   const reviewerNick = reviewer.nickname || reviewer.display_name || "Reviewer";
 
-  return [
+  const lines = [
     `You are ${meName}, the ${meTitle} agent in a multi-agent coding roundtable.`,
     `Teammates: coder is ${coder.display_name || "Coder"} (${coder.role_title || "CoreDev"}), reviewer is ${reviewer.display_name || "Reviewer"} (${reviewer.role_title || "Reviewer"}).`,
     `Nickname rules: call coder as "${coderNick}", reviewer as "${reviewerNick}".`,
@@ -59,12 +96,19 @@ function buildTesterDiscussionPrompt({ taskPrompt, coderOutput, roleProfile = {}
     "- Suggest minimal verification strategy and edge cases.",
     "- Flag risky rollout points.",
     "",
+  ];
+  const contractLines = renderDiscussionContractLines(discussionContract);
+  if (contractLines.length) {
+    lines.push(...contractLines, "");
+  }
+  lines.push(
     "Task:",
     taskPrompt,
     "",
     "Coder proposal / latest implementation notes:",
-    coderOutput,
-  ].join("\n");
+    coderOutput
+  );
+  return lines.join("\n");
 }
 
 function extractJsonObject(text) {
@@ -122,6 +166,7 @@ async function runTester({
   peerProfiles,
   taskPrompt,
   coderOutput,
+  discussionContract,
   mode = "strict_json",
   timeoutMs,
   eventMeta,
@@ -130,8 +175,20 @@ async function runTester({
 }) {
   const prompt =
     mode === "discussion"
-      ? buildTesterDiscussionPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles })
-      : buildTesterPrompt({ taskPrompt, coderOutput, roleProfile, peerProfiles });
+      ? buildTesterDiscussionPrompt({
+        taskPrompt,
+        coderOutput,
+        discussionContract,
+        roleProfile,
+        peerProfiles,
+      })
+      : buildTesterPrompt({
+        taskPrompt,
+        coderOutput,
+        discussionContract,
+        roleProfile,
+        peerProfiles,
+      });
   const result = await executeProviderText({
     provider,
     model,

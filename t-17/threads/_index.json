@@ -1,0 +1,11 @@
+{
+  "threads": {
+    "default": {
+      "name": "default",
+      "session_count": 0,
+      "updated_at": 1772379890489,
+      "archived": false
+    }
+  },
+  "rebuilt_at": null
+}

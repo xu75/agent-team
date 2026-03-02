@@ -49,7 +49,11 @@ function resolveCodexBinary() {
   return explicit || "codex";
 }
 
-function buildCodexCommand({ prompt, model }) {
+function isValidSandboxMode(mode) {
+  return mode === "read-only" || mode === "workspace-write" || mode === "danger-full-access";
+}
+
+function buildCodexCommand({ prompt, model, sandboxMode }) {
   if (typeof prompt !== "string" || !prompt.trim()) {
     throw new Error("buildCodexCommand: prompt must be a non-empty string");
   }
@@ -59,6 +63,10 @@ function buildCodexCommand({ prompt, model }) {
 
   if (model && typeof model === "string") {
     args.push("--model", model);
+  }
+
+  if (typeof sandboxMode === "string" && isValidSandboxMode(sandboxMode)) {
+    args.push("--sandbox", sandboxMode);
   }
 
   args.push(prompt);

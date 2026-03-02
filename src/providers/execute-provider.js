@@ -5,6 +5,12 @@ const { buildClaudeCommand } = require("./claude-cli");
 const { buildCodexCommand } = require("./codex-cli");
 const { buildGeminiCommand } = require("./gemini-cli");
 
+function envFlag(name, defaultValue = false) {
+  const raw = String(process.env[name] || "").trim();
+  if (!raw) return !!defaultValue;
+  return /^(1|true|yes|on)$/i.test(raw);
+}
+
 function formatLocalDateTime(ts = Date.now()) {
   const d = new Date(ts);
   const yyyy = d.getFullYear();
@@ -26,14 +32,24 @@ function formatArgs(args) {
     .join(" ");
 }
 
-function resolveProvider(provider, prompt, model, settingsFile) {
+function resolveCodexSandboxMode(eventMeta = {}) {
+  const role = String(
+    eventMeta?.agent_role || eventMeta?.workflow_node || eventMeta?.role || ""
+  ).trim().toLowerCase();
+  if (role === "coder") return "workspace-write";
+  if (role === "reviewer") return "read-only";
+  return null;
+}
+
+function resolveProvider(provider, prompt, model, settingsFile, eventMeta = {}) {
   if (provider === "claude-cli") {
     const built = buildClaudeCommand({ prompt, model, settingsFile });
     return { ...built, stdoutParseMode: "ndjson" };
   }
 
   if (provider === "codex-cli") {
-    const built = buildCodexCommand({ prompt, model });
+    const sandboxMode = resolveCodexSandboxMode(eventMeta);
+    const built = buildCodexCommand({ prompt, model, sandboxMode });
     return { ...built, stdoutParseMode: "text" };
   }
 
@@ -42,7 +58,9 @@ function resolveProvider(provider, prompt, model, settingsFile) {
     return { ...built, stdoutParseMode: "text" };
   }
 
-  throw new Error(`Unsupported provider: ${provider}`);
+  const err = new Error(`Unsupported provider: ${provider}`);
+  err.code = "PROVIDER_UNSUPPORTED";
+  throw err;
 }
 
 function classifyProviderError({ provider, exit, stderrLines = [], text = "", permissionDeniedCount = 0 }) {
@@ -58,6 +76,9 @@ function classifyProviderError({ provider, exit, stderrLines = [], text = "", pe
   if (provider === "codex-cli" && /enoent/.test(errMsg.toLowerCase())) {
     return "provider_not_found";
   }
+  if (/(quota|usage limit|rate limit|too many requests|status 429|insufficient credits|credit balance|billing|monthly limit)/i.test(haystack)) {
+    return "provider_quota_exceeded";
+  }
   if (/(unauthorized|forbidden|invalid api key|auth|token expired|status 401|status 403)/i.test(haystack)) {
     return "provider_auth_error";
   }
@@ -70,6 +91,34 @@ function classifyProviderError({ provider, exit, stderrLines = [], text = "", pe
   return "provider_runtime_error";
 }
 
+function detectSoftQuotaBlock({ provider, text = "", stderrLines = [] }) {
+  if (provider !== "claude-cli") return false;
+  const merged = [String(text || ""), ...stderrLines].join("\n");
+  const head = merged.slice(0, 500).toLowerCase();
+  if (!head.trim()) return false;
+  if (/you'?ve hit your limit/i.test(head)) return true;
+  if (/(usage limit|monthly limit|credit balance|insufficient credits|status 429|too many requests)/i.test(head)) {
+    return true;
+  }
+  if (/resets?\s+\d{1,2}(:\d{2})?\s*(am|pm)/i.test(head) && /limit/i.test(head)) {
+    return true;
+  }
+  return false;
+}
+
+function shouldAutoFallback({
+  provider,
+  errorClass,
+  fallbackDepth = 0,
+  fallbackProvider,
+}) {
+  if (fallbackDepth > 0) return false;
+  if (provider !== "claude-cli") return false;
+  if (!fallbackProvider || fallbackProvider === provider) return false;
+  if (!envFlag("CATCAFE_AUTO_FALLBACK_TO_CODEX", true)) return false;
+  return errorClass === "provider_quota_exceeded";
+}
+
 async function executeProviderText({
   provider = "claude-cli",
   prompt,
@@ -80,8 +129,48 @@ async function executeProviderText({
   eventMeta = {},
   abortSignal = null,
   onLiveEvent = null,
+  fallbackDepth = 0,
 }) {
-  const { cmd, args, stdoutParseMode } = resolveProvider(provider, prompt, model, settingsFile);
+  let resolvedProvider;
+  try {
+    resolvedProvider = resolveProvider(
+      provider,
+      prompt,
+      model,
+      settingsFile,
+      eventMeta
+    );
+  } catch (err) {
+    const isUnsupportedProvider =
+      err?.code === "PROVIDER_UNSUPPORTED" || /unsupported provider/i.test(String(err?.message || ""));
+    if (!isUnsupportedProvider) throw err;
+    const message = String(err?.message || `Unsupported provider: ${provider}`);
+    if (streamOutput) {
+      process.stdout.write(
+        `\n[provider] done\n` +
+        `  time: ${formatLocalDateTime()}\n` +
+        `  provider: ${provider}\n` +
+        `  run_id: -\n` +
+        `  exit_code: null\n` +
+        `  signal: -\n` +
+        `  duration_ms: 0\n` +
+        `  error: provider_unsupported\n`
+      );
+    }
+    return {
+      text: `Runtime Error: ${message}\n`,
+      runId: null,
+      runDir: null,
+      exit: {
+        code: null,
+        signal: null,
+        error: { message },
+      },
+      error_class: "provider_unsupported",
+      usage: null,
+    };
+  }
+  const { cmd, args, stdoutParseMode } = resolvedProvider;
   const startedAt = Date.now();
   let text = "";
   const stderrLines = [];
@@ -198,6 +287,84 @@ async function executeProviderText({
     text,
     permissionDeniedCount,
   });
+  const resolvedErrorClass = errorClass || (
+    detectSoftQuotaBlock({ provider, text, stderrLines }) ? "provider_quota_exceeded" : null
+  );
+
+  const fallbackProvider = String(process.env.CATCAFE_FALLBACK_PROVIDER || "codex-cli").trim() || "codex-cli";
+  if (
+    shouldAutoFallback({
+      provider,
+      errorClass: resolvedErrorClass,
+      fallbackDepth,
+      fallbackProvider,
+    })
+  ) {
+    if (streamOutput) {
+      const durationMs = Date.now() - startedAt;
+      const exitCode = Number.isFinite(Number(result?.exit?.code))
+        ? Number(result.exit.code)
+        : "null";
+      const exitSignal = result?.exit?.signal || "-";
+      process.stdout.write(
+        `\n[provider] done\n` +
+        `  time: ${formatLocalDateTime()}\n` +
+        `  provider: ${provider}\n` +
+        `  run_id: ${result.runId}\n` +
+        `  exit_code: ${exitCode}\n` +
+        `  signal: ${exitSignal}\n` +
+        `  duration_ms: ${durationMs}\n` +
+        `  error: ${resolvedErrorClass || "-"}\n` +
+        `  note: fallback_triggered\n`
+      );
+    }
+    const fallbackModel = String(process.env.CATCAFE_FALLBACK_MODEL || "").trim() || null;
+    if (streamOutput) {
+      process.stdout.write(
+        `\n[provider] fallback\n` +
+        `  time: ${formatLocalDateTime()}\n` +
+        `  from: ${provider}\n` +
+        `  to: ${fallbackProvider}\n` +
+        `  reason: ${resolvedErrorClass}\n`
+      );
+    }
+    const fallbackResult = await executeProviderText({
+      provider: fallbackProvider,
+      prompt,
+      model: fallbackModel,
+      settingsFile: null,
+      timeoutMs,
+      streamOutput,
+      eventMeta: {
+        ...eventMeta,
+        fallback_from: provider,
+        fallback_reason: resolvedErrorClass,
+      },
+      abortSignal,
+      onLiveEvent,
+      fallbackDepth: fallbackDepth + 1,
+    });
+    const fallbackExitCode = Number(fallbackResult?.exit?.code);
+    const fallbackOk = !fallbackResult?.error_class && (!Number.isFinite(fallbackExitCode) || fallbackExitCode === 0);
+    if (fallbackOk) {
+      return {
+        ...fallbackResult,
+        fallback_from: provider,
+        fallback_reason: resolvedErrorClass,
+        primary_error_class: resolvedErrorClass,
+      };
+    }
+    if (streamOutput) {
+      process.stdout.write(
+        `\n[provider] fallback_failed\n` +
+        `  time: ${formatLocalDateTime()}\n` +
+        `  from: ${provider}\n` +
+        `  to: ${fallbackProvider}\n` +
+        `  reason: ${resolvedErrorClass}\n` +
+        `  fallback_error: ${fallbackResult?.error_class || "unknown"}\n`
+      );
+    }
+  }
 
   if (streamOutput) {
     const durationMs = Date.now() - startedAt;
@@ -213,7 +380,7 @@ async function executeProviderText({
       `  exit_code: ${exitCode}\n` +
       `  signal: ${exitSignal}\n` +
       `  duration_ms: ${durationMs}\n` +
-      `  error: ${errorClass || "-"}\n`
+      `  error: ${resolvedErrorClass || "-"}\n`
     );
   }
 
@@ -222,7 +389,7 @@ async function executeProviderText({
     runId: result.runId,
     runDir: result.dir,
     exit: result.exit,
-    error_class: errorClass,
+    error_class: resolvedErrorClass,
     usage: usageData,
   };
 }

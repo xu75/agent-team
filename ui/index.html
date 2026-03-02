@@ -14,6 +14,16 @@
             <span class="paw">●</span>
             <h1>Cat Café</h1>
           </div>
+          <div class="project-selector-row">
+            <button id="projectSelectorBtn" class="project-selector-btn" title="切换 Thread">
+              <span id="projectSelectorName">Cat Cafe</span>
+              <span class="project-arrow">▾</span>
+            </button>
+            <button id="newProjectBtn" class="icon-btn" title="新建 Thread" aria-label="新建 Thread">+</button>
+            <button id="archiveProjectBtn" class="icon-btn" title="归档当前 Thread" aria-label="归档当前 Thread">⎘</button>
+            <button id="deleteProjectBtn" class="icon-btn danger" title="硬删除当前 Thread" aria-label="硬删除当前 Thread">×</button>
+            <div id="projectDropdown" class="project-dropdown" aria-hidden="true"></div>
+          </div>
           <div class="panel-title-row">
             <h2>对话</h2>
             <button id="newChatBtn" class="btn primary">新对话</button>
