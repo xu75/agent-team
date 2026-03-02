@@ -106,6 +106,15 @@ const DEFAULT_ROLE_CONFIG = Object.freeze({
 const LIVE_SESSIONS = new Map(); // key = task_id/thread_id
 const LIVE_STREAM_SUBSCRIBERS = new Map(); // key = task_id/thread_id -> Set<ServerResponse>
 const TASK_RESOLVE_CACHE_TTL_MS = Math.max(1000, Number(process.env.TASK_RESOLVE_CACHE_TTL_MS || 8000));
+const LONG_REQUEST_TRACE_ENABLED = /^(1|true|yes|on)$/i.test(
+  String(process.env.LONG_REQUEST_TRACE_ENABLED || "1").trim()
+);
+const LONG_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.LONG_REQUEST_TIMEOUT_MS || 180000));
+const DEFAULT_ALLOWED_TEST_COMMANDS = String(process.env.ALLOWED_TEST_COMMANDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const DEFAULT_TESTER_BLOCKED_POLICY = String(process.env.TESTER_BLOCKED_POLICY || "").trim();
 const TASK_RESOLVE_CACHE = {
   expires_at: 0,
   entries: [],
@@ -118,8 +127,121 @@ function nowTs() {
   return Date.now();
 }
 
+function nowIsoUtc() {
+  return new Date().toISOString();
+}
+
 function createTaskId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function sanitizeRequestId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.replace(/[^a-zA-Z0-9._:-]/g, "").slice(0, 80);
+}
+
+function createRequestId() {
+  return `req-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function extractRequestIdFromBody(body) {
+  if (!body || typeof body !== "object") return "";
+  const candidates = [
+    body.request_id,
+    body.requestId,
+    body.client_request_id,
+    body.clientRequestId,
+    body.client_message_id,
+    body.clientMessageId,
+  ];
+  for (const candidate of candidates) {
+    const normalized = sanitizeRequestId(candidate);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function isLongRequestTraceTarget(method, reqPath) {
+  if (!LONG_REQUEST_TRACE_ENABLED || String(method || "").toUpperCase() !== "POST") return false;
+  if (reqPath === "/api/chat") return true;
+  if (/^\/api\/tasks\/[^/]+\/followup$/.test(reqPath)) return true;
+  if (/^\/api\/tasks\/[^/]+\/rerun$/.test(reqPath)) return true;
+  return false;
+}
+
+function createRequestTraceContext(req, reqPath) {
+  const method = String(req?.method || "").toUpperCase();
+  const pathName = String(reqPath || "");
+  const startedAt = Date.now();
+  const startedIso = new Date(startedAt).toISOString();
+  const headerRequestId = sanitizeRequestId(req?.headers?.["x-request-id"] || req?.headers?.["x-requestid"]);
+  return {
+    tracked: isLongRequestTraceTarget(method, pathName),
+    method,
+    path: pathName,
+    started_at: startedAt,
+    started_iso: startedIso,
+    request_id: headerRequestId || createRequestId(),
+    timeout_logged: false,
+    completed: false,
+    timeout_timer: null,
+  };
+}
+
+function bindRequestTrace(req, res, trace) {
+  if (!trace?.tracked) return;
+  req.__traceContext = trace;
+  req.__traceResponse = res;
+  if (!res.headersSent) {
+    res.setHeader("x-request-id", trace.request_id);
+  }
+  process.stdout.write(
+    `[http-trace] ts=${trace.started_iso} stage=start request_id=${trace.request_id} method=${trace.method} path=${trace.path}\n`
+  );
+  const finalizeTrace = (stage, statusCode) => {
+    if (trace.completed) return;
+    trace.completed = true;
+    if (trace.timeout_timer) {
+      clearTimeout(trace.timeout_timer);
+      trace.timeout_timer = null;
+    }
+    const endedAt = Date.now();
+    const endedIso = new Date(endedAt).toISOString();
+    const safeStatus = Number.isFinite(statusCode) ? statusCode : 0;
+    process.stdout.write(
+      `[http-trace] ts=${endedIso} stage=${stage} request_id=${trace.request_id} method=${trace.method} path=${trace.path} status=${safeStatus} started_at=${trace.started_iso} ended_at=${endedIso} duration_ms=${endedAt - trace.started_at}\n`
+    );
+  };
+  if (LONG_REQUEST_TIMEOUT_MS > 0) {
+    trace.timeout_timer = setTimeout(() => {
+      trace.timeout_logged = true;
+      process.stdout.write(
+        `[http-trace] ts=${nowIsoUtc()} stage=timeout_hint request_id=${trace.request_id} method=${trace.method} path=${trace.path} timeout_ms=${LONG_REQUEST_TIMEOUT_MS} elapsed_ms=${Date.now() - trace.started_at}\n`
+      );
+    }, LONG_REQUEST_TIMEOUT_MS);
+    if (typeof trace.timeout_timer.unref === "function") {
+      trace.timeout_timer.unref();
+    }
+  }
+  res.on("finish", () => finalizeTrace("finish", res.statusCode));
+  res.on("close", () => finalizeTrace("close", res.statusCode));
+}
+
+function updateTraceRequestId(req, body) {
+  const trace = req?.__traceContext;
+  if (!trace?.tracked) return;
+  const bodyRequestId = extractRequestIdFromBody(body);
+  if (!bodyRequestId || bodyRequestId === trace.request_id) return;
+  const oldRequestId = trace.request_id;
+  trace.request_id = bodyRequestId;
+  const res = req.__traceResponse;
+  if (res && !res.headersSent) {
+    res.setHeader("x-request-id", bodyRequestId);
+  }
+  process.stdout.write(
+    `[http-trace] ts=${nowIsoUtc()} stage=request_id_override old_request_id=${oldRequestId} request_id=${trace.request_id} method=${trace.method} path=${trace.path}\n`
+  );
 }
 
 function threadFallbackState(now = nowTs()) {
@@ -581,6 +703,32 @@ function clip(s, max = 64) {
   return String(s || "").trim().slice(0, max);
 }
 
+function parseCommandList(value) {
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x || "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value.split(",").map((x) => x.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function resolveAllowedTestCommands(body, summary = null) {
+  const bodyCommands = parseCommandList(body?.allowed_test_commands ?? body?.allowedTestCommands);
+  if (bodyCommands.length) return bodyCommands;
+  const summaryCommands = parseCommandList(summary?.allowed_test_commands ?? summary?.allowedTestCommands);
+  if (summaryCommands.length) return summaryCommands;
+  return DEFAULT_ALLOWED_TEST_COMMANDS.length ? [...DEFAULT_ALLOWED_TEST_COMMANDS] : undefined;
+}
+
+function resolveTesterBlockedPolicy(body, summary = null) {
+  const bodyPolicy = String(body?.tester_blocked_policy ?? body?.testerBlockedPolicy ?? "").trim();
+  if (bodyPolicy) return bodyPolicy;
+  const summaryPolicy = String(summary?.tester_blocked_policy || "").trim();
+  if (summaryPolicy) return summaryPolicy;
+  return DEFAULT_TESTER_BLOCKED_POLICY || undefined;
+}
+
 function normalizeRoleConfig(input) {
   const fallback = cloneDefaultRoleConfig();
   if (!input || typeof input !== "object") return fallback;
@@ -833,9 +981,14 @@ function readRequestJson(req) {
       }
     });
     req.on("end", () => {
-      if (!data.trim()) return resolve({});
+      if (!data.trim()) {
+        updateTraceRequestId(req, {});
+        return resolve({});
+      }
       try {
-        resolve(JSON.parse(data));
+        const parsed = JSON.parse(data);
+        updateTraceRequestId(req, parsed);
+        resolve(parsed);
       } catch {
         reject(new Error("invalid json body"));
       }
@@ -1130,7 +1283,18 @@ function toneFromOutcome(outcome) {
   return "neutral";
 }
 
-function listTasks() {
+function mapThreadsById(threads) {
+  const map = new Map();
+  for (const thread of Array.isArray(threads) ? threads : []) {
+    const threadId = String(thread?.thread_id || "").trim();
+    if (!threadId) continue;
+    map.set(threadId, thread);
+  }
+  return map;
+}
+
+function listTasks(threadById = null) {
+  const threadLookup = threadById instanceof Map ? threadById : mapThreadsById(listThreads(LOGS_ROOT));
   return getTaskResolveIndex().entries
     .map((t) => {
       const summary = t.summary || safeReadJson(path.join(t.dir, "summary.json"));
@@ -1139,13 +1303,17 @@ function listTasks() {
       const tone = toneFromOutcome(summary.final_outcome);
       const preview = taskLastPreview(t.dir, summary);
       const updatedTs = Number.isFinite(t.updated_ts) ? t.updated_ts : taskUpdatedTs(summary, t.dir);
-      const projectId = clip(summary.project_id || summary.project || t.thread_id || DEFAULT_PROJECT_ID, 64) || DEFAULT_PROJECT_ID;
-      const projectName = clip(summary.project_name || summary.workspace_name || DEFAULT_PROJECT_NAME, 96) || DEFAULT_PROJECT_NAME;
+      const rawThreadId = clip(summary.thread_id || t.thread_id || "", 64) || null;
+      const threadId = rawThreadId && threadLookup.has(rawThreadId) ? rawThreadId : null;
+      const threadMeta = threadId ? threadLookup.get(threadId) : null;
+      const projectId = threadId || (clip(summary.project_id || summary.project || "", 64) || null);
+      const projectName = threadMeta
+        ? (clip(threadMeta.name || summary.project_name || summary.workspace_name || "", 96) || threadMeta.name || null)
+        : null;
       const alertCount =
         unresolved.length +
         (tone === "negative" ? 1 : 0) +
         ((summary.final_outcome || "") === "max_iterations_reached" ? 1 : 0);
-      const threadId = clip(summary.thread_id || t.thread_id || projectId, 64) || DEFAULT_PROJECT_ID;
       const date = t.date || new Date(updatedTs || Date.now()).toISOString().slice(0, 10);
       return {
         task_id: summary.task_id || t.taskId,
@@ -1175,6 +1343,148 @@ function listTasks() {
       if (ts !== 0) return ts;
       return String(a.task_id || "").localeCompare(String(b.task_id || ""));
     });
+}
+
+function dedupeTasksByLatest(tasks) {
+  const deduped = new Map();
+  for (const item of Array.isArray(tasks) ? tasks : []) {
+    const id = String(item?.task_id || "").trim();
+    if (!id) continue;
+    const prev = deduped.get(id);
+    if (!prev || (Number(item.updated_ts) || 0) > (Number(prev.updated_ts) || 0)) {
+      deduped.set(id, item);
+    }
+  }
+  return Array.from(deduped.values()).sort((a, b) => {
+    const ts = (Number(b.updated_ts) || 0) - (Number(a.updated_ts) || 0);
+    if (ts !== 0) return ts;
+    return String(a.task_id || "").localeCompare(String(b.task_id || ""));
+  });
+}
+
+function buildVisibleTaskCatalog(opts = {}) {
+  const includeLegacyPreview = opts.includeLegacyPreview !== false;
+  const threads = listThreads(LOGS_ROOT);
+  const threadById = mapThreadsById(threads);
+  const tasks = listTasks(threadById);
+  const seenTaskIds = new Set(
+    tasks
+      .map((t) => String(t?.task_id || "").trim())
+      .filter(Boolean)
+  );
+
+  // Include legacy chat sessions; keep unbound sessions unassigned instead of forcing them into default thread.
+  const legacySessions = listChatSessions(LOGS_ROOT);
+  for (const session of legacySessions) {
+    const taskId = String(session?.thread_id || "").trim();
+    if (!taskId || seenTaskIds.has(taskId)) continue;
+    const rawThreadId = clip(session.parent_thread || session.project_id || "", 64) || null;
+    const threadId = rawThreadId && threadById.has(rawThreadId) ? rawThreadId : null;
+    const threadMeta = threadId ? threadById.get(threadId) : null;
+    let title = session.title || "聊天对话";
+    let preview = "";
+    let updatedTs = Number(session.updated_at || session.created_at || Date.now()) || Date.now();
+    if (includeLegacyPreview) {
+      const msgs = readMessages(LOGS_ROOT, taskId);
+      const lastMsg = msgs[msgs.length - 1];
+      const firstUserMsg = msgs.find((m) => m.sender_type === "user");
+      title = session.title || (firstUserMsg ? String(firstUserMsg.text || "").slice(0, 28) : "聊天对话");
+      preview = lastMsg ? String(lastMsg.text || "").slice(0, 56) : "";
+      updatedTs = Number(lastMsg?.ts || session.updated_at || session.created_at || Date.now()) || Date.now();
+    }
+    tasks.push({
+      task_id: taskId,
+      project_id: threadId || null,
+      thread_id: threadId,
+      project_name: threadMeta?.name || null,
+      date: new Date(session.created_at || Date.now()).toISOString().slice(0, 10),
+      provider: "chat",
+      final_status: null,
+      final_outcome: null,
+      task_title: title.length > 28 ? `${title.slice(0, 28)}...` : title,
+      rounds: 0,
+      unresolved_must_fix: 0,
+      status_tone: "neutral",
+      updated_ts: updatedTs,
+      last_preview: preview,
+      alert_count: 0,
+      _is_thread: true,
+      _thread_id: taskId,
+      _thread_mode: session.mode || "free_chat",
+      task_source: threadId ? "legacy_thread_chat" : "legacy_unassigned_chat",
+    });
+    seenTaskIds.add(taskId);
+  }
+
+  // Include thread-scoped sessions (chat + task) not already present in task logs.
+  for (const thread of threads) {
+    const threadSessions = listSessions(LOGS_ROOT, thread.thread_id);
+    for (const sess of threadSessions) {
+      const sessionId = String(sess?.session_id || "").trim();
+      if (!sessionId || seenTaskIds.has(sessionId)) continue;
+      tasks.push({
+        task_id: sessionId,
+        project_id: thread.thread_id,
+        thread_id: thread.thread_id,
+        project_name: thread.name || DEFAULT_PROJECT_NAME,
+        date: new Date(sess.created_at || Date.now()).toISOString().slice(0, 10),
+        provider: sess.type === "task" ? "workflow" : "chat",
+        final_status: sess.final_status || null,
+        final_outcome: sess.final_outcome || null,
+        task_title: (sess.title || "").length > 28 ? `${sess.title.slice(0, 28)}...` : (sess.title || "未命名"),
+        rounds: sess.rounds || 0,
+        unresolved_must_fix: 0,
+        status_tone: sess.type === "task" ? toneFromOutcome(sess.final_outcome) : "neutral",
+        updated_ts: sess.updated_at || sess.created_at || Date.now(),
+        last_preview: "",
+        alert_count: 0,
+        _is_thread: sess.type === "chat",
+        _thread_id: sessionId,
+        _thread_mode: sess.mode || "free_chat",
+        task_source: `thread_${sess.type || "session"}`,
+      });
+      seenTaskIds.add(sessionId);
+    }
+  }
+
+  return {
+    threads,
+    tasks: dedupeTasksByLatest(tasks),
+  };
+}
+
+function filterTasksByThread(tasks, threadId) {
+  const filterThreadId = String(threadId || "").trim();
+  if (!filterThreadId) return Array.isArray(tasks) ? tasks : [];
+  return (Array.isArray(tasks) ? tasks : []).filter((t) => String(t?.thread_id || "") === filterThreadId);
+}
+
+function buildThreadVisibleMetrics(threads, tasks) {
+  const byThreadId = new Map();
+  for (const thread of Array.isArray(threads) ? threads : []) {
+    const threadId = String(thread?.thread_id || "").trim();
+    if (!threadId) continue;
+    byThreadId.set(threadId, {
+      visible_count: 0,
+      breakdown: {
+        scoped: 0,
+        legacy: 0,
+      },
+    });
+  }
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    const threadId = String(task?.thread_id || "").trim();
+    if (!threadId) continue;
+    const metric = byThreadId.get(threadId);
+    if (!metric) continue;
+    metric.visible_count += 1;
+    if (String(task?.task_source || "").startsWith("legacy")) {
+      metric.breakdown.legacy += 1;
+    } else {
+      metric.breakdown.scoped += 1;
+    }
+  }
+  return byThreadId;
 }
 
 function getTaskDirById(taskId) {
@@ -1233,6 +1543,71 @@ function verifyTaskDeleteDir(taskId, taskDir) {
     return { ok: false, status: 403, error: "目录解析不安全，拒绝删除" };
   }
   return { ok: true, real_task_dir: realTaskDir };
+}
+
+function resolveChatSessionDirForDelete(sessionId, hintedThreadId = null) {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return null;
+
+  const hinted = String(hintedThreadId || "").trim();
+  if (hinted) {
+    const scoped = path.join(LOGS_ROOT, "threads", hinted, "sessions", sid);
+    if (fs.existsSync(scoped)) return scoped;
+  }
+
+  const locatedThread = locateSessionThread(sid, hinted || null);
+  if (locatedThread) {
+    const scoped = path.join(LOGS_ROOT, "threads", locatedThread, "sessions", sid);
+    if (fs.existsSync(scoped)) return scoped;
+  }
+
+  const legacyDir = path.join(LOGS_ROOT, "threads", sid);
+  const legacyMeta = path.join(legacyDir, "meta.json");
+  if (fs.existsSync(legacyMeta)) return legacyDir;
+
+  return null;
+}
+
+function verifyChatSessionDeleteDir(sessionId, sessionDir) {
+  const expectedBase = String(sessionId || "").trim();
+  if (!expectedBase || path.basename(sessionDir) !== expectedBase) {
+    return { ok: false, status: 403, error: "仅允许删除会话目录" };
+  }
+
+  try {
+    const st = fs.lstatSync(sessionDir);
+    if (!st.isDirectory() || st.isSymbolicLink()) {
+      return { ok: false, status: 403, error: "仅允许删除真实会话目录" };
+    }
+  } catch {
+    return { ok: false, status: 404, error: "session not found" };
+  }
+
+  let realLogsRoot;
+  let realSessionDir;
+  try {
+    realLogsRoot = fs.realpathSync(LOGS_ROOT);
+    realSessionDir = fs.realpathSync(sessionDir);
+  } catch {
+    return { ok: false, status: 404, error: "session not found" };
+  }
+
+  const realThreadsRoot = path.join(realLogsRoot, "threads");
+  if (!realSessionDir.startsWith(realThreadsRoot + path.sep)) {
+    return { ok: false, status: 403, error: "禁止删除任务根目录外的文件" };
+  }
+  if (path.basename(realSessionDir) !== expectedBase) {
+    return { ok: false, status: 403, error: "目录解析不安全，拒绝删除" };
+  }
+
+  const rel = path.relative(realThreadsRoot, realSessionDir);
+  const parts = rel.split(path.sep).filter(Boolean);
+  const isLegacy = parts.length === 1 && parts[0] === expectedBase;
+  const isScoped = parts.length === 3 && parts[1] === "sessions" && parts[2] === expectedBase;
+  if (!isLegacy && !isScoped) {
+    return { ok: false, status: 403, error: "会话目录不在允许路径中" };
+  }
+  return { ok: true, real_session_dir: realSessionDir };
 }
 
 function readRoundFiles(taskDir, round) {
@@ -1885,12 +2260,26 @@ function serveStatic(reqPath, res) {
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host}`);
   const p = u.pathname;
+  const trace = createRequestTraceContext(req, p);
+  bindRequestTrace(req, res, trace);
 
   try {
     // ---- Thread CRUD endpoints (Thread = project container) ----
 
     if (p === "/api/threads" && req.method === "GET") {
-      const threads = listThreads(LOGS_ROOT);
+      const catalog = buildVisibleTaskCatalog({ includeLegacyPreview: false });
+      const metrics = buildThreadVisibleMetrics(catalog.threads, catalog.tasks);
+      const threads = catalog.threads.map((thread) => {
+        const m = metrics.get(String(thread.thread_id || "").trim()) || {
+          visible_count: 0,
+          breakdown: { scoped: 0, legacy: 0 },
+        };
+        return {
+          ...thread,
+          visible_count: m.visible_count,
+          breakdown: m.breakdown,
+        };
+      });
       return sendJson(res, 200, { threads, default_thread_id: DEFAULT_PROJECT_ID });
     }
 
@@ -2310,82 +2699,10 @@ const server = http.createServer(async (req, res) => {
 
     if (p === "/api/tasks" && req.method === "GET") {
       const filterThread = u.searchParams.get("thread_id") || u.searchParams.get("project_id") || null;
-      const tasks = listTasks();
-      // Include legacy chat sessions (not yet under any thread)
-      const legacySessions = listChatSessions(LOGS_ROOT);
-      const taskIds = new Set(tasks.map((t) => t.task_id));
-      for (const session of legacySessions) {
-        if (taskIds.has(session.thread_id)) continue;
-        const sessionThread = session.parent_thread || session.project_id || DEFAULT_PROJECT_ID;
-        const msgs = readMessages(LOGS_ROOT, session.thread_id);
-        const lastMsg = msgs[msgs.length - 1];
-        const firstUserMsg = msgs.find((m) => m.sender_type === "user");
-        const title = session.title || (firstUserMsg ? firstUserMsg.text.slice(0, 28) : "聊天对话");
-        const preview = lastMsg ? (lastMsg.text || "").slice(0, 56) : "";
-        tasks.push({
-          task_id: session.thread_id,
-          project_id: sessionThread,
-          thread_id: sessionThread,
-          project_name: session.project_name || DEFAULT_PROJECT_NAME,
-          date: new Date(session.created_at || Date.now()).toISOString().slice(0, 10),
-          provider: "chat",
-          final_status: null,
-          final_outcome: null,
-          task_title: title.length > 28 ? title.slice(0, 28) + "..." : title,
-          rounds: 0,
-          unresolved_must_fix: 0,
-          status_tone: "neutral",
-          updated_ts: lastMsg?.ts || session.created_at || Date.now(),
-          last_preview: preview,
-          alert_count: 0,
-          _is_thread: true,
-          _thread_id: session.thread_id,
-          _thread_mode: session.mode || "free_chat",
-        });
-      }
-      // Also include thread-scoped sessions
-      const allThreads = listThreads(LOGS_ROOT);
-      for (const thread of allThreads) {
-        const threadSessions = listSessions(LOGS_ROOT, thread.thread_id);
-        for (const sess of threadSessions) {
-          if (taskIds.has(sess.session_id)) continue;
-          if (tasks.some((t) => t.task_id === sess.session_id)) continue;
-          tasks.push({
-            task_id: sess.session_id,
-            project_id: thread.thread_id,
-            thread_id: thread.thread_id,
-            project_name: thread.name || DEFAULT_PROJECT_NAME,
-            date: new Date(sess.created_at || Date.now()).toISOString().slice(0, 10),
-            provider: sess.type === "task" ? "workflow" : "chat",
-            final_status: sess.final_status || null,
-            final_outcome: sess.final_outcome || null,
-            task_title: (sess.title || "").length > 28 ? sess.title.slice(0, 28) + "..." : (sess.title || "未命名"),
-            rounds: sess.rounds || 0,
-            unresolved_must_fix: 0,
-            status_tone: sess.type === "task" ? toneFromOutcome(sess.final_outcome) : "neutral",
-            updated_ts: sess.updated_at || sess.created_at || Date.now(),
-            last_preview: "",
-            alert_count: 0,
-            _is_thread: sess.type === "chat",
-            _thread_id: sess.session_id,
-            _thread_mode: sess.mode || "free_chat",
-          });
-        }
-      }
-      // 按 Thread 过滤（如果指定）
-      const deduped = new Map();
-      for (const item of tasks) {
-        const id = String(item?.task_id || "").trim();
-        if (!id) continue;
-        const prev = deduped.get(id);
-        if (!prev || (Number(item.updated_ts) || 0) > (Number(prev.updated_ts) || 0)) {
-          deduped.set(id, item);
-        }
-      }
-      const uniqueTasks = Array.from(deduped.values()).sort((a, b) => (b.updated_ts || 0) - (a.updated_ts || 0));
+      const catalog = buildVisibleTaskCatalog({ includeLegacyPreview: true });
       const filtered = filterThread
-        ? uniqueTasks.filter((t) => (t.thread_id || t.project_id || DEFAULT_PROJECT_ID) === filterThread)
-        : uniqueTasks;
+        ? filterTasksByThread(catalog.tasks, filterThread)
+        : catalog.tasks;
       return sendJson(res, 200, { tasks: filtered });
     }
 
@@ -2408,6 +2725,8 @@ const server = http.createServer(async (req, res) => {
       const provider = String(body.provider || "claude-cli");
       const model = body.model ? String(body.model) : undefined;
       const maxIterations = Number.isFinite(body.maxIterations) ? Number(body.maxIterations) : 3;
+      const allowedTestCommands = resolveAllowedTestCommands(body, null);
+      const testerBlockedPolicy = resolveTesterBlockedPolicy(body, null);
       const roleConfig = body.role_config ? normalizeRoleConfig(body.role_config) : readRoleConfig();
       const checked = validateNicknameUniqueness(roleConfig);
       if (!checked.ok) return sendJson(res, 400, { error: checked.error });
@@ -2469,6 +2788,8 @@ const server = http.createServer(async (req, res) => {
             taskId,
             liveHooks,
             logsRoot: LOGS_ROOT,
+            allowedTestCommands,
+            testerBlockedPolicy,
           });
         } catch (err) {
           runFailed = err;
@@ -2596,6 +2917,8 @@ const server = http.createServer(async (req, res) => {
         }
 
         const summary = task.summary || {};
+        const allowedTestCommands = resolveAllowedTestCommands(body, summary);
+        const testerBlockedPolicy = resolveTesterBlockedPolicy(body, summary);
         const summaryThreadId = String(summary.thread_id || summary.project_id || "").trim();
         const threadGuard = assertThreadId(body, {
           source: "POST /api/tasks/:id/followup(task)",
@@ -2634,10 +2957,9 @@ const server = http.createServer(async (req, res) => {
         // Confirm implementation only through explicit control flag from /confirm.
         // Free-form follow-up text must never auto-switch execution mode.
         const confirmRequested = body.confirm === true;
-        const skipAppendFollowup = confirmRequested && isPureConfirmControlMessage(message);
-        if (!skipAppendFollowup) {
-          appendFollowup(task.task_dir, message, body.client_message_id || body.clientMessageId || null);
-        }
+        // Persist operator input unconditionally so refresh/reload can always reconstruct chat history.
+        // Implementation prompts still filter pure control confirmations in buildThreadPrompt().
+        appendFollowup(task.task_dir, message, body.client_message_id || body.clientMessageId || null);
         const prompt = buildThreadPrompt(task.task_dir, {
           executionMode: confirmRequested ? "implementation" : "proposal",
         });
@@ -2675,6 +2997,8 @@ const server = http.createServer(async (req, res) => {
             projectId: taskThreadId || undefined,
             threadSlug: taskThreadId || undefined,
             logsRoot: LOGS_ROOT,
+            allowedTestCommands,
+            testerBlockedPolicy,
           });
         } catch (err) {
           runFailed = err;
@@ -2819,6 +3143,8 @@ const server = http.createServer(async (req, res) => {
         const roleProviders = stageAssignmentToRoleProviders(effectiveRoleConfig);
         const roleProfiles = stageRoleProfiles(effectiveRoleConfig);
         const provider = String(body.provider || summary.provider || "claude-cli");
+        const allowedTestCommands = resolveAllowedTestCommands(body, summary);
+        const testerBlockedPolicy = resolveTesterBlockedPolicy(body, summary);
         const providerCheck = validateTaskProviders(provider, roleProviders);
         if (!providerCheck.ok) {
           return sendJson(res, 400, {
@@ -2854,6 +3180,8 @@ const server = http.createServer(async (req, res) => {
             projectId: taskThreadId || undefined,
             threadSlug: taskThreadId || undefined,
             logsRoot: LOGS_ROOT,
+            allowedTestCommands,
+            testerBlockedPolicy,
           });
         } catch (err) {
           runFailed = err;
@@ -2906,12 +3234,19 @@ const server = http.createServer(async (req, res) => {
           // Fallback: try to delete as a chat thread
           const threadMeta = readThreadMeta(LOGS_ROOT, taskId);
           if (threadMeta) {
-            const threadPath = path.join(LOGS_ROOT, "threads", taskId);
-            const resolvedThreadDir = path.resolve(threadPath);
-            if (!resolvedThreadDir.startsWith(path.resolve(LOGS_ROOT) + path.sep)) {
-              return sendJson(res, 403, { error: "禁止删除任务根目录外的文件" });
+            const hintedThreadId = String(threadMeta.parent_thread || "").trim();
+            const sessionDir = resolveChatSessionDirForDelete(taskId, hintedThreadId || null);
+            if (!sessionDir) {
+              return sendJson(res, 404, { error: "session not found" });
             }
-            fs.rmSync(threadPath, { recursive: true, force: true });
+            const sessionGuard = verifyChatSessionDeleteDir(taskId, sessionDir);
+            if (!sessionGuard.ok) {
+              return sendJson(res, sessionGuard.status || 403, { error: sessionGuard.error || "session delete blocked" });
+            }
+            fs.rmSync(sessionGuard.real_session_dir, { recursive: true, force: true });
+            const parentThread = String(threadMeta.parent_thread || "").trim() || locateSessionThread(taskId);
+            if (parentThread) safeTouchThreadActivity(parentThread, "delete_thread_session");
+            invalidateTaskResolveCache();
             LIVE_SESSIONS.delete(taskId);
             return sendJson(res, 200, { ok: true, task_id: taskId, message: "会话已删除" });
           }
@@ -3061,8 +3396,9 @@ const server = http.createServer(async (req, res) => {
     serveStatic(p, res);
   } catch (err) {
     const errMessage = err?.message || String(err);
+    const traceRequestId = req?.__traceContext?.request_id || "-";
     process.stderr.write(
-      `[ui-server] request_error method=${req.method} path=${req.url || "-"} message=${errMessage}\n`
+      `[ui-server] ts=${nowIsoUtc()} request_error request_id=${traceRequestId} method=${req.method} path=${req.url || "-"} message=${errMessage}\n`
     );
     if (err?.stack) process.stderr.write(`${String(err.stack)}\n`);
     return sendJson(res, 500, { error: err?.message || String(err) });

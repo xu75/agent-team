@@ -1,6 +1,6 @@
 # Workflow Overview | 整体流程总览
 
-Last updated | 最近更新: 2026-02-28
+Last updated | 最近更新: 2026-03-02
 Scope | 范围: Cat Cafe multi-agent runtime workflow (current implementation + chat mode + recommended refinements) | Cat Cafe 多智能体运行时流程（当前实现 + 聊天模式 + 建议优化）
 
 ## 1. End-to-end Flow (Current) | 端到端流程（当前）
@@ -73,12 +73,18 @@ flowchart TD
    CN: Reviewer 必须通过严格 JSON schema 与决策规则校验。
 3. EN: If reviewer approves, Tester must pass strict JSON schema.
    CN: Reviewer 通过后，Tester 需通过严格 JSON schema。
-4. EN: Test commands run via allowlist runner. Only allowed prefixes: `npm test`, `npm run test`, `node --test`, `pnpm test`, `yarn test`.
-   CN: 测试命令通过 allowlist runner 执行。仅允许前缀：`npm test`、`npm run test`、`node --test`、`pnpm test`、`yarn test`。
-5. EN: Test failure handling (new):
+4. EN: Test commands run via allowlist runner. Prefixes are token-parsed (`argv`) and default to `npm test`, `npm run test`, `node --test`, `pnpm test`, `yarn test`.
+   CN: 测试命令通过 allowlist runner 执行。白名单按 token(`argv`)校验，默认前缀为 `npm test`、`npm run test`、`node --test`、`pnpm test`、`yarn test`。
+5. EN: Blocked command handling:
+   CN: blocked command 处理：
+   - EN: Blocked commands are skipped (continue), not immediate stop, even with `stopOnFailure=true`.
+     CN: blocked 命令会被跳过（continue），即使 `stopOnFailure=true` 也不会立即中断。
+   - EN: `tester_command_blocked` is emitted only when `runnable_commands=0` and blocked commands exist.
+     CN: 仅当 `runnable_commands=0` 且存在 blocked 命令时，才判定 `tester_command_blocked`。
+   - EN: In `resilient` policy, if first pass is all blocked due to allowlist mismatch, tester gets one explainable retry.
+     CN: 在 `resilient` 策略下，若首轮全 blocked 且原因是 allowlist mismatch，会触发一次可解释重试。
+6. EN: Test failure handling:
    CN: 测试失败处理（新增）：
-   - EN: If all failures are blocked commands → `tester_command_blocked`, stop iteration (tester's fault).
-     CN: 若所有失败均为 blocked command → `tester_command_blocked`，停止迭代（tester 问题）。
    - EN: If same command failed in consecutive rounds → `repeated_test_failure`, stop iteration (avoid loop).
      CN: 若连续两轮相同命令失败 → `repeated_test_failure`，停止迭代（避免死循环）。
    - EN: Otherwise → `test_failed`, iterate back to coder with stderr snippet.

@@ -573,13 +573,50 @@ h3 {
 .project-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
   padding: 8px 6px 4px;
   margin-top: 8px;
+  border: 0;
+  background: transparent;
+  text-align: left;
 }
 
 .project-header:first-child {
   margin-top: 0;
+}
+
+.project-header.collapsible {
+  cursor: pointer;
+  border-radius: 8px;
+  min-height: 36px;
+  transition: background-color 120ms ease;
+}
+
+.project-header.collapsible:hover {
+  background: #f8f4f0;
+}
+
+.project-header.collapsible:active {
+  background: #f1e9e1;
+}
+
+.project-header.collapsible:focus-visible {
+  outline: 2px solid #e5b488;
+  outline-offset: 1px;
+}
+
+.project-header.collapsible[aria-disabled="true"] {
+  cursor: default;
+}
+
+.project-collapse-indicator {
+  width: 12px;
+  font-size: 10px;
+  color: #a89f98;
+  flex-shrink: 0;
+  text-align: center;
+  pointer-events: none;
 }
 
 .project-header .project-name {
@@ -588,6 +625,11 @@ h3 {
   color: #998f88;
   text-transform: uppercase;
   letter-spacing: 0.3px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-header .project-count {
@@ -596,6 +638,7 @@ h3 {
   background: #f5f0eb;
   border-radius: 99px;
   padding: 1px 6px;
+  margin-left: auto;
 }
 
 .task-item {
@@ -1853,6 +1896,11 @@ h3 {
     border-right: none;
     border-bottom: 1px solid var(--line);
     max-height: none;
+  }
+  .project-header.collapsible {
+    min-height: 44px;
+    padding-top: 10px;
+    padding-bottom: 10px;
   }
 }
 

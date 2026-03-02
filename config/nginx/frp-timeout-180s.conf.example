@@ -1,0 +1,25 @@
+# 504 诊断期临时兜底配置（Nginx）
+# 目标：降低手机经 frp 访问时的误超时，不改变业务逻辑。
+
+server {
+  listen 80;
+  server_name your.domain.example;
+
+  location / {
+    proxy_pass http://127.0.0.1:4173;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection "";
+
+    # Gate B: 首轮统一设为 180s
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 180s;
+    proxy_read_timeout 180s;
+    send_timeout 180s;
+  }
+
+  keepalive_timeout 75s;
+}

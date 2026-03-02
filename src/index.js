@@ -10,8 +10,18 @@ const testCommandTimeoutMs = Number(process.env.TEST_COMMAND_TIMEOUT_MS || 12000
 const allowedTestCommands = process.env.ALLOWED_TEST_COMMANDS
   ? process.env.ALLOWED_TEST_COMMANDS.split(",").map((s) => s.trim()).filter(Boolean)
   : undefined;
+const testerBlockedPolicy = process.env.TESTER_BLOCKED_POLICY
+  ? String(process.env.TESTER_BLOCKED_POLICY).trim()
+  : undefined;
 
-runTask(prompt, { provider, model, maxIterations, testCommandTimeoutMs, allowedTestCommands })
+runTask(prompt, {
+  provider,
+  model,
+  maxIterations,
+  testCommandTimeoutMs,
+  allowedTestCommands,
+  testerBlockedPolicy,
+})
   .then((summary) => {
     console.error("\n--- task summary ---\n" + JSON.stringify(summary, null, 2));
     process.exit(0);

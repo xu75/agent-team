@@ -126,6 +126,46 @@ function createMockThreadTask(taskId) {
   return { taskDir, threadRoot: path.join(LOGS_ROOT, "threads", threadSlug) };
 }
 
+function createMockThreadChatSession(sessionId) {
+  const threadSlug = `delete-chat-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
+  const sessionDir = path.join(LOGS_ROOT, "threads", threadSlug, "sessions", sessionId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionDir, "meta.json"),
+    JSON.stringify({
+      thread_id: sessionId,
+      parent_thread: threadSlug,
+      title: "Chat session for delete test",
+      mode: "free_chat",
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    })
+  );
+  fs.writeFileSync(
+    path.join(sessionDir, "messages.jsonl"),
+    JSON.stringify({
+      id: `${Date.now()}-m1`,
+      sender: "铲屎官",
+      sender_type: "user",
+      text: "hello",
+      ts: Date.now(),
+    }) + "\n"
+  );
+  const threadDir = path.join(LOGS_ROOT, "threads", threadSlug);
+  fs.writeFileSync(
+    path.join(threadDir, "thread.json"),
+    JSON.stringify({
+      thread_id: threadSlug,
+      name: "Delete Chat Test",
+      description: "",
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      archived: false,
+    })
+  );
+  return { sessionDir, threadRoot: threadDir };
+}
+
 async function runTests() {
   console.log("Running delete task API tests...\n");
   const port = 4700 + Math.floor(Math.random() * 200);
@@ -166,23 +206,34 @@ async function runTests() {
     assert(!fs.existsSync(threadTaskDir), "Thread-scoped task directory should be deleted");
     console.log("  PASS\n");
 
-    // Test 4: Invalid task ID format (400)
-    console.log("Test 4: Delete with invalid task ID format - should return 400");
-    const res4 = await request(port, "DELETE", "/api/tasks/invalid-id");
-    assert.strictEqual(res4.status, 400, `Expected 400, got ${res4.status}`);
-    assert(res4.body.error, "Should have error message");
+    // Test 4: Delete thread-scoped chat session success (200)
+    console.log("Test 4: Delete thread-scoped chat session - should return 200 and remove dir");
+    const testSessionId4 = randomTaskId();
+    const { sessionDir: chatSessionDir, threadRoot: chatThreadRoot } = createMockThreadChatSession(testSessionId4);
+    cleanupThreadRoot = chatThreadRoot;
+    assert(fs.existsSync(chatSessionDir), "Thread-scoped chat session should exist before delete");
+    const res4 = await request(port, "DELETE", `/api/tasks/${testSessionId4}`);
+    assert.strictEqual(res4.status, 200, `Expected 200, got ${res4.status}`);
+    assert(!fs.existsSync(chatSessionDir), "Thread-scoped chat session directory should be deleted");
     console.log("  PASS\n");
 
-    // Test 5: Path traversal attempt (400)
-    console.log("Test 5: Path traversal attempt - should return 400");
-    const res5 = await request(port, "DELETE", "/api/tasks/..%2F..%2Fetc");
+    // Test 5: Invalid task ID format (400)
+    console.log("Test 5: Delete with invalid task ID format - should return 400");
+    const res5 = await request(port, "DELETE", "/api/tasks/invalid-id");
     assert.strictEqual(res5.status, 400, `Expected 400, got ${res5.status}`);
+    assert(res5.body.error, "Should have error message");
     console.log("  PASS\n");
 
-    // Test 6: Path with slashes (400)
-    console.log("Test 6: Task ID with slashes - should return 400");
-    const res6 = await request(port, "DELETE", "/api/tasks/2099-01-01/task");
-    assert(res6.status === 400 || res6.status === 404, `Expected 400 or 404, got ${res6.status}`);
+    // Test 6: Path traversal attempt (400)
+    console.log("Test 6: Path traversal attempt - should return 400");
+    const res6 = await request(port, "DELETE", "/api/tasks/..%2F..%2Fetc");
+    assert.strictEqual(res6.status, 400, `Expected 400, got ${res6.status}`);
+    console.log("  PASS\n");
+
+    // Test 7: Path with slashes (400)
+    console.log("Test 7: Task ID with slashes - should return 400");
+    const res7 = await request(port, "DELETE", "/api/tasks/2099-01-01/task");
+    assert(res7.status === 400 || res7.status === 404, `Expected 400 or 404, got ${res7.status}`);
     console.log("  PASS\n");
 
     console.log("All tests passed!");

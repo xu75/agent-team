@@ -14,6 +14,11 @@ const {
   WORKFLOW_NODES,
   buildWorkflowModeState,
 } = require("../modes/mode-registry");
+const {
+  buildCatLookup,
+  parseMentions,
+  buildChatContext,
+} = require("./context-builder");
 
 const WORKFLOW_ROLE_TO_STAGE = Object.freeze({
   CoreDev: "coder",
@@ -59,62 +64,6 @@ function writeRuntimeLog(scope, title, fields = {}) {
  */
 
 // ---------------------------------------------------------------------------
-// Cat registry — builds a lookup from role-config cats section
-// ---------------------------------------------------------------------------
-
-function buildCatLookup(cats) {
-  // cats: { "银渐层": { model_id, display_name, nickname, aliases, ... }, ... }
-  const lookup = new Map(); // key (lowercase) → cat config object
-  if (!cats || typeof cats !== "object") return lookup;
-
-  for (const [name, cat] of Object.entries(cats)) {
-    if (!cat || typeof cat !== "object") continue;
-    const entry = { ...cat, cat_name: name };
-    // Register by display_name
-    lookup.set(name.toLowerCase(), entry);
-    // Register by nickname
-    if (cat.nickname) lookup.set(cat.nickname.toLowerCase(), entry);
-    // Register by aliases
-    if (Array.isArray(cat.aliases)) {
-      for (const alias of cat.aliases) {
-        if (typeof alias === "string" && alias.trim()) {
-          lookup.set(alias.trim().toLowerCase(), entry);
-        }
-      }
-    }
-  }
-  return lookup;
-}
-
-// ---------------------------------------------------------------------------
-// @mention parser
-// ---------------------------------------------------------------------------
-
-/**
- * Parse @mentions from user input text.
- * Supports: @银渐层, @牛奶, @咖啡, etc.
- * Returns { targets: [cat_entry, ...], cleanText: "message without @mentions" }
- */
-function parseMentions(text, catLookup) {
-  const mentionPattern = /@([\u4e00-\u9fff\w]+)/g;
-  const targets = [];
-  const seen = new Set();
-  let match;
-
-  while ((match = mentionPattern.exec(text)) !== null) {
-    const name = match[1].toLowerCase();
-    const cat = catLookup.get(name);
-    if (cat && !seen.has(cat.cat_name)) {
-      seen.add(cat.cat_name);
-      targets.push(cat);
-    }
-  }
-
-  const cleanText = text.replace(/@[\u4e00-\u9fff\w]+/g, "").trim();
-  return { targets, cleanText };
-}
-
-// ---------------------------------------------------------------------------
 // Resolve provider info from cat config + models list
 // ---------------------------------------------------------------------------
 
@@ -130,48 +79,6 @@ function resolveProviderForCat(cat, models) {
     model: modelDef.model || null,
     settingsFile: modelDef.settings_file || null,
   };
-}
-
-// ---------------------------------------------------------------------------
-// Build chat prompt with persona
-// ---------------------------------------------------------------------------
-
-function buildChatPrompt(cat, userMessage, history, peerCats) {
-  const lines = [];
-  const name = cat.display_name || cat.cat_name;
-  const persona = cat.persona || "";
-
-  lines.push(`你是${name}，Cat Café 里的一只猫猫。`);
-  if (persona) lines.push(`性格：${persona}`);
-  lines.push("");
-
-  // Introduce peers
-  if (peerCats && peerCats.length > 0) {
-    lines.push("你的猫猫同事：");
-    for (const peer of peerCats) {
-      const peerName = peer.display_name || peer.cat_name;
-      const peerNick = peer.nickname || peerName;
-      lines.push(`- ${peerName}（昵称：${peerNick}）`);
-    }
-    lines.push("");
-  }
-
-  // Conversation history (last N messages for context)
-  if (history && history.length > 0) {
-    lines.push("对话历史：");
-    for (const msg of history.slice(-20)) {
-      const sender = msg.sender || "铲屎官";
-      lines.push(`[${sender}]: ${msg.text}`);
-    }
-    lines.push("");
-  }
-
-  lines.push("铲屎官说：");
-  lines.push(userMessage);
-  lines.push("");
-  lines.push(`请以${name}的身份回复。保持你的性格特点，简洁自然地回答。`);
-
-  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +402,6 @@ async function sendChatMessage({
 }) {
   const cats = roleConfig?.cats || {};
   const models = roleConfig?.models || [];
-  const catLookup = buildCatLookup(cats);
 
   // Read thread meta for mode info
   const threadMeta =
@@ -530,32 +436,17 @@ async function sendChatMessage({
     } catch {}
   }
 
-  // Parse @mentions
-  const { targets, cleanText } = parseMentions(userText, catLookup);
-
-  // Build effective targets:
-  // 1. workflow mode → always follow current workflow node (ignore @mention routing)
-  // 2. other modes + explicit @mention → only mentioned cats respond
-  // 3. other modes + no @mention → all cats
-  const catNames = Object.keys(cats);
-  let effectiveTargets;
-  if (mode === "workflow") {
-    const currentNode = modeState?.current_node || "coder";
-    const node = WORKFLOW_NODES.find((n) => n.id === currentNode) || WORKFLOW_NODES[0];
-    const roleMap = modeState?.role_map || {};
-    // Find the cat(s) assigned to the current node's role
-    const activeCats = catNames.filter((n) => roleMap[n] === node.role);
-    if (activeCats.length > 0) {
-      effectiveTargets = activeCats.map((n) => ({ ...cats[n], cat_name: n }));
-    } else {
-      // Fallback: all cats (shouldn't happen with proper init)
-      effectiveTargets = catNames.map((n) => ({ ...cats[n], cat_name: n }));
-    }
-  } else if (targets.length > 0) {
-    effectiveTargets = targets;
-  } else {
-    effectiveTargets = catNames.map((n) => ({ ...cats[n], cat_name: n }));
-  }
+  // Context routing decisions are centralized in context-builder.
+  const preContext = buildChatContext({
+    mode,
+    modeState,
+    userText,
+    cats,
+    history: [],
+    workflowNodes: WORKFLOW_NODES,
+  });
+  const effectiveTargets = preContext.effectiveTargets;
+  const promptUserText = preContext.promptUserText;
 
   if (effectiveTargets.length === 0) {
     throw new Error("没有可用的猫猫，请检查 role-config.json 中的 cats 配置。");
@@ -571,6 +462,16 @@ async function sendChatMessage({
 
   // Read history for context
   const history = readMessages(logsRoot, threadId, effectiveThreadSlug);
+  const postContext = buildChatContext({
+    mode,
+    modeState,
+    userText,
+    cats,
+    history,
+    workflowNodes: WORKFLOW_NODES,
+  });
+  const promptHistory = postContext.promptHistory;
+  const workflowTaskPrompt = postContext.workflowTaskPrompt;
 
   // Build peer list (all cats except current target)
   const allCatEntries = Object.entries(cats).map(([name, c]) => ({ ...c, cat_name: name }));
@@ -578,7 +479,7 @@ async function sendChatMessage({
   async function runSingleCat(cat, promptModeState, extraMeta = {}) {
     const { provider, model, settingsFile } = resolveProviderForCat(cat, models);
     const peerCats = allCatEntries.filter((c) => c.cat_name !== cat.cat_name);
-    const prompt = buildModePrompt(mode, cat, cleanText || userText, history, peerCats, promptModeState);
+    const prompt = buildModePrompt(mode, cat, promptUserText, promptHistory, peerCats, promptModeState);
     const catLabel = cat.display_name || cat.cat_name;
     writeRuntimeLog("chat", "start", {
       thread: threadId,
@@ -757,20 +658,7 @@ async function sendChatMessage({
       return catMsg;
     }
 
-    const userMessages = history
-      .filter((m) => m && m.sender_type === "user")
-      .map((m) => String(m.text || "").trim())
-      .filter(Boolean);
-    const taskPrompt = (() => {
-      if (!userMessages.length) return cleanText || userText;
-      const first = userMessages[0];
-      if (userMessages.length === 1) return first;
-      const lines = [first, "", "Follow-up messages from operator (chronological):"];
-      userMessages.slice(1).forEach((m, idx) => {
-        lines.push(`${idx + 1}. ${m}`);
-      });
-      return lines.join("\n");
-    })();
+    const taskPrompt = workflowTaskPrompt;
 
     for (let round = 1; round <= maxRounds; round += 1) {
       executedRounds = round;

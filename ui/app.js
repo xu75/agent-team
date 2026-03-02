@@ -22,6 +22,7 @@ const state = {
     kind: null,
   },
   collapsedProjects: new Set(),
+  collapsedThreadGroups: new Set(),
   // 草稿防丢失：key = taskId (或 "__new__" 表示新对话), value = 草稿文本
   drafts: new Map(),
   // 新对话草稿模式
@@ -332,12 +333,24 @@ function normalizeProjectId(v) {
     .replace(/[^a-z0-9\-_]/g, "") || "default";
 }
 
-function taskProjectInfo(t) {
-  const rawName = String(t?.project_name || t?.project_id || "默认项目").trim();
-  const rawId = String(t?.project_id || rawName).trim();
+function taskProjectInfo(t, threadById = null) {
+  const rawThreadId = String(t?.thread_id || "").trim();
+  if (rawThreadId) {
+    const mapped = threadById instanceof Map ? threadById.get(rawThreadId) : null;
+    const mappedName = String(mapped?.project_name || mapped?.name || "").trim();
+    const fallbackName = String(t?.project_name || rawThreadId).trim();
+    return {
+      id: `thread:${rawThreadId}`,
+      name: mappedName || fallbackName || rawThreadId,
+      thread_id: rawThreadId,
+      unassigned: false,
+    };
+  }
   return {
-    id: normalizeProjectId(rawId),
-    name: rawName || "默认项目",
+    id: "thread:unassigned",
+    name: "未分配",
+    thread_id: null,
+    unassigned: true,
   };
 }
 
@@ -814,18 +827,65 @@ function taskGroups(tasks) {
 }
 
 function projectTaskGroups(tasks) {
+  const threadById = new Map(
+    state.projects.map((p) => [String(p.project_id || "").trim(), p])
+  );
   const map = new Map();
   for (const t of tasks) {
-    const p = taskProjectInfo(t);
-    if (!map.has(p.id)) map.set(p.id, { id: p.id, name: p.name, tasks: [] });
+    const p = taskProjectInfo(t, threadById);
+    if (!map.has(p.id)) {
+      map.set(p.id, {
+        id: p.id,
+        name: p.name,
+        thread_id: p.thread_id,
+        unassigned: !!p.unassigned,
+        tasks: [],
+      });
+    }
     map.get(p.id).tasks.push(t);
   }
-  return Array.from(map.values())
+  const groups = Array.from(map.values())
     .map((p) => {
       p.tasks.sort((a, b) => (b.updated_ts || 0) - (a.updated_ts || 0));
       return p;
     })
     .sort((a, b) => (b.tasks[0]?.updated_ts || 0) - (a.tasks[0]?.updated_ts || 0));
+  const nameCounts = new Map();
+  for (const g of groups) {
+    const key = String(g.name || "").trim().toLowerCase();
+    if (!key) continue;
+    nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+  }
+  for (const g of groups) {
+    const key = String(g.name || "").trim().toLowerCase();
+    const duplicated = key && (nameCounts.get(key) || 0) > 1;
+    g.display_name = duplicated && g.thread_id
+      ? `${g.name} (${g.thread_id})`
+      : g.name;
+  }
+  return groups;
+}
+
+function threadGroupCollapseKey(group) {
+  const threadId = String(group?.thread_id || "").trim();
+  return threadId ? `thread:${threadId}` : "thread:unassigned";
+}
+
+function threadGroupCollapseKeyForTask(task) {
+  return threadGroupCollapseKey(taskProjectInfo(task));
+}
+
+function expandThreadGroupForTask(taskId, tasks = state.tasks) {
+  if (state.currentProjectId !== null || !taskId) return;
+  const target = Array.isArray(tasks) ? tasks.find((t) => t.task_id === taskId) : null;
+  if (!target) return;
+  state.collapsedThreadGroups.delete(threadGroupCollapseKeyForTask(target));
+}
+
+function expandThreadGroupByThreadId(threadId) {
+  const id = String(threadId || "").trim();
+  if (!id) return;
+  state.collapsedThreadGroups.delete(`thread:${id}`);
 }
 
 function renderTasks() {
@@ -851,17 +911,45 @@ function renderTasks() {
     return;
   }
 
+  const searchActive = !!String(el.taskSearch?.value || "").trim();
+  const canCollapseGroups = state.currentProjectId === null;
+
   // 扁平化列表：按项目分组，项目名作为分隔标题，对话直接列出
   const projects = projectTaskGroups(state.filtered);
   projects.forEach((project) => {
+    const groupKey = threadGroupCollapseKey(project);
+    const persistedCollapsed = canCollapseGroups && state.collapsedThreadGroups.has(groupKey);
+    // Invariant: search only overrides collapsed visibility in this render path.
+    // Never mutate collapsedThreadGroups during search, so clearing search can restore user preference.
+    const renderedCollapsed = canCollapseGroups && !searchActive && persistedCollapsed;
+
     // 项目标题行
-    const projectHeader = document.createElement("div");
-    projectHeader.className = "project-header";
+    const projectHeader = document.createElement(canCollapseGroups ? "button" : "div");
+    projectHeader.className = `project-header${canCollapseGroups ? " collapsible" : ""}${renderedCollapsed ? " collapsed" : ""}${searchActive ? " search-forced-open" : ""}`;
+    if (canCollapseGroups) {
+      projectHeader.type = "button";
+      projectHeader.setAttribute("aria-expanded", String(!renderedCollapsed));
+      projectHeader.setAttribute("aria-disabled", String(searchActive));
+      projectHeader.dataset.groupKey = groupKey;
+    }
     projectHeader.innerHTML = `
-      <span class="project-name">${escapeHtml(project.name)}</span>
+      ${canCollapseGroups ? `<span class="project-collapse-indicator" aria-hidden="true">${renderedCollapsed ? "▶" : "▼"}</span>` : ""}
+      <span class="project-name" title="${escapeHtml(project.thread_id || project.name)}">${escapeHtml(project.display_name || project.name)}</span>
       <span class="project-count">${project.tasks.length}</span>
     `;
+    if (canCollapseGroups) {
+      projectHeader.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (searchActive) return;
+        if (state.collapsedThreadGroups.has(groupKey)) state.collapsedThreadGroups.delete(groupKey);
+        else state.collapsedThreadGroups.add(groupKey);
+        renderTasks();
+      });
+    }
     el.taskList.appendChild(projectHeader);
+
+    if (renderedCollapsed) return;
 
     // 直接列出该项目下的所有对话
     project.tasks.forEach((t) => {
@@ -901,9 +989,11 @@ function applyFilter() {
   const q = el.taskSearch.value.trim().toLowerCase();
   state.filtered = state.tasks.filter((t) => {
     if (!q) return true;
+    const p = taskProjectInfo(t);
     return (
       String(t.project_name || "").toLowerCase().includes(q) ||
       String(t.project_id || "").toLowerCase().includes(q) ||
+      String(p.name || "").toLowerCase().includes(q) ||
       t.task_id.toLowerCase().includes(q) ||
       String(t.task_title || "").toLowerCase().includes(q) ||
       String(t.provider).toLowerCase().includes(q) ||
@@ -1658,6 +1748,7 @@ async function selectTask(taskId) {
   saveChatForCurrentTask();
 
   state.selectedTaskId = taskId;
+  expandThreadGroupForTask(taskId, state.tasks);
   state.selectedRound = null;
   // 恢复目标任务的聊天消息
   await restoreChatForTask(taskId);
@@ -1766,6 +1857,11 @@ async function loadProjects() {
     updated_at: t.updated_at,
     archived: t.archived,
     session_count: t.session_count || 0,
+    visible_count: Number.isFinite(t.visible_count) ? t.visible_count : (t.session_count || 0),
+    breakdown: {
+      scoped: Number.isFinite(t?.breakdown?.scoped) ? t.breakdown.scoped : 0,
+      legacy: Number.isFinite(t?.breakdown?.legacy) ? t.breakdown.legacy : 0,
+    },
   }));
   state.defaultProjectId = data.default_thread_id || null;
   if (!state.currentProjectId && state.defaultProjectId) {
@@ -1802,7 +1898,15 @@ function renderProjectDropdown() {
     const isActive = state.currentProjectId === p.project_id;
     const isDefault = p.project_id === state.defaultProjectId;
     item.className = `project-dropdown-item${isActive ? " active" : ""}`;
-    const sessionInfo = p.session_count ? ` <small>(${p.session_count})</small>` : "";
+    const visibleCount = Math.max(0, Number(p.visible_count || 0));
+    const scopedCount = Math.max(0, Number(p?.breakdown?.scoped || 0));
+    const legacyCount = Math.max(0, Number(p?.breakdown?.legacy || 0));
+    const sessionInfo = ` <small>(${visibleCount})</small>`;
+    if (legacyCount > 0) {
+      item.title = `可见会话 ${visibleCount} = scoped ${scopedCount} + legacy ${legacyCount}`;
+    } else {
+      item.title = `可见会话 ${visibleCount}`;
+    }
     item.innerHTML = `
       <span class="project-item-name">${escapeHtml(p.project_name)}${isDefault ? " <small>(默认)</small>" : ""}${sessionInfo}</span>
       ${p.archived ? '<span class="project-archived-tag">已归档</span>' : ""}
@@ -2341,6 +2445,8 @@ async function ensureChatSession(initialMessage = "", preferredMode = state.curr
   });
   const threadId = created?.session?.thread_id || created?.thread?.thread_id;
   if (!threadId) throw new Error("创建对话失败：未返回 thread_id");
+  const targetThreadId = threadSlug || created?.thread?.thread_id || threadId;
+  expandThreadGroupByThreadId(targetThreadId);
   adoptThreadSession(threadId);
   safeSetCurrentMode(created?.thread?.mode || preferredMode || state.currentMode);
   state.currentModeState = created?.thread?.mode_state || {};

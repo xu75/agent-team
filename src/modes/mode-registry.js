@@ -72,7 +72,7 @@ function buildBaseHeader(cat, peerCats) {
 function appendHistory(lines, history) {
   if (history && history.length > 0) {
     lines.push("对话历史：");
-    for (const msg of history.slice(-20)) {
+    for (const msg of history) {
       const sender = msg.sender || "铲屎官";
       lines.push(`[${sender}]: ${msg.text}`);
     }

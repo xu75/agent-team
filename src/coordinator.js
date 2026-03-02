@@ -7,7 +7,11 @@ const crypto = require("node:crypto");
 const { runCoder } = require("./agents/coder");
 const { runReviewer } = require("./agents/reviewer");
 const { runTester } = require("./agents/tester");
-const { runTestCommands, DEFAULT_ALLOWED_PREFIXES } = require("./engine/test-runner");
+const {
+  runTestCommands,
+  DEFAULT_ALLOWED_PREFIXES,
+  normalizeAllowedPrefixes,
+} = require("./engine/test-runner");
 const { createTaskLogDir, roundDir, writeText, writeJson } = require("./engine/task-logger");
 
 const FSM_STATES = Object.freeze({
@@ -29,6 +33,78 @@ const STATE_LABELS = Object.freeze({
   [FSM_STATES.ITERATE]: "Iterate",
   [FSM_STATES.FINALIZE]: "Finalize",
 });
+
+const TESTER_BLOCKED_POLICIES = new Set(["strict", "resilient"]);
+
+function normalizeTesterBlockedPolicy(value) {
+  const policy = String(value || "").trim().toLowerCase();
+  if (TESTER_BLOCKED_POLICIES.has(policy)) return policy;
+  return "strict";
+}
+
+function summarizeTestRun(testRun) {
+  const results = Array.isArray(testRun?.results) ? testRun.results : [];
+  const blockedResults = results.filter((r) => r?.blocked === true);
+  const runnableResults = results.filter((r) => r?.runnable === true);
+  const retryableBlocked = blockedResults.filter((r) => r?.retryable_blocked === true);
+  const maliciousBlocked = blockedResults.filter((r) => r?.blocked_severity === "malicious");
+  const failedRunnable = runnableResults.find((r) => !r?.ok) || null;
+  const firstBlocked = blockedResults[0] || null;
+  return {
+    blocked_commands: Number.isFinite(testRun?.blocked_commands)
+      ? Number(testRun.blocked_commands)
+      : blockedResults.length,
+    runnable_commands: Number.isFinite(testRun?.runnable_commands)
+      ? Number(testRun.runnable_commands)
+      : runnableResults.length,
+    retryable_blocked_commands: Number.isFinite(testRun?.retryable_blocked_commands)
+      ? Number(testRun.retryable_blocked_commands)
+      : retryableBlocked.length,
+    malicious_blocked_commands: maliciousBlocked.length,
+    first_blocked_command: testRun?.first_blocked_command || firstBlocked?.command || null,
+    blocked_reason: testRun?.blocked_reason || firstBlocked?.blocked_reason || null,
+    first_failed_runnable: failedRunnable,
+    failed_runnable_commands: runnableResults.filter((r) => !r?.ok).length,
+  };
+}
+
+function shouldRetryBlockedCommands({ policy, summary, retryCount = 0 }) {
+  if (policy !== "resilient") return false;
+  if (!summary || typeof summary !== "object") return false;
+  if (retryCount >= 1) return false;
+  if (summary.blocked_commands <= 0) return false;
+  if (summary.runnable_commands !== 0) return false;
+  if (summary.malicious_blocked_commands > 0) return false;
+  return summary.retryable_blocked_commands === summary.blocked_commands;
+}
+
+function shouldFinalizeAsTesterCommandBlocked(summary) {
+  if (!summary || typeof summary !== "object") return false;
+  return summary.runnable_commands === 0 && summary.blocked_commands > 0;
+}
+
+function buildTesterBlockedRetryFeedback({
+  blockedCommands = [],
+  allowedPrefixes = DEFAULT_ALLOWED_PREFIXES,
+}) {
+  const blockedList = blockedCommands.length
+    ? blockedCommands.map((cmd, idx) => `${idx + 1}. ${cmd}`).join("\n")
+    : "1. (none)";
+  const allowedList = allowedPrefixes.map((x) => `- ${x}`).join("\n");
+  return [
+    "Your previous commands were blocked by the allowlist. Re-generate commands with strict compliance.",
+    "Blocked commands:",
+    blockedList,
+    "",
+    "Allowed command prefixes:",
+    allowedList,
+    "",
+    "Reusable valid examples:",
+    "- node --test tests/**/*.test.js",
+    "- npm test -- --grep \"keyword\"",
+    "- pnpm test -- --filter unit",
+  ].join("\n");
+}
 
 function copyRunArtifacts(runDir, roundPath, prefix) {
   if (!runDir) return;
@@ -269,9 +345,13 @@ async function runTask(taskPrompt, options = {}) {
   const testCommandTimeoutMs = Number.isFinite(options.testCommandTimeoutMs)
     ? options.testCommandTimeoutMs
     : 2 * 60 * 1000;
-  const allowedTestCommands = Array.isArray(options.allowedTestCommands)
-    ? options.allowedTestCommands
-    : DEFAULT_ALLOWED_PREFIXES;
+  const allowlist = normalizeAllowedPrefixes(
+    Array.isArray(options.allowedTestCommands) ? options.allowedTestCommands : DEFAULT_ALLOWED_PREFIXES
+  );
+  const allowedTestCommands = allowlist.prefixes;
+  const testerBlockedPolicy = normalizeTesterBlockedPolicy(
+    options.testerBlockedPolicy || process.env.TESTER_BLOCKED_POLICY
+  );
   const abortSignal = options.abortSignal || null;
   const projectId = options.projectId || null;
   const threadSlug = options.threadSlug || null;
@@ -329,6 +409,14 @@ async function runTask(taskPrompt, options = {}) {
   }
   let currentState = priorSummary?.final_status || null;
   const stateEvents = Array.isArray(priorSummary?.state_events) ? [...priorSummary.state_events] : [];
+
+  if (allowlist.rejected.length) {
+    writeWorkflowLog("allowed_test_commands_sanitized", {
+      task_id: taskId,
+      rejected_count: allowlist.rejected.length,
+      used_fallback: allowlist.used_fallback ? "true" : "false",
+    });
+  }
 
   function transition(to, payload = {}) {
     const evt = {
@@ -761,7 +849,7 @@ async function runTask(taskPrompt, options = {}) {
 
       throwIfAborted();
       emitLiveAgentState("tester", { state: "thinking", run_mode: "implementation", round });
-      const tester = await runTester({
+      let tester = await runTester({
         provider: providerFor("tester"),
         model: modelFor("tester"),
         settingsFile: settingsFileFor("tester"),
@@ -793,10 +881,52 @@ async function runTask(taskPrompt, options = {}) {
       });
       copyRunArtifacts(tester.runDir, roundPath, "tester");
 
-      const commands = Array.isArray(tester.test_spec?.commands) ? tester.test_spec.commands : [];
+      if (!tester.ok) {
+        const roundRef = rounds[rounds.length - 1];
+        if (roundRef) {
+          roundRef.tester = {
+            run_id: tester.runId,
+            ok: tester.ok,
+            parse_error: tester.parse_error,
+            command_count: 0,
+            tests_passed: false,
+            blocked_commands: 0,
+            runnable_commands: 0,
+            retry_used: false,
+            retry_trigger: null,
+            first_blocked_command: null,
+            blocked_reason: null,
+          };
+        }
+        emitLiveAgentState("tester", { state: "error", round, error: tester.error_class || tester.parse_error || "tester_invalid" });
+        if (tester.error_class) {
+          mustFix = [`Tester provider error: ${tester.error_class}`];
+          finalOutcome = tester.error_class;
+          transition(FSM_STATES.FINALIZE, {
+            round,
+            reason: finalOutcome,
+          });
+          break;
+        }
+        mustFix = ["Tester output schema invalid"];
+        finalOutcome = "tester_schema_invalid";
+        transition(FSM_STATES.ITERATE, {
+          round,
+          reason: "tester_schema_invalid",
+        });
+        continue;
+      }
+
+      let commands = Array.isArray(tester.test_spec?.commands) ? tester.test_spec.commands : [];
+      let retryUsed = false;
+      let retryTrigger = null;
+      let testRun = null;
+      let testSummary = null;
+      let retryCount = 0;
+
       throwIfAborted();
       emitLiveAgentState("tester", { state: "tool", round, test_commands: commands.length });
-      const testRun = await runTestCommands(commands, {
+      testRun = await runTestCommands(commands, {
         timeoutMs: testCommandTimeoutMs,
         cwd: process.cwd(),
         env: process.env,
@@ -805,6 +935,84 @@ async function runTask(taskPrompt, options = {}) {
         abortSignal,
         streamOutput: true,
       });
+      testSummary = summarizeTestRun(testRun);
+
+      if (shouldRetryBlockedCommands({ policy: testerBlockedPolicy, summary: testSummary, retryCount })) {
+        retryUsed = true;
+        retryCount = 1;
+        retryTrigger = "all_blocked_allowlist_mismatch";
+        writeJson(path.join(roundPath, "test-results-initial.json"), testRun);
+        const blockedCommands = testRun.results
+          .filter((r) => r?.blocked === true)
+          .map((r) => r.command)
+          .filter(Boolean);
+        const retryFeedback = buildTesterBlockedRetryFeedback({
+          blockedCommands,
+          allowedPrefixes: allowedTestCommands,
+        });
+        writeText(path.join(roundPath, "tester_retry_feedback.txt"), retryFeedback + "\n");
+
+        throwIfAborted();
+        emitLiveAgentState("tester", {
+          state: "thinking",
+          run_mode: "implementation",
+          round,
+          retry: retryCount,
+          retry_reason: retryTrigger,
+        });
+        tester = await runTester({
+          provider: providerFor("tester"),
+          model: modelFor("tester"),
+          settingsFile: settingsFileFor("tester"),
+          roleProfile: profileFor("tester"),
+          peerProfiles: peersFor("tester"),
+          taskPrompt,
+          coderOutput: coder.text,
+          discussionContract,
+          retryFeedback,
+          timeoutMs,
+          abortSignal,
+          eventMeta: {
+            task_id: taskId,
+            round_id: round,
+            agent_role: "tester",
+            attempt: `${attempt}-retry1`,
+          },
+          onLiveEvent: (evt) => emitLiveAgentEvent("tester", evt),
+        });
+        writeText(path.join(roundPath, "tester_retry_raw.md"), tester.text);
+        writeJson(path.join(roundPath, "tester_retry.json"), tester.test_spec);
+        writeJson(path.join(roundPath, "tester_retry_meta.json"), {
+          ok: tester.ok,
+          parse_error: tester.parse_error,
+          error_class: tester.error_class || null,
+          run_id: tester.runId,
+          run_dir: tester.runDir,
+          exit: tester.exit,
+        });
+        copyRunArtifacts(tester.runDir, roundPath, "tester_retry");
+
+        if (tester.ok) {
+          commands = Array.isArray(tester.test_spec?.commands) ? tester.test_spec.commands : [];
+          throwIfAborted();
+          emitLiveAgentState("tester", {
+            state: "tool",
+            round,
+            test_commands: commands.length,
+            retry: retryCount,
+          });
+          testRun = await runTestCommands(commands, {
+            timeoutMs: testCommandTimeoutMs,
+            cwd: process.cwd(),
+            env: process.env,
+            allowedPrefixes: allowedTestCommands,
+            stopOnFailure: true,
+            abortSignal,
+            streamOutput: true,
+          });
+          testSummary = summarizeTestRun(testRun);
+        }
+      }
 
       writeJson(path.join(roundPath, "test-results.json"), testRun);
       writeText(
@@ -815,6 +1023,9 @@ async function runTask(taskPrompt, options = {}) {
               `# Command ${idx + 1}`,
               `cmd: ${r.command}`,
               `ok: ${r.ok}`,
+              `runnable: ${r.runnable === true}`,
+              `blocked: ${r.blocked === true}`,
+              `blocked_reason: ${r.blocked_reason || "-"}`,
               `code: ${r.code}`,
               r.stdout ? `stdout:\n${r.stdout}` : "stdout:",
               r.stderr ? `stderr:\n${r.stderr}` : "stderr:",
@@ -832,6 +1043,12 @@ async function runTask(taskPrompt, options = {}) {
           parse_error: tester.parse_error,
           command_count: commands.length,
           tests_passed: testRun.allPassed,
+          blocked_commands: testSummary.blocked_commands,
+          runnable_commands: testSummary.runnable_commands,
+          retry_used: retryUsed,
+          retry_trigger: retryTrigger,
+          first_blocked_command: testSummary.first_blocked_command,
+          blocked_reason: testSummary.blocked_reason,
         };
       }
 
@@ -857,17 +1074,14 @@ async function runTask(taskPrompt, options = {}) {
 
       if (!testRun.allPassed) {
         emitLiveAgentState("tester", { state: "error", round, error: "test_failed" });
-        const blockedResults = testRun.results.filter(
-          (r) => !r.ok && r.stderr?.includes("blocked command")
-        );
 
-        if (
-          blockedResults.length > 0 &&
-          testRun.results.every((r) => r.ok || r.stderr?.includes("blocked command"))
-        ) {
-          // All failures are blocked commands → Tester's fault, no point iterating
+        if (shouldFinalizeAsTesterCommandBlocked(testSummary)) {
           mustFix = [
-            `Tester generated blocked command(s): ${blockedResults.map((r) => r.command).join("; ")}`,
+            `Tester generated blocked command(s): ${testRun.results
+              .filter((r) => r?.blocked === true)
+              .map((r) => r.command)
+              .join("; ")}`,
+            `First blocked reason: ${testSummary.blocked_reason || "unknown"}`,
             `Only allowed: ${allowedTestCommands.join(", ")}`,
           ];
           finalOutcome = "tester_command_blocked";
@@ -875,8 +1089,7 @@ async function runTask(taskPrompt, options = {}) {
           break;
         }
 
-        // Real test failure
-        const failed = testRun.results.find((r) => !r.ok);
+        const failed = testSummary.first_failed_runnable || testRun.results.find((r) => r.runnable === true && !r.ok);
         const stderrSnippet = failed?.stderr ? failed.stderr.slice(0, 500) : "";
         mustFix = [
           "Tests failed in tester stage",
@@ -909,7 +1122,13 @@ async function runTask(taskPrompt, options = {}) {
 
       finalOutcome = "approved";
       mustFix = [];
-      emitLiveAgentState("tester", { state: "done", round, tests_passed: true });
+      emitLiveAgentState("tester", {
+        state: "done",
+        round,
+        tests_passed: true,
+        blocked_commands: testSummary.blocked_commands,
+        runnable_commands: testSummary.runnable_commands,
+      });
       transition(FSM_STATES.FINALIZE, { round, reason: "tests_passed" });
       break;
     }
@@ -995,6 +1214,8 @@ async function runTask(taskPrompt, options = {}) {
     final_outcome: finalOutcome,
     awaiting_operator_confirm: finalOutcome === "awaiting_operator_confirm",
     workflow_phase: executionMode,
+    tester_blocked_policy: testerBlockedPolicy,
+    allowed_test_commands: allowedTestCommands,
     max_iterations: maxIterations,
     fsm_states: Object.values(FSM_STATES),
     state_events: stateEvents,
@@ -1027,4 +1248,13 @@ async function runOnce(prompt, options = {}) {
   return { summary, review: lastRound ? lastRound.reviewer : null };
 }
 
-module.exports = { FSM_STATES, runTask, runOnce };
+module.exports = {
+  FSM_STATES,
+  normalizeTesterBlockedPolicy,
+  summarizeTestRun,
+  shouldRetryBlockedCommands,
+  shouldFinalizeAsTesterCommandBlocked,
+  buildTesterBlockedRetryFeedback,
+  runTask,
+  runOnce,
+};
