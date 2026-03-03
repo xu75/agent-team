@@ -9,6 +9,10 @@
     "run:codex": "node scripts/run-codex.js",
     "ui": "node scripts/ui-server.js",
     "rebuild:thread-index": "node scripts/rebuild-thread-index.js",
-    "test": "node tests/delete-task.test.js"
+    "verify:legacy-project": "node scripts/verify-project-legacy-parity.js",
+    "test": "node tests/delete-task.test.js",
+    "test:task-run-async": "node tests/task-run-async.test.js",
+    "test:task-session-resolve": "node tests/task-session-resolve.test.js",
+    "test:thread-visible-count": "node tests/thread-visible-count.test.js"
   }
 }

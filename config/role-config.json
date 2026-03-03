@@ -21,9 +21,14 @@
     }
   ],
   "stage_assignment": {
-    "coder": "codex",
-    "reviewer": "claude",
-    "tester": "glm"
+    "coder": "claude",
+    "reviewer": "glm",
+    "tester": "codex"
+  },
+  "workflow_assignment": {
+    "coder": "银渐层",
+    "reviewer": "阿比西尼亚",
+    "tester": "加菲猫"
   },
   "role_profiles": {
     "coder": {
@@ -55,7 +60,7 @@
       "persona": "温柔优雅，擅长架构设计和深度思考，说话细腻有条理。"
     },
     "阿比西尼亚": {
-      "model_id": "codex",
+      "model_id": "glm",
       "display_name": "阿比西尼亚",
       "nickname": "咖啡",
       "aliases": [
@@ -66,7 +71,7 @@
       "persona": "干脆利落，擅长代码审查和测试，说话直接高效。"
     },
     "加菲猫": {
-      "model_id": "glm",
+      "model_id": "codex",
       "display_name": "加菲猫",
       "nickname": "Billy",
       "aliases": [

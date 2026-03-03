@@ -14,15 +14,15 @@
             <span class="paw">●</span>
             <h1>Cat Café</h1>
           </div>
-          <div class="project-selector-row">
-            <button id="projectSelectorBtn" class="project-selector-btn" title="切换 Thread">
+          <div class="thread-selector-row project-selector-row">
+            <button id="projectSelectorBtn" class="thread-selector-btn project-selector-btn" title="切换 Thread">
               <span id="projectSelectorName">Cat Cafe</span>
-              <span class="project-arrow">▾</span>
+              <span class="thread-arrow project-arrow">▾</span>
             </button>
             <button id="newProjectBtn" class="icon-btn" title="新建 Thread" aria-label="新建 Thread">+</button>
             <button id="archiveProjectBtn" class="icon-btn" title="归档当前 Thread" aria-label="归档当前 Thread">⎘</button>
             <button id="deleteProjectBtn" class="icon-btn danger" title="硬删除当前 Thread" aria-label="硬删除当前 Thread">×</button>
-            <div id="projectDropdown" class="project-dropdown" aria-hidden="true"></div>
+            <div id="projectDropdown" class="thread-dropdown project-dropdown" aria-hidden="true"></div>
           </div>
           <div class="panel-title-row">
             <h2>对话</h2>
@@ -42,10 +42,6 @@
                 <span class="mode-arrow">▾</span>
               </button>
               <div id="modeDropdown" class="mode-dropdown" aria-hidden="true"></div>
-            </div>
-            <div id="workflowNodeBar" class="workflow-node-bar" style="display:none;">
-              <div id="workflowNodeSteps" class="workflow-node-steps"></div>
-              <button id="advanceNodeBtn" class="btn workflow-advance-btn" title="推进到下一节点">下一步 ▶</button>
             </div>
             <div class="top-icon-actions">
               <button id="exportReportBtn" class="icon-btn" title="导出报告" aria-label="导出报告">
@@ -88,6 +84,10 @@
               <button data-action="rerun-task">重跑任务</button>
               <button data-action="clear-round-filter">清除回合筛选</button>
             </div>
+          </div>
+          <div id="workflowNodeBar" class="workflow-node-bar" style="display:none;">
+            <div id="workflowNodeSteps" class="workflow-node-steps"></div>
+            <button id="advanceNodeBtn" class="btn workflow-advance-btn" title="推进到下一节点">下一步 ▶</button>
           </div>
           <div id="chatStream" class="chat-stream"></div>
           <button id="jumpBottomBtn" class="jump-bottom-btn" title="回到最新消息" aria-label="回到最新消息">

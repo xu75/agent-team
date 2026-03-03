@@ -14,6 +14,7 @@ const {
   listThreads: listChatSessions,
   sendChatMessage,
 } = require("../src/engine/chat-session");
+const { syncRoleConfigCats } = require("../src/engine/role-config-sync");
 const { getModes, getMode, isValidMode, advanceWorkflowNode, WORKFLOW_NODES } = require("../src/modes/mode-registry");
 const {
   // Thread API (new)
@@ -33,7 +34,6 @@ const {
   updateProject,
   deleteProject,
   listProjects,
-  ensureDefaultProject,
 } = require("../src/engine/project-manager");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -41,6 +41,29 @@ const UI_ROOT = path.join(ROOT, "ui");
 const LOGS_ROOT = path.join(ROOT, "logs");
 const CONFIG_ROOT = path.join(ROOT, "config");
 const ROLE_CONFIG_FILE = path.join(CONFIG_ROOT, "role-config.json");
+
+// === Structured access log ===
+// All 5xx responses, long-request traces, and 30s early-warnings are written here.
+// Log file path: logs/ui-server.access.log  (relative to project root)
+// Used by: scripts/collect-504-logs.sh
+if (!fs.existsSync(LOGS_ROOT)) {
+  fs.mkdirSync(LOGS_ROOT, { recursive: true });
+}
+const ACCESS_LOG_FILE = path.join(LOGS_ROOT, "ui-server.access.log");
+const _accessLogStream = fs.createWriteStream(ACCESS_LOG_FILE, { flags: "a" });
+
+function logLine(line) {
+  const full = line.endsWith("\n") ? line : `${line}\n`;
+  try { _accessLogStream.write(full); } catch { /* non-fatal */ }
+  process.stdout.write(full);
+}
+
+function logErrorLine(line) {
+  const full = line.endsWith("\n") ? line : `${line}\n`;
+  try { _accessLogStream.write(full); } catch { /* non-fatal */ }
+  process.stderr.write(full);
+}
+
 const PORT = Number(process.env.UI_PORT || 4173);
 const HOST = process.env.UI_HOST || "127.0.0.1";
 const ACTIVE_TASK_RUNS = new Map();
@@ -110,6 +133,8 @@ const LONG_REQUEST_TRACE_ENABLED = /^(1|true|yes|on)$/i.test(
   String(process.env.LONG_REQUEST_TRACE_ENABLED || "1").trim()
 );
 const LONG_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.LONG_REQUEST_TIMEOUT_MS || 180000));
+// WARNING fires at 30s so slow requests are visible in logs before nginx/frp times out at 60-180s.
+const LONG_REQUEST_WARN_MS = Math.max(1000, Number(process.env.LONG_REQUEST_WARN_MS || 30000));
 const DEFAULT_ALLOWED_TEST_COMMANDS = String(process.env.ALLOWED_TEST_COMMANDS || "")
   .split(",")
   .map((s) => s.trim())
@@ -123,12 +148,59 @@ const TASK_RESOLVE_CACHE = {
   logged_misses: new Set(),
 };
 
+const DEPRECATION_STATS = {
+  started_at: nowIsoUtc(),
+  updated_at: nowIsoUtc(),
+  api_projects_calls_total: 0,
+  project_id_requests_total: 0,
+  api_projects_by_source: {},
+  project_id_by_source: {},
+};
+
 function nowTs() {
   return Date.now();
 }
 
 function nowIsoUtc() {
   return new Date().toISOString();
+}
+
+function shouldLogDeprecation(total) {
+  return total <= 5 || total % 25 === 0;
+}
+
+function bumpDeprecationCounter(key, source, field) {
+  const sourceKey = String(source || "unknown").trim() || "unknown";
+  DEPRECATION_STATS[key] = Number(DEPRECATION_STATS[key] || 0) + 1;
+  DEPRECATION_STATS[field][sourceKey] = Number(DEPRECATION_STATS[field][sourceKey] || 0) + 1;
+  DEPRECATION_STATS.updated_at = nowIsoUtc();
+  return DEPRECATION_STATS[key];
+}
+
+function trackDeprecatedProjectsApi(source) {
+  const total = bumpDeprecationCounter("api_projects_calls_total", source, "api_projects_by_source");
+  if (!shouldLogDeprecation(total)) return;
+  process.stdout.write(
+    `[deprecation][warn] api=/api/projects source=${source} total=${total} migrate_to=/api/threads\n`
+  );
+}
+
+function trackDeprecatedProjectIdUsage(source, value) {
+  const total = bumpDeprecationCounter("project_id_requests_total", source, "project_id_by_source");
+  if (!shouldLogDeprecation(total)) return;
+  const preview = clip(value, 64) || "(empty)";
+  process.stdout.write(
+    `[deprecation][warn] field=project_id source=${source} total=${total} value=${preview} migrate_to=thread_slug/thread_id\n`
+  );
+}
+
+function readDeprecationStatsSnapshot() {
+  const apiProjects = Number(DEPRECATION_STATS.api_projects_calls_total || 0);
+  const projectId = Number(DEPRECATION_STATS.project_id_requests_total || 0);
+  return {
+    ...DEPRECATION_STATS,
+    phase2_entry_ready: apiProjects === 0 && projectId === 0,
+  };
 }
 
 function createTaskId() {
@@ -185,6 +257,7 @@ function createRequestTraceContext(req, reqPath) {
     request_id: headerRequestId || createRequestId(),
     timeout_logged: false,
     completed: false,
+    warn_timer: null,
     timeout_timer: null,
   };
 }
@@ -196,28 +269,53 @@ function bindRequestTrace(req, res, trace) {
   if (!res.headersSent) {
     res.setHeader("x-request-id", trace.request_id);
   }
-  process.stdout.write(
-    `[http-trace] ts=${trace.started_iso} stage=start request_id=${trace.request_id} method=${trace.method} path=${trace.path}\n`
+  logLine(
+    `[http-trace] ts=${trace.started_iso} stage=start request_id=${trace.request_id} method=${trace.method} path=${trace.path}`
   );
   const finalizeTrace = (stage, statusCode) => {
     if (trace.completed) return;
     trace.completed = true;
+    if (trace.warn_timer) {
+      clearTimeout(trace.warn_timer);
+      trace.warn_timer = null;
+    }
     if (trace.timeout_timer) {
       clearTimeout(trace.timeout_timer);
       trace.timeout_timer = null;
     }
     const endedAt = Date.now();
     const endedIso = new Date(endedAt).toISOString();
+    const durationMs = endedAt - trace.started_at;
     const safeStatus = Number.isFinite(statusCode) ? statusCode : 0;
-    process.stdout.write(
-      `[http-trace] ts=${endedIso} stage=${stage} request_id=${trace.request_id} method=${trace.method} path=${trace.path} status=${safeStatus} started_at=${trace.started_iso} ended_at=${endedIso} duration_ms=${endedAt - trace.started_at}\n`
+    logLine(
+      `[http-trace] ts=${endedIso} stage=${stage} request_id=${trace.request_id} method=${trace.method} path=${trace.path} status=${safeStatus} started_at=${trace.started_iso} ended_at=${endedIso} duration_ms=${durationMs}`
     );
+    // Detect probable proxy 504: "close" fires (without prior "finish") when the
+    // upstream connection was terminated — almost always by nginx/frp returning 504
+    // to the client.  If the request ran longer than the warning threshold, flag it.
+    if (stage === "close" && durationMs >= LONG_REQUEST_WARN_MS) {
+      logErrorLine(
+        `[http-trace] ts=${endedIso} stage=probable_504 level=ERROR request_id=${trace.request_id} method=${trace.method} path=${trace.path} upstream_status=${safeStatus} duration_ms=${durationMs} hint=connection_closed_before_response_finish`
+      );
+    }
   };
+  // 30s early-warning: fires before nginx/frp timeout so slow requests leave a log trail.
+  if (LONG_REQUEST_WARN_MS > 0 && LONG_REQUEST_WARN_MS < LONG_REQUEST_TIMEOUT_MS) {
+    trace.warn_timer = setTimeout(() => {
+      if (trace.completed) return;
+      logLine(
+        `[http-trace] ts=${nowIsoUtc()} stage=30s_warning level=WARN request_id=${trace.request_id} method=${trace.method} path=${trace.path} warn_ms=${LONG_REQUEST_WARN_MS} elapsed_ms=${Date.now() - trace.started_at}`
+      );
+    }, LONG_REQUEST_WARN_MS);
+    if (typeof trace.warn_timer.unref === "function") {
+      trace.warn_timer.unref();
+    }
+  }
   if (LONG_REQUEST_TIMEOUT_MS > 0) {
     trace.timeout_timer = setTimeout(() => {
       trace.timeout_logged = true;
-      process.stdout.write(
-        `[http-trace] ts=${nowIsoUtc()} stage=timeout_hint request_id=${trace.request_id} method=${trace.method} path=${trace.path} timeout_ms=${LONG_REQUEST_TIMEOUT_MS} elapsed_ms=${Date.now() - trace.started_at}\n`
+      logLine(
+        `[http-trace] ts=${nowIsoUtc()} stage=timeout_hint request_id=${trace.request_id} method=${trace.method} path=${trace.path} timeout_ms=${LONG_REQUEST_TIMEOUT_MS} elapsed_ms=${Date.now() - trace.started_at}`
       );
     }, LONG_REQUEST_TIMEOUT_MS);
     if (typeof trace.timeout_timer.unref === "function") {
@@ -239,8 +337,8 @@ function updateTraceRequestId(req, body) {
   if (res && !res.headersSent) {
     res.setHeader("x-request-id", bodyRequestId);
   }
-  process.stdout.write(
-    `[http-trace] ts=${nowIsoUtc()} stage=request_id_override old_request_id=${oldRequestId} request_id=${trace.request_id} method=${trace.method} path=${trace.path}\n`
+  logLine(
+    `[http-trace] ts=${nowIsoUtc()} stage=request_id_override old_request_id=${oldRequestId} request_id=${trace.request_id} method=${trace.method} path=${trace.path}`
   );
 }
 
@@ -813,13 +911,14 @@ function normalizeRoleConfig(input) {
     };
   }
 
-  return {
+  const normalized = {
     version: input.version || 3,
     models: mergedModels,
     stage_assignment: stage,
     role_profiles: roleProfiles,
     cats: input.cats && typeof input.cats === "object" ? input.cats : undefined,
   };
+  return syncRoleConfigCats(normalized, { stages: STAGES });
 }
 
 function validateNicknameUniqueness(roleConfig) {
@@ -987,6 +1086,11 @@ function readRequestJson(req) {
       }
       try {
         const parsed = JSON.parse(data);
+        if (Object.prototype.hasOwnProperty.call(parsed, "project_id")) {
+          const srcPath = String(req?.__traceContext?.path || req?.url || "").trim() || "/";
+          const srcMethod = String(req?.method || "UNKNOWN").toUpperCase();
+          trackDeprecatedProjectIdUsage(`${srcMethod} ${srcPath}`, parsed.project_id);
+        }
         updateTraceRequestId(req, parsed);
         resolve(parsed);
       } catch {
@@ -1310,6 +1414,7 @@ function listTasks(threadById = null) {
       const projectName = threadMeta
         ? (clip(threadMeta.name || summary.project_name || summary.workspace_name || "", 96) || threadMeta.name || null)
         : null;
+      const threadName = projectName || (threadId ? threadId : null);
       const alertCount =
         unresolved.length +
         (tone === "negative" ? 1 : 0) +
@@ -1319,6 +1424,7 @@ function listTasks(threadById = null) {
         task_id: summary.task_id || t.taskId,
         project_id: projectId,
         thread_id: threadId,
+        thread_name: threadName,
         project_name: projectName,
         date,
         provider: summary.provider || "unknown",
@@ -1396,6 +1502,7 @@ function buildVisibleTaskCatalog(opts = {}) {
       task_id: taskId,
       project_id: threadId || null,
       thread_id: threadId,
+      thread_name: threadMeta?.name || null,
       project_name: threadMeta?.name || null,
       date: new Date(session.created_at || Date.now()).toISOString().slice(0, 10),
       provider: "chat",
@@ -1426,6 +1533,7 @@ function buildVisibleTaskCatalog(opts = {}) {
         task_id: sessionId,
         project_id: thread.thread_id,
         thread_id: thread.thread_id,
+        thread_name: thread.name || DEFAULT_PROJECT_NAME,
         project_name: thread.name || DEFAULT_PROJECT_NAME,
         date: new Date(sess.created_at || Date.now()).toISOString().slice(0, 10),
         provider: sess.type === "task" ? "workflow" : "chat",
@@ -2263,7 +2371,49 @@ const server = http.createServer(async (req, res) => {
   const trace = createRequestTraceContext(req, p);
   bindRequestTrace(req, res, trace);
 
+  // Universal 5xx structured access log — fires for every response regardless of route.
+  // Writes: timestamp / method / path / status / response_time_ms / client_ip / user-agent / request-id
+  const _accessReqStartedAt = Date.now();
+  const _accessClientIp = String(
+    req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "-"
+  ).split(",")[0].trim();
+  const _accessUa = String(req.headers["user-agent"] || "-").replace(/\s+/g, " ").slice(0, 200);
+  const _accessXff = String(req.headers["x-forwarded-for"] || "-");
+  res.on("finish", () => {
+    const status = res.statusCode;
+    if (status >= 500) {
+      const durationMs = Date.now() - _accessReqStartedAt;
+      const requestId = trace?.request_id || "-";
+      logErrorLine(
+        `[access] ts=${new Date().toISOString()} level=ERROR method=${String(req.method || "").toUpperCase()} path=${p} status=${status} duration_ms=${durationMs} request_id=${requestId} client_ip=${_accessClientIp} x_forwarded_for=${_accessXff} ua=${_accessUa}`
+      );
+    }
+  });
+
   try {
+    if (p === "/api/deprecations" && req.method === "GET") {
+      return sendJson(res, 200, readDeprecationStatsSnapshot());
+    }
+
+    // ---- Client-side error beacon ----
+    // Browser reports errors that the server cannot observe (e.g. nginx/frp 504).
+    if (p === "/api/client-error" && req.method === "POST") {
+      const body = await readRequestJson(req);
+      const status = Number(body.status) || 0;
+      const action = String(body.action || "-").slice(0, 80);
+      const message = String(body.message || "-").slice(0, 300);
+      const taskId = String(body.task_id || "-").slice(0, 80);
+      const requestId = String(body.request_id || trace?.request_id || "-").slice(0, 80);
+      logErrorLine(
+        `[client-error] ts=${nowIsoUtc()} level=ERROR status=${status} action=${action} task_id=${taskId} request_id=${requestId} message=${message}`
+      );
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (p === "/api/projects" || p.startsWith("/api/projects/")) {
+      trackDeprecatedProjectsApi(`${String(req.method || "UNKNOWN").toUpperCase()} ${p}`);
+    }
+
     // ---- Thread CRUD endpoints (Thread = project container) ----
 
     if (p === "/api/threads" && req.method === "GET") {
@@ -2698,7 +2848,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/api/tasks" && req.method === "GET") {
-      const filterThread = u.searchParams.get("thread_id") || u.searchParams.get("project_id") || null;
+      const legacyProjectId = u.searchParams.get("project_id");
+      if (legacyProjectId !== null) {
+        trackDeprecatedProjectIdUsage("GET /api/tasks?project_id", legacyProjectId);
+      }
+      const filterThread = u.searchParams.get("thread_id") || legacyProjectId || null;
       const catalog = buildVisibleTaskCatalog({ includeLegacyPreview: true });
       const filtered = filterThread
         ? filterTasksByThread(catalog.tasks, filterThread)
@@ -3397,10 +3551,10 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     const errMessage = err?.message || String(err);
     const traceRequestId = req?.__traceContext?.request_id || "-";
-    process.stderr.write(
-      `[ui-server] ts=${nowIsoUtc()} request_error request_id=${traceRequestId} method=${req.method} path=${req.url || "-"} message=${errMessage}\n`
+    logErrorLine(
+      `[ui-server] ts=${nowIsoUtc()} request_error request_id=${traceRequestId} method=${req.method} path=${req.url || "-"} message=${errMessage}`
     );
-    if (err?.stack) process.stderr.write(`${String(err.stack)}\n`);
+    if (err?.stack) logErrorLine(String(err.stack));
     return sendJson(res, 500, { error: err?.message || String(err) });
   }
 });
@@ -3414,4 +3568,5 @@ if (indexRepair?.repaired) {
 
 server.listen(PORT, HOST, () => {
   process.stdout.write(`UI server running: http://${HOST}:${PORT}\n`);
+  process.stdout.write(`Access log (5xx + traces): ${ACCESS_LOG_FILE}\n`);
 });

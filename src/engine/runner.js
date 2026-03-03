@@ -23,6 +23,7 @@ async function runCommandStreaming({
   cmd,
   args,
   env = process.env,
+  cwd = undefined,
   stdoutParseMode = "ndjson",
   eventMeta = {},
   timeoutMs = 10 * 60 * 1000,
@@ -94,10 +95,9 @@ async function runCommandStreaming({
     gracefulKill("aborted by operator");
   }
 
-  child = spawn(cmd, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    env,
-  });
+  const spawnOpts = { stdio: ["ignore", "pipe", "pipe"], env };
+  if (cwd) spawnOpts.cwd = cwd;
+  child = spawn(cmd, args, spawnOpts);
 
   emit("run.spawned", { pid: child.pid });
 

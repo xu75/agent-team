@@ -84,6 +84,9 @@ function selectEffectiveTargets({
   const mentions = Array.isArray(mentionTargets) ? mentionTargets : [];
 
   if (mode === "workflow") {
+    // Explicit @mentions override workflow node routing
+    if (mentions.length > 0) return mentions;
+
     const nodes = Array.isArray(workflowNodes) && workflowNodes.length > 0
       ? workflowNodes
       : [{ id: "coder", role: "CoreDev" }];

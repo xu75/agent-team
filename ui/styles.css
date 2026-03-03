@@ -350,7 +350,8 @@ body {
   box-shadow: 0 8px 18px -14px rgba(80, 62, 46, 0.35);
 }
 
-/* ---- Project Selector ---- */
+/* ---- Thread Selector (legacy .project-* kept for compatibility) ---- */
+.thread-selector-row,
 .project-selector-row {
   display: flex;
   align-items: center;
@@ -359,6 +360,7 @@ body {
   position: relative;
 }
 
+.thread-selector-btn,
 .project-selector-btn {
   flex: 1;
   display: flex;
@@ -376,16 +378,19 @@ body {
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
+.thread-selector-btn:hover,
 .project-selector-btn:hover {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(124, 111, 224, 0.12);
 }
 
+.thread-arrow,
 .project-arrow {
   font-size: 10px;
   opacity: 0.5;
 }
 
+.thread-dropdown,
 .project-dropdown {
   position: absolute;
   top: 100%;
@@ -401,10 +406,12 @@ body {
   overflow-y: auto;
 }
 
+.thread-dropdown[aria-hidden="true"],
 .project-dropdown[aria-hidden="true"] {
   display: none;
 }
 
+.thread-dropdown-item,
 .project-dropdown-item {
   display: flex;
   align-items: center;
@@ -420,32 +427,38 @@ body {
   text-align: left;
 }
 
+.thread-dropdown-item:hover,
 .project-dropdown-item:hover {
   background: var(--hover-bg);
 }
 
+.thread-dropdown-item.active,
 .project-dropdown-item.active {
   background: var(--accent);
   color: #fff;
 }
 
+.thread-dropdown-sep,
 .project-dropdown-sep {
   height: 1px;
   background: var(--border);
   margin: 4px 8px;
 }
 
+.thread-item-name,
 .project-item-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.thread-item-name small,
 .project-item-name small {
   font-weight: normal;
   opacity: 0.6;
 }
 
+.thread-archived-tag,
 .project-archived-tag {
   font-size: 10px;
   padding: 1px 5px;
@@ -570,6 +583,7 @@ h3 {
   gap: 4px;
 }
 
+.thread-header,
 .project-header {
   display: flex;
   align-items: center;
@@ -582,10 +596,12 @@ h3 {
   text-align: left;
 }
 
+.thread-header:first-child,
 .project-header:first-child {
   margin-top: 0;
 }
 
+.thread-header.collapsible,
 .project-header.collapsible {
   cursor: pointer;
   border-radius: 8px;
@@ -593,23 +609,28 @@ h3 {
   transition: background-color 120ms ease;
 }
 
+.thread-header.collapsible:hover,
 .project-header.collapsible:hover {
   background: #f8f4f0;
 }
 
+.thread-header.collapsible:active,
 .project-header.collapsible:active {
   background: #f1e9e1;
 }
 
+.thread-header.collapsible:focus-visible,
 .project-header.collapsible:focus-visible {
   outline: 2px solid #e5b488;
   outline-offset: 1px;
 }
 
+.thread-header.collapsible[aria-disabled="true"],
 .project-header.collapsible[aria-disabled="true"] {
   cursor: default;
 }
 
+.thread-collapse-indicator,
 .project-collapse-indicator {
   width: 12px;
   font-size: 10px;
@@ -619,6 +640,7 @@ h3 {
   pointer-events: none;
 }
 
+.thread-header .thread-name,
 .project-header .project-name {
   font-size: 11px;
   font-weight: 650;
@@ -632,6 +654,7 @@ h3 {
   white-space: nowrap;
 }
 
+.thread-header .thread-count,
 .project-header .project-count {
   font-size: 10px;
   color: #b5aca5;
@@ -1897,6 +1920,7 @@ h3 {
     border-bottom: 1px solid var(--line);
     max-height: none;
   }
+  .thread-header.collapsible,
   .project-header.collapsible {
     min-height: 44px;
     padding-top: 10px;
@@ -1983,8 +2007,13 @@ h3 {
   font-weight: 400;
 }
 
-/* ---- Workflow Node Bar ---- */
+/* ---- Workflow Node Bar (second header row, sits just below .center-top) ---- */
 .workflow-node-bar {
+  position: absolute;
+  top: 46px;
+  left: 0;
+  right: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 8px;

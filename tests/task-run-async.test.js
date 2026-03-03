@@ -126,7 +126,6 @@ async function run() {
     const accepted = await request(port, "POST", "/api/tasks/run", {
       prompt: "async smoke test",
       thread_slug: DEFAULT_THREAD,
-      project_id: DEFAULT_THREAD,
     });
     assert.strictEqual(accepted.status, 202, `expected 202, got ${accepted.status}`);
     assert.strictEqual(accepted.body.accepted, true, "accepted should be true");
@@ -155,4 +154,3 @@ run().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-

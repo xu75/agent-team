@@ -53,7 +53,7 @@ function isValidSandboxMode(mode) {
   return mode === "read-only" || mode === "workspace-write" || mode === "danger-full-access";
 }
 
-function buildCodexCommand({ prompt, model, sandboxMode }) {
+function buildCodexCommand({ prompt, model, sandboxMode, addDirs }) {
   if (typeof prompt !== "string" || !prompt.trim()) {
     throw new Error("buildCodexCommand: prompt must be a non-empty string");
   }
@@ -67,6 +67,14 @@ function buildCodexCommand({ prompt, model, sandboxMode }) {
 
   if (typeof sandboxMode === "string" && isValidSandboxMode(sandboxMode)) {
     args.push("--sandbox", sandboxMode);
+  }
+
+  if (Array.isArray(addDirs)) {
+    for (const dir of addDirs) {
+      if (dir && typeof dir === "string") {
+        args.push("--add-dir", dir);
+      }
+    }
   }
 
   args.push(prompt);

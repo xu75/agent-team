@@ -185,7 +185,7 @@ async function run() {
     const unassignedRow = allTasks.find((t) => t.task_id === legacyUnassigned.thread_id);
     assert(unassignedRow, "unassigned legacy row should exist in all-task view");
     assert.strictEqual(unassignedRow.thread_id, null, "unassigned legacy row thread_id should be null");
-    assert.strictEqual(unassignedRow.project_name, null, "unassigned legacy row project_name should be null");
+    assert.strictEqual(unassignedRow.thread_name, null, "unassigned legacy row thread_name should be null");
 
     process.stdout.write("thread visible count tests passed\n");
   } finally {

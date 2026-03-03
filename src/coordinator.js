@@ -355,6 +355,7 @@ async function runTask(taskPrompt, options = {}) {
   const abortSignal = options.abortSignal || null;
   const projectId = options.projectId || null;
   const threadSlug = options.threadSlug || null;
+  const containerThreadId = threadSlug || projectId || null;
   const logsRoot = String(options.logsRoot || "logs");
   const liveHooks = options.liveHooks && typeof options.liveHooks === "object"
     ? options.liveHooks
@@ -366,7 +367,7 @@ async function runTask(taskPrompt, options = {}) {
   const existingTaskDir = options.taskDir ? String(options.taskDir) : null;
   const created = appendToTask
     ? { taskId: existingTaskId, dir: existingTaskDir }
-    : createTaskLogDir(logsRoot, options.taskId, threadSlug);
+    : createTaskLogDir(logsRoot, options.taskId, containerThreadId);
   const { taskId, dir: taskDir } = created;
   if (!taskId || !taskDir) {
     throw new Error("appendToTask requires both taskId and taskDir");
@@ -1182,8 +1183,9 @@ async function runTask(taskPrompt, options = {}) {
   const summary = {
     task_id: taskId,
     task_dir: taskDir,
-    project_id: projectId || undefined,
-    thread_id: threadSlug || projectId || undefined,
+    thread_id: containerThreadId || undefined,
+    // Backward compatibility; remove after consumers migrate to thread_id.
+    project_id: containerThreadId || undefined,
     timeline_file: path.join(taskDir, "task-timeline.json"),
     provider,
     model: model || null,

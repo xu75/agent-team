@@ -53,7 +53,7 @@
 - `thread_id`（无则服务端创建新 session）
 - `mode`
 - `role_config`
-- `thread_slug/project_id`
+- `thread_slug`（`project_id` 仅保留兼容输入，已进入弃用统计）
 
 ### 4.2 服务端入口
 
@@ -110,9 +110,20 @@ Prompt 由 `buildModePrompt`（mode-registry）构建，主要包含：
 
 ## 7. 边界与注意点
 
+- **当前实现局限（2026-03-02）**  
+  Thread 当前主要解决“数据归属（session 属于哪个 thread）”，尚未落地“执行 workspace 绑定”：
+  - `thread.json` 里还没有 `workspace_root` / `allowed_write_roots` / `schema_version` 字段。
+  - 执行链路仍使用服务进程工作目录：如 `src/coordinator.js`、`src/engine/chat-session.js` 的测试执行均传入 `cwd: process.cwd()`。
+  - `src/providers/codex-cli.js` 当前只注入 `--sandbox`，尚未注入 `--add-dir` 白名单目录。
+  - 因此“新 Thread 能改到 Cat-Cafe 代码”在当前实现下是可能发生的（本质是执行边界未按 Thread 隔离）。
+  - 另外，未显式指定 thread 时，`/api/chat` 仍存在 fallback 到默认 thread 的兼容路径（默认截止配置为 `2026-04-15`）。
+
 - 历史窗口仍是固定 20 条，暂无摘要/检索增强。
 - 当前轮用户输入会先写入历史，再在 prompt 的“铲屎官说”中单独注入，语义上可能出现一次重复。
 - 线程会话关系由 `thread_slug + session` 约束，跨 thread 的 session 调用会被拒绝。
+- Phase 2 入场门槛改为指标门控：`/api/projects` 调用计数与 `project_id` 请求计数都降为 0（或仅来自 compat 测试流量）。
+
+Thread/Session/Workspace 的目标边界模型与约束见：`docs/Architecture/thread-session-workspace-boundary.md`。
 
 ## 8. 关键代码位置
 

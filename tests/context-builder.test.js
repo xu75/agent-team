@@ -41,7 +41,8 @@ function run() {
     ["银渐层", "阿比西尼亚"]
   );
 
-  const workflowTargets = selectEffectiveTargets({
+  // workflow + explicit @mentions → mentions override node routing
+  const workflowMentionTargets = selectEffectiveTargets({
     mode: "workflow",
     modeState: {
       current_node: "reviewer",
@@ -59,7 +60,31 @@ function run() {
       { id: "tester", role: "Tester" },
     ],
   });
-  assert.deepStrictEqual(workflowTargets.map((t) => t.cat_name), ["阿比西尼亚"]);
+  assert.deepStrictEqual(
+    workflowMentionTargets.map((t) => t.cat_name),
+    ["银渐层", "阿比西尼亚"]
+  );
+
+  // workflow + no mentions → falls back to current node routing
+  const workflowNodeTargets = selectEffectiveTargets({
+    mode: "workflow",
+    modeState: {
+      current_node: "reviewer",
+      role_map: {
+        "银渐层": "CoreDev",
+        "阿比西尼亚": "Reviewer",
+        "加菲猫": "Tester",
+      },
+    },
+    cats,
+    mentionTargets: [],
+    workflowNodes: [
+      { id: "coder", role: "CoreDev" },
+      { id: "reviewer", role: "Reviewer" },
+      { id: "tester", role: "Tester" },
+    ],
+  });
+  assert.deepStrictEqual(workflowNodeTargets.map((t) => t.cat_name), ["阿比西尼亚"]);
 
   const history = Array.from({ length: DEFAULT_PROMPT_HISTORY_LIMIT + 3 }, (_, i) => ({
     sender: "u",

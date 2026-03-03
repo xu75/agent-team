@@ -264,11 +264,64 @@ function validateAndRepairIndex(logsRoot) {
 
 /* ---------- Thread CRUD ---------- */
 
-function createThread(logsRoot, { slug, name, description }) {
+/**
+ * 校验 workspace_root 是否合法（拒绝根目录和 home 根级目录）。
+ * 返回 { ok, error, code } 或 { ok, resolved }。
+ */
+function validateWorkspaceRoot(raw) {
+  if (raw === undefined || raw === null) return { ok: true, resolved: null };
+  const str = String(raw).trim();
+  if (!str) return { ok: true, resolved: null };
+  if (!path.isAbsolute(str)) {
+    return { ok: false, code: "PATH_TRAVERSAL", error: "workspace_root must be an absolute path" };
+  }
+  const normalized = path.resolve(str);
+  if (normalized === "/") {
+    return { ok: false, code: "PATH_TRAVERSAL", error: "workspace_root cannot be filesystem root '/'" };
+  }
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  if (homeDir && normalized === path.resolve(homeDir)) {
+    return { ok: false, code: "PATH_TRAVERSAL", error: "workspace_root cannot be home root directory" };
+  }
+  return { ok: true, resolved: normalized };
+}
+
+/**
+ * 解析 Thread 的 workspace 策略。
+ * v0（无 schema_version）：返回 { version:"v0", workspaceRoot:null, allowedWriteRoots:null }
+ * v1：返回实际值。
+ */
+function resolveThreadWorkspacePolicy(threadMeta) {
+  if (!threadMeta) return { version: "v0", workspaceRoot: null, allowedWriteRoots: null };
+  const sv = String(threadMeta.schema_version || "").trim();
+  if (sv !== "v1") {
+    return { version: "v0", workspaceRoot: null, allowedWriteRoots: null };
+  }
+  const wr = threadMeta.workspace_root ? path.resolve(String(threadMeta.workspace_root)) : null;
+  let awr = null;
+  if (Array.isArray(threadMeta.allowed_write_roots)) {
+    awr = threadMeta.allowed_write_roots
+      .map((p) => path.resolve(String(p)))
+      .filter(Boolean);
+  } else if (wr) {
+    // 字段缺失时默认继承为 [workspace_root]
+    awr = [wr];
+  }
+  return { version: "v1", workspaceRoot: wr, allowedWriteRoots: awr };
+}
+
+function createThread(logsRoot, { slug, name, description, workspace_root, allowed_write_roots, schema_version }) {
   const id = normalizeSlug(slug);
   const file = threadFilePath(logsRoot, id);
   const dir = threadDirPath(logsRoot, id);
   ensureDir(threadsRoot(logsRoot));
+
+  // 校验 workspace_root
+  if (workspace_root !== undefined && workspace_root !== null) {
+    const wsCheck = validateWorkspaceRoot(workspace_root);
+    if (!wsCheck.ok) return { ok: false, code: wsCheck.code, error: wsCheck.error };
+  }
+
   try {
     fs.mkdirSync(dir, { recursive: false });
   } catch (err) {
@@ -288,6 +341,19 @@ function createThread(logsRoot, { slug, name, description }) {
     updated_at: now,
     archived: false,
   };
+
+  // 写入 workspace 相关字段（schema_version=v1 时）
+  const sv = String(schema_version || "").trim();
+  if (sv === "v1") {
+    meta.schema_version = "v1";
+    if (workspace_root !== undefined && workspace_root !== null) {
+      meta.workspace_root = path.resolve(String(workspace_root));
+    }
+    if (Array.isArray(allowed_write_roots)) {
+      meta.allowed_write_roots = allowed_write_roots.map((p) => path.resolve(String(p)));
+    }
+    // allowed_write_roots 缺失时不写入字段 → resolveThreadWorkspacePolicy 会默认继承 [workspace_root]
+  }
 
   try {
     fs.writeFileSync(file, JSON.stringify(meta, null, 2), "utf8");
@@ -314,9 +380,20 @@ function updateThread(logsRoot, slug, patch) {
   const meta = readThread(logsRoot, slug);
   if (!meta) return { ok: false, error: `Thread "${slug}" 不存在` };
 
-  const allowed = ["name", "description", "archived"];
+  // 校验 workspace_root（如果传入）
+  if (patch.workspace_root !== undefined) {
+    const wsCheck = validateWorkspaceRoot(patch.workspace_root);
+    if (!wsCheck.ok) return { ok: false, code: wsCheck.code, error: wsCheck.error };
+  }
+
+  const allowed = ["name", "description", "archived", "workspace_root", "allowed_write_roots", "schema_version"];
   for (const key of allowed) {
     if (patch[key] !== undefined) meta[key] = patch[key];
+  }
+  // 归一化路径
+  if (meta.workspace_root) meta.workspace_root = path.resolve(String(meta.workspace_root));
+  if (Array.isArray(meta.allowed_write_roots)) {
+    meta.allowed_write_roots = meta.allowed_write_roots.map((p) => path.resolve(String(p)));
   }
   meta.updated_at = Date.now();
 
@@ -663,6 +740,8 @@ module.exports = {
   readIndex,
   rebuildIndex,
   validateAndRepairIndex,
+  resolveThreadWorkspacePolicy,
+  validateWorkspaceRoot,
 
   // Project API (backward compat)
   normalizeProjectId,

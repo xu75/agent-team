@@ -41,7 +41,7 @@ function resolveCodexSandboxMode(eventMeta = {}) {
   return null;
 }
 
-function resolveProvider(provider, prompt, model, settingsFile, eventMeta = {}) {
+function resolveProvider(provider, prompt, model, settingsFile, eventMeta = {}, extraOpts = {}) {
   if (provider === "claude-cli") {
     const built = buildClaudeCommand({ prompt, model, settingsFile });
     return { ...built, stdoutParseMode: "ndjson" };
@@ -49,7 +49,8 @@ function resolveProvider(provider, prompt, model, settingsFile, eventMeta = {}) 
 
   if (provider === "codex-cli") {
     const sandboxMode = resolveCodexSandboxMode(eventMeta);
-    const built = buildCodexCommand({ prompt, model, sandboxMode });
+    const addDirs = Array.isArray(extraOpts.addDirs) ? extraOpts.addDirs : undefined;
+    const built = buildCodexCommand({ prompt, model, sandboxMode, addDirs });
     return { ...built, stdoutParseMode: "text" };
   }
 
@@ -130,6 +131,8 @@ async function executeProviderText({
   abortSignal = null,
   onLiveEvent = null,
   fallbackDepth = 0,
+  cwd = undefined,
+  extraOpts = {},
 }) {
   let resolvedProvider;
   try {
@@ -138,7 +141,8 @@ async function executeProviderText({
       prompt,
       model,
       settingsFile,
-      eventMeta
+      eventMeta,
+      extraOpts
     );
   } catch (err) {
     const isUnsupportedProvider =

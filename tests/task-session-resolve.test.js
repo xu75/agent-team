@@ -106,6 +106,7 @@ function writeTaskDir(taskDir, { taskId, threadId = null, ts }) {
   const summary = {
     task_id: taskId,
     thread_id: threadId,
+    thread_name: "Resolver Test",
     project_id: threadId || "cat-cafe",
     project_name: "Resolver Test",
     provider: "workflow",

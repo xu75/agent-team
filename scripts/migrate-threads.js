@@ -13,6 +13,8 @@
  * 用法:
  *   node scripts/migrate-threads.js              # 执行迁移
  *   node scripts/migrate-threads.js --dry-run    # 仅预览，不实际移动
+ *   node scripts/migrate-threads.js --include-project-compat
+ *                                              # 执行旧 logs/projects → logs/threads 兼容迁移（已弃用）
  *
  * 特性:
  *   - 幂等：重复执行不会重复迁移已处理的数据
@@ -29,6 +31,7 @@ const DEFAULT_THREAD = "cat-cafe";
 const DEFAULT_THREAD_NAME = "Cat Cafe";
 
 const isDryRun = process.argv.includes("--dry-run");
+const includeProjectCompat = process.argv.includes("--include-project-compat");
 
 function safeReadJson(filePath) {
   try {
@@ -254,9 +257,27 @@ function main() {
 
   ensureDefaultThread();
 
-  log("\n--- 迁移旧项目 ---");
-  const projectResult = migrateOldProjects();
-  log(`项目: 迁移 ${projectResult.migrated}, 跳过 ${projectResult.skipped}`);
+  let projectResult = {
+    migrated: 0,
+    skipped: 0,
+    executed: false,
+    deprecated: true,
+    reason: "skip by default; use --include-project-compat only for one-off legacy recovery",
+  };
+  if (includeProjectCompat) {
+    log("\n--- 迁移旧项目（兼容路径，已弃用） ---");
+    const migrated = migrateOldProjects();
+    projectResult = {
+      ...projectResult,
+      ...migrated,
+      executed: true,
+      reason: "executed with --include-project-compat",
+    };
+    log(`项目: 迁移 ${projectResult.migrated}, 跳过 ${projectResult.skipped}`);
+  } else {
+    log("\n--- 跳过旧项目兼容迁移（已弃用） ---");
+    log("提示: 如需一次性恢复 logs/projects，可显式传入 --include-project-compat");
+  }
 
   log("\n--- 迁移聊天会话 ---");
   const chatResult = migrateLegacyChatSessions();

@@ -49,7 +49,9 @@ const state = {
     items: [],
     activeIndex: 0,
   },
-  // ---- Project management ----
+  // ---- Thread management ----
+  threads: [],
+  // Backward-compat alias: remove in next cleanup window after all callers migrate.
   projects: [],
   currentProjectId: null,    // null = 全部, string = 过滤到指定项目
   defaultProjectId: null,
@@ -209,6 +211,40 @@ async function deleteJson(url, body) {
   });
 }
 
+/**
+ * Fire-and-forget: report a client-side error to the server so it appears in logs.
+ * Covers errors the server cannot observe (e.g. nginx/frp 504 gateway timeout).
+ */
+function reportClientError({ action, status, message, task_id }) {
+  const body = JSON.stringify({ action, status: status || 0, message, task_id: task_id || "-" });
+  try {
+    const sent = navigator.sendBeacon(
+      "/api/client-error",
+      new Blob([body], { type: "application/json" })
+    );
+    // sendBeacon returns false when queued-data limit exceeded or browser refused;
+    // fall back to a keepalive fetch so the error still reaches the server.
+    if (!sent) {
+      fetch("/api/client-error", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true,
+      }).catch(() => {});
+    }
+  } catch {
+    // sendBeacon itself threw (e.g. blocked by proxy/CSP) — try fetch fallback.
+    try {
+      fetch("/api/client-error", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true,
+      }).catch(() => {});
+    } catch { /* give up */ }
+  }
+}
+
 function toneFromOutcome(v) {
   const s = String(v || "").toLowerCase();
   if (!s) return "neutral";
@@ -333,12 +369,19 @@ function normalizeProjectId(v) {
     .replace(/[^a-z0-9\-_]/g, "") || "default";
 }
 
+function setThreads(nextThreads) {
+  const threads = Array.isArray(nextThreads) ? nextThreads : [];
+  state.threads = threads;
+  // Phase-1 dual-write: keep state.projects alive for compatibility.
+  state.projects = threads;
+}
+
 function taskProjectInfo(t, threadById = null) {
   const rawThreadId = String(t?.thread_id || "").trim();
   if (rawThreadId) {
     const mapped = threadById instanceof Map ? threadById.get(rawThreadId) : null;
-    const mappedName = String(mapped?.project_name || mapped?.name || "").trim();
-    const fallbackName = String(t?.project_name || rawThreadId).trim();
+    const mappedName = String(mapped?.thread_name || mapped?.project_name || mapped?.name || "").trim();
+    const fallbackName = String(t?.thread_name || t?.project_name || rawThreadId).trim();
     return {
       id: `thread:${rawThreadId}`,
       name: mappedName || fallbackName || rawThreadId,
@@ -524,6 +567,125 @@ function clipText(v, max = 64) {
   return String(v || "").trim().slice(0, max);
 }
 
+function normRoleText(v) {
+  return clipText(v).toLowerCase();
+}
+
+function uniqueAliasList(values) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of values || []) {
+    const t = clipText(raw);
+    if (!t) continue;
+    const key = t.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
+}
+
+function syncRoleConfigCats(base, stages = STAGES) {
+  if (!base || typeof base !== "object" || !base.cats || typeof base.cats !== "object") return base;
+  const cats = {};
+  for (const [catName, catCfg] of Object.entries(base.cats || {})) {
+    cats[catName] = catCfg && typeof catCfg === "object" ? { ...catCfg } : {};
+  }
+  const roleProfiles = base.role_profiles && typeof base.role_profiles === "object" ? base.role_profiles : {};
+  const stageAssignment = base.stage_assignment && typeof base.stage_assignment === "object" ? base.stage_assignment : {};
+  const workflowIn = base.workflow_assignment && typeof base.workflow_assignment === "object" ? base.workflow_assignment : {};
+
+  const byName = new Map();
+  const byIdentity = new Map();
+  const addIdentity = (key, catName) => {
+    if (!key || !catName) return;
+    const arr = byIdentity.get(key) || [];
+    if (!arr.includes(catName)) arr.push(catName);
+    byIdentity.set(key, arr);
+  };
+  for (const [catName, catCfg] of Object.entries(cats)) {
+    const nameKey = normRoleText(catName);
+    if (nameKey) byName.set(nameKey, catName);
+    const displayKey = normRoleText(catCfg.display_name);
+    const nickKey = normRoleText(catCfg.nickname);
+    if (displayKey) addIdentity(displayKey, catName);
+    if (nickKey) addIdentity(nickKey, catName);
+    const aliases = Array.isArray(catCfg.aliases) ? catCfg.aliases : [];
+    for (const alias of aliases) {
+      const k = normRoleText(alias);
+      if (k) addIdentity(k, catName);
+    }
+  }
+
+  const workflowOut = { ...workflowIn };
+  const used = new Set();
+  for (const stage of stages) {
+    const profile = roleProfiles[stage] && typeof roleProfiles[stage] === "object" ? roleProfiles[stage] : {};
+    const displayName = clipText(profile.display_name);
+    const nickname = clipText(profile.nickname);
+
+    let catName = "";
+    const explicit = clipText(workflowIn[stage]);
+    if (explicit && cats[explicit] && !used.has(explicit)) {
+      catName = explicit;
+    } else {
+      const keys = [normRoleText(displayName), normRoleText(nickname)].filter(Boolean);
+      for (const key of keys) {
+        const hit = byName.get(key);
+        if (hit && cats[hit] && !used.has(hit)) {
+          catName = hit;
+          break;
+        }
+      }
+      if (!catName) {
+        for (const key of keys) {
+          const hits = byIdentity.get(key) || [];
+          const hit = hits.find((n) => cats[n] && !used.has(n));
+          if (hit) {
+            catName = hit;
+            break;
+          }
+        }
+      }
+      if (!catName) {
+        for (const key of keys) {
+          const hit = byName.get(key);
+          if (hit && cats[hit]) {
+            catName = hit;
+            break;
+          }
+          const hits = byIdentity.get(key) || [];
+          const any = hits.find((n) => cats[n]);
+          if (any) {
+            catName = any;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!catName || !cats[catName]) continue;
+    used.add(catName);
+    workflowOut[stage] = catName;
+    const catCfg = cats[catName];
+    const stageModelId = clipText(stageAssignment[stage], 128);
+    if (stageModelId) catCfg.model_id = stageModelId;
+    if (displayName) catCfg.display_name = displayName;
+    if (nickname) catCfg.nickname = nickname;
+    catCfg.aliases = uniqueAliasList([
+      ...(Array.isArray(catCfg.aliases) ? catCfg.aliases : []),
+      displayName,
+      nickname,
+    ]);
+  }
+
+  return {
+    ...base,
+    cats,
+    workflow_assignment: workflowOut,
+  };
+}
+
 function normalizeRoleConfig(input) {
   const base = JSON.parse(JSON.stringify(DEFAULT_ROLE_CONFIG));
   if (!input || typeof input !== "object") return base;
@@ -591,7 +753,7 @@ function normalizeRoleConfig(input) {
   if (input.cats && typeof input.cats === "object") {
     base.cats = input.cats;
   }
-  return base;
+  return syncRoleConfigCats(base, STAGES);
 }
 
 function modelMap() {
@@ -745,7 +907,7 @@ function setRunStatus(text = "", running = false) {
 function updateActionAvailability() {
   const hasTask = !!state.selectedTaskId;
   const busy = !!state.busy;
-  const currentThread = state.projects.find((p) => p.project_id === state.currentProjectId) || null;
+  const currentThread = state.threads.find((p) => p.thread_id === state.currentProjectId) || null;
   const canCancelTask = !!state.selectedTaskId && state.runningTaskId === state.selectedTaskId;
   const canCancelChat = busy && state.chatBusy;
   const canCancel = canCancelTask || canCancelChat;
@@ -828,7 +990,7 @@ function taskGroups(tasks) {
 
 function projectTaskGroups(tasks) {
   const threadById = new Map(
-    state.projects.map((p) => [String(p.project_id || "").trim(), p])
+    state.threads.map((p) => [String(p.thread_id || "").trim(), p])
   );
   const map = new Map();
   for (const t of tasks) {
@@ -925,7 +1087,7 @@ function renderTasks() {
 
     // 项目标题行
     const projectHeader = document.createElement(canCollapseGroups ? "button" : "div");
-    projectHeader.className = `project-header${canCollapseGroups ? " collapsible" : ""}${renderedCollapsed ? " collapsed" : ""}${searchActive ? " search-forced-open" : ""}`;
+    projectHeader.className = `thread-header project-header${canCollapseGroups ? " collapsible" : ""}${renderedCollapsed ? " collapsed" : ""}${searchActive ? " search-forced-open" : ""}`;
     if (canCollapseGroups) {
       projectHeader.type = "button";
       projectHeader.setAttribute("aria-expanded", String(!renderedCollapsed));
@@ -933,9 +1095,9 @@ function renderTasks() {
       projectHeader.dataset.groupKey = groupKey;
     }
     projectHeader.innerHTML = `
-      ${canCollapseGroups ? `<span class="project-collapse-indicator" aria-hidden="true">${renderedCollapsed ? "▶" : "▼"}</span>` : ""}
-      <span class="project-name" title="${escapeHtml(project.thread_id || project.name)}">${escapeHtml(project.display_name || project.name)}</span>
-      <span class="project-count">${project.tasks.length}</span>
+      ${canCollapseGroups ? `<span class="thread-collapse-indicator project-collapse-indicator" aria-hidden="true">${renderedCollapsed ? "▶" : "▼"}</span>` : ""}
+      <span class="thread-name project-name" title="${escapeHtml(project.thread_id || project.name)}">${escapeHtml(project.display_name || project.name)}</span>
+      <span class="thread-count project-count">${project.tasks.length}</span>
     `;
     if (canCollapseGroups) {
       projectHeader.addEventListener("click", (e) => {
@@ -991,8 +1153,8 @@ function applyFilter() {
     if (!q) return true;
     const p = taskProjectInfo(t);
     return (
-      String(t.project_name || "").toLowerCase().includes(q) ||
-      String(t.project_id || "").toLowerCase().includes(q) ||
+      String(t.thread_name || t.project_name || "").toLowerCase().includes(q) ||
+      String(t.thread_id || t.project_id || "").toLowerCase().includes(q) ||
       String(p.name || "").toLowerCase().includes(q) ||
       t.task_id.toLowerCase().includes(q) ||
       String(t.task_title || "").toLowerCase().includes(q) ||
@@ -1755,6 +1917,9 @@ async function selectTask(taskId) {
   // 如果该任务有关联的 thread，自动恢复 chatMode
   if (state.chatThreadId) {
     state.chatMode = true;
+    // 先用缓存值同步渲染（无闪烁），再异步拉取权威值
+    const savedMode = restoreTaskMode(taskId);
+    safeSetCurrentMode(savedMode);
     fetchThreadMode(state.chatThreadId);
   } else {
     state.chatMode = false;
@@ -1848,10 +2013,9 @@ async function loadTasks() {
 
 async function loadProjects() {
   const data = await getJson("/api/threads");
-  // Map thread fields to project fields for UI compatibility
-  state.projects = (data.threads || []).map((t) => ({
-    project_id: t.thread_id,
-    project_name: t.name,
+  const mapped = (data.threads || []).map((t) => ({
+    thread_id: t.thread_id,
+    thread_name: t.name,
     description: t.description,
     created_at: t.created_at,
     updated_at: t.updated_at,
@@ -1862,7 +2026,11 @@ async function loadProjects() {
       scoped: Number.isFinite(t?.breakdown?.scoped) ? t.breakdown.scoped : 0,
       legacy: Number.isFinite(t?.breakdown?.legacy) ? t.breakdown.legacy : 0,
     },
+    // Deprecated aliases; remove after one compatibility window.
+    project_id: t.thread_id,
+    project_name: t.name,
   }));
+  setThreads(mapped);
   state.defaultProjectId = data.default_thread_id || null;
   if (!state.currentProjectId && state.defaultProjectId) {
     state.currentProjectId = state.defaultProjectId;
@@ -1871,8 +2039,8 @@ async function loadProjects() {
 }
 
 function renderProjectSelector() {
-  const current = state.projects.find((p) => p.project_id === state.currentProjectId);
-  el.projectSelectorName.textContent = current ? current.project_name : "全部 Thread";
+  const current = state.threads.find((p) => p.thread_id === state.currentProjectId);
+  el.projectSelectorName.textContent = current ? current.thread_name : "全部 Thread";
   updateActionAvailability();
 }
 
@@ -1882,22 +2050,22 @@ function renderProjectDropdown() {
 
   // "全部" option
   const allItem = document.createElement("button");
-  allItem.className = `project-dropdown-item${!state.currentProjectId ? " active" : ""}`;
+  allItem.className = `thread-dropdown-item project-dropdown-item${!state.currentProjectId ? " active" : ""}`;
   allItem.textContent = "📁 全部 Thread";
   allItem.addEventListener("click", () => switchProject(null));
   dd.appendChild(allItem);
 
   // Separator
   const sep = document.createElement("div");
-  sep.className = "project-dropdown-sep";
+  sep.className = "thread-dropdown-sep project-dropdown-sep";
   dd.appendChild(sep);
 
   // Thread items
-  for (const p of state.projects) {
+  for (const p of state.threads) {
     const item = document.createElement("button");
-    const isActive = state.currentProjectId === p.project_id;
-    const isDefault = p.project_id === state.defaultProjectId;
-    item.className = `project-dropdown-item${isActive ? " active" : ""}`;
+    const isActive = state.currentProjectId === p.thread_id;
+    const isDefault = p.thread_id === state.defaultProjectId;
+    item.className = `thread-dropdown-item project-dropdown-item${isActive ? " active" : ""}`;
     const visibleCount = Math.max(0, Number(p.visible_count || 0));
     const scopedCount = Math.max(0, Number(p?.breakdown?.scoped || 0));
     const legacyCount = Math.max(0, Number(p?.breakdown?.legacy || 0));
@@ -1908,10 +2076,10 @@ function renderProjectDropdown() {
       item.title = `可见会话 ${visibleCount}`;
     }
     item.innerHTML = `
-      <span class="project-item-name">${escapeHtml(p.project_name)}${isDefault ? " <small>(默认)</small>" : ""}${sessionInfo}</span>
-      ${p.archived ? '<span class="project-archived-tag">已归档</span>' : ""}
+      <span class="thread-item-name project-item-name">${escapeHtml(p.thread_name)}${isDefault ? " <small>(默认)</small>" : ""}${sessionInfo}</span>
+      ${p.archived ? '<span class="thread-archived-tag project-archived-tag">已归档</span>' : ""}
     `;
-    item.addEventListener("click", () => switchProject(p.project_id));
+    item.addEventListener("click", () => switchProject(p.thread_id));
     dd.appendChild(item);
   }
 }
@@ -1975,7 +2143,7 @@ async function archiveCurrentProject() {
     showToast("请先选择一个 Thread", "warning");
     return;
   }
-  const thread = state.projects.find((p) => p.project_id === threadId);
+  const thread = state.threads.find((p) => p.thread_id === threadId);
   if (!thread) {
     showToast("当前 Thread 不存在", "negative");
     return;
@@ -1984,7 +2152,7 @@ async function archiveCurrentProject() {
     showToast("当前 Thread 已归档", "warning");
     return;
   }
-  const audit = collectThreadAudit("归档", thread.project_name || threadId);
+  const audit = collectThreadAudit("归档", thread.thread_name || threadId);
   if (!audit) return;
   try {
     setBusy(true);
@@ -1993,7 +2161,7 @@ async function archiveCurrentProject() {
       operator: audit.operator,
       reason: audit.reason,
     });
-    showToast(`Thread "${thread.project_name || threadId}" 已归档`, "positive");
+    showToast(`Thread "${thread.thread_name || threadId}" 已归档`, "positive");
     await loadProjects();
     await loadTasks();
   } catch (err) {
@@ -2009,8 +2177,8 @@ async function hardDeleteCurrentProject() {
     showToast("请先选择一个 Thread", "warning");
     return;
   }
-  const thread = state.projects.find((p) => p.project_id === threadId);
-  const threadName = thread?.project_name || threadId;
+  const thread = state.threads.find((p) => p.thread_id === threadId);
+  const threadName = thread?.thread_name || threadId;
   if (!thread) {
     showToast("当前 Thread 不存在", "negative");
     return;
@@ -2196,7 +2364,6 @@ async function runNewTaskFromCommand({ prompt, provider, rounds }) {
       maxIterations,
       role_config: state.roleConfig || DEFAULT_ROLE_CONFIG,
       thread_slug: state.currentProjectId || undefined,
-      project_id: state.currentProjectId || undefined,
     });
     const taskId = String(res?.task_id || "").trim();
     el.chatCommandInput.value = "";
@@ -2218,6 +2385,7 @@ async function runNewTaskFromCommand({ prompt, provider, rounds }) {
   } catch (err) {
     setRunStatus(`运行失败：${err.message}`, false);
     showToast(`运行失败：${err.message}`, "negative");
+    reportClientError({ action: "run", status: err.status, message: err.message });
   } finally {
     setBusy(false);
   }
@@ -2289,6 +2457,7 @@ async function sendFollowupInThread({ message, provider, rounds, confirm = false
     renderChat();
     setRunStatus(`追问失败：${err.message}`, false);
     showToast(`追问失败：${err.message}`, "negative");
+    reportClientError({ action: "followup", status: err.status, message: err.message, task_id: taskId });
   } finally {
     stopLivePolling();
     state.runningTaskId = null;
@@ -2326,6 +2495,7 @@ async function rerunCurrentTask(opts = {}) {
   } catch (err) {
     setRunStatus(`重跑失败：${err.message}`, false);
     showToast(`重跑失败：${err.message}`, "negative");
+    reportClientError({ action: "rerun", status: err.status, message: err.message, task_id: state.selectedTaskId });
   } finally {
     stopLivePolling();
     state.runningTaskId = null;
@@ -2700,7 +2870,6 @@ async function sendChatMessageUI(message) {
       role_config: state.roleConfig || undefined,
       mode: state.currentMode || undefined,
       thread_slug: state.currentProjectId || undefined,
-      project_id: state.currentProjectId || undefined,
     };
 
     const res = await postJson("/api/chat", body);
@@ -2724,6 +2893,7 @@ async function sendChatMessageUI(message) {
     renderTaskPage({ preserveEvidence: true });
     setRunStatus(`聊天失败：${err.message}`, false);
     showToast(`聊天失败：${err.message}`, "negative");
+    reportClientError({ action: "chat", status: err.status, message: err.message });
   } finally {
     stopLivePolling();
     state.chatBusy = false;
@@ -2866,6 +3036,9 @@ function renderModeSelector() {
 function renderWorkflowNodeBar() {
   const isWorkflow = state.currentMode === "workflow" && state.chatMode;
   el.workflowNodeBar.style.display = isWorkflow ? "" : "none";
+  // 工作流条在 .center-top 下方独立一行（position:absolute top:46px）
+  // 显示时需加高 chatStream 的上边距，避免内容被遮挡
+  el.chatStream.style.paddingTop = isWorkflow ? "104px" : "";
   if (!isWorkflow) return;
 
   const ms = state.currentModeState || {};
